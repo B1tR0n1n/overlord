@@ -1,0 +1,16 @@
+# AppArmor profile for OVERLORD.
+#
+# Ubuntu 24.04+ ships kernel.apparmor_restrict_unprivileged_userns=1, which
+# denies capability-bearing user namespaces to unconfined processes. This
+# profile grants exactly that — and nothing else is restricted — to the
+# overlord launcher binary, enabling the kernel overlay backend (full
+# containment) without weakening the mitigation system-wide.
+#
+# Install: cp to /etc/apparmor.d/overlord && apparmor_parser -r /etc/apparmor.d/overlord
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile overlord /usr/local/bin/overlord flags=(unconfined) {
+  userns,
+}

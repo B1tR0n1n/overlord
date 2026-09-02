@@ -1,6 +1,6 @@
-# WARDEN
+# OVERLORD
 
-**Working name.** An agent hypervisor — the trust kernel for delegated computing.
+An agent hypervisor — the trust kernel for delegated computing.
 
 ## Thesis
 
@@ -9,7 +9,7 @@ concept of a machine actor. Every agent today runs with its principal's full aut
 on infrastructure that cannot distinguish the principal's intent from the agent's
 behavior. Every harness vendor duct-tapes around this independently and badly.
 
-WARDEN is the missing layer between the agent harness and the operating system.
+OVERLORD is the missing layer between the agent harness and the operating system.
 Not an AI. Model-agnostic. A boring, load-bearing primitive — the SQLite pattern,
 not the Windows pattern.
 
@@ -33,8 +33,27 @@ A Linux-level daemon + library that wraps any agent process, from any vendor:
 - OverlayFS / CoW snapshots → reversibility
 - eBPF syscall capture → provenance
 - Capability manifest format → grants
-- Wrap-and-run CLI → adoption path (`warden run -- <any agent command>`)
+- Wrap-and-run CLI → adoption path (`overlord run -- <any agent command>`)
 
 ## Status
 
 2026-09-01 — repo created. Nothing exists yet but the thesis.
+
+## v0 — reversibility (built)
+
+`overlord.py` — single-file CLI proving the keystone primitive:
+
+```
+overlord run -t <dir> -- <any command>   # command runs against an overlay; real tree untouched
+overlord diff <session>                  # added / modified / deleted / replaced-dir
+overlord commit <session>                # replay upper layer onto the real tree
+overlord rollback <session>              # discard — target byte-identical
+overlord sessions                        # pending / committed history with cmd provenance
+```
+
+Backends, auto-detected:
+- **kernel** — overlayfs in an unprivileged user namespace (blocked on Ubuntu 24.04+
+  by `kernel.apparmor_restrict_unprivileged_userns=1` unless a profile grants `userns`)
+- **fuse** — fuse-overlayfs, no privileges needed (`apt install fuse-overlayfs`)
+
+Test: `test/smoke.sh` — run/diff/rollback/commit e2e assertions.

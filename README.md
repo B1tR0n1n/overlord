@@ -2,6 +2,8 @@
 
 An agent hypervisor — the trust kernel for delegated computing.
 
+![OVERLORD demo: rm -rf inside a transactional shell, then rollback — everything comes back](assets/demo.gif)
+
 ## Thesis
 
 Computing is transitioning to a new operator: machine agents. The OS has no native

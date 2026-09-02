@@ -344,6 +344,21 @@ def _copy_entry(src, dst):
         shutil.copy2(src, dst, follow_symlinks=False)
 
 
+def _force_rmtree(path):
+    """rmtree that survives mode-000 entries (overlayfs creates work/work as 000)."""
+    if not os.path.isdir(path):
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    for root, dirs, _files in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path)
+
+
 def _remove_target(path):
     if not os.path.lexists(path):
         return
@@ -534,10 +549,10 @@ def cmd_commit(args):
     save_meta(args.session, m)
     for sub in ("upper", "work", "merged", "manifest.json", "raw.strace"):
         p = os.path.join(sdir, sub)
-        if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-        elif os.path.isfile(p):
-            os.remove(p)
+        try:
+            _force_rmtree(p)
+        except OSError:
+            pass
     print(f"committed {n} changes to {m['target']}")
     return 0
 
@@ -546,7 +561,7 @@ def cmd_rollback(args):
     m = load_meta(args.session)
     if m.get("status") == "committed":
         raise SystemExit("error: session already committed; nothing to roll back")
-    shutil.rmtree(session_path(args.session))
+    _force_rmtree(session_path(args.session))
     print(f"rolled back {args.session} — target untouched: {m['target']}")
     return 0
 

@@ -10,6 +10,12 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$OVERLORD_HOME" "$WORK"' EXIT
 
 OVERLORD="python3 $HERE/overlord.py"
+# The AppArmor userns grant attaches to the installed ELF launcher, not to a
+# bare python3 invocation — use the installed binary when it matches the repo.
+if command -v overlord > /dev/null && cmp -s /usr/local/lib/overlord/overlord.py "$HERE/overlord.py"; then
+    OVERLORD="overlord"
+fi
+echo "under test: $OVERLORD"
 TARGET="$WORK/target"
 
 reset_target() {
@@ -114,7 +120,7 @@ else
 fi
 
 # --- 11. absolute-path containment (kernel backend only)
-if unshare --map-root-user --mount true 2>/dev/null; then
+if $OVERLORD doctor 2>/dev/null | grep -q 'kernel backend.*: available'; then
     reset_target
     OUT=$($OVERLORD run --backend kernel -t "$TARGET" -- bash -c "echo abs > $TARGET/abs.txt")
     SID=$(sid_of "$OUT")
@@ -125,5 +131,15 @@ if unshare --map-root-user --mount true 2>/dev/null; then
 else
     echo "  skip: containment test (kernel backend unavailable)"
 fi
+
+# --- 12. cleanup survives mode-000 dirs (kernel overlayfs creates work/work as 000)
+reset_target
+OUT=$($OVERLORD run -t "$TARGET" -- true)
+SID=$(sid_of "$OUT")
+mkdir -p "$OVERLORD_HOME/sessions/$SID/work/work"
+chmod 000 "$OVERLORD_HOME/sessions/$SID/work/work"
+$OVERLORD rollback "$SID" > /dev/null || fail "rollback died on mode-000 work dir"
+[ ! -d "$OVERLORD_HOME/sessions/$SID" ] || fail "session dir survived rollback"
+pass "mode-000 cleanup"
 
 echo "PASS: all smoke assertions"

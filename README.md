@@ -89,6 +89,19 @@ Arbitration: one executing session per target (flock; `--wait` queues), and a
 new session is refused while another is pending on the same target (`--stack`
 overrides).
 
+## Mission control (web UI)
+
+```bash
+overlord ui          # http://127.0.0.1:7777 — localhost only
+```
+
+![OVERLORD mission control — pending session with per-file diff, before/after hashes, commit/rollback](assets/ui.png)
+
+The review moment for human eyes: pending sessions with their grant badges,
+per-file changes with before → after hashes and provenance, one-click commit
+or rollback, and a live policy editor. Zero dependencies (stdlib http server),
+server-rendered first paint, binds 127.0.0.1 only.
+
 ## Resident mode: daemon, policy, SDK
 
 `overlord daemon` (or the systemd unit in packaging/) makes OVERLORD a
@@ -165,3 +178,6 @@ grants are absent.
 - 2026-09-01 — v0.3: red team suite (10 attacks; found + fixed A3 session-record
   exposure), resident daemon with policy brokering (deny-by-default, grant caps,
   force gating), Python SDK, systemd unit, integration docs.
+- 2026-09-01 — v0.4: mission control web UI (`overlord ui`) — session review,
+  per-file diff with hashes, one-click commit/rollback, policy editor;
+  zero-dependency, server-rendered, localhost-only.

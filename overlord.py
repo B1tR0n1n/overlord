@@ -990,6 +990,12 @@ def cmd_daemon(args):
     return 0
 
 
+def cmd_ui(args):
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import ui
+    return ui.serve(args.port)
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1032,6 +1038,10 @@ def main(argv=None):
     pd = sub.add_parser("daemon", help="resident broker: unix socket + policy enforcement")
     pd.add_argument("--socket", help=f"socket path (default {DEFAULT_SOCKET})")
     pd.set_defaults(fn=cmd_daemon)
+
+    pu = sub.add_parser("ui", help="mission control: localhost web UI for session review")
+    pu.add_argument("--port", type=int, default=7777)
+    pu.set_defaults(fn=cmd_ui)
 
     for name, fn in (("diff", cmd_diff), ("log", cmd_log), ("rollback", cmd_rollback)):
         sp = sub.add_parser(name)

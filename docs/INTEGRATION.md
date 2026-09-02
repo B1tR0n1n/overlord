@@ -17,6 +17,15 @@ overlord commit <session>    # or rollback
 
 The agent believes it edited the project. Nothing is real until you commit.
 
+## 1b. Watch it happen (web UI)
+
+```bash
+overlord ui    # http://127.0.0.1:7777
+```
+
+Mission control: every pending session, its diff, and commit/rollback buttons.
+Point it at a fleet of agents and it becomes the review console.
+
 ## 2. Python SDK (embed in a harness)
 
 Run the broker once (`overlord daemon`, or the systemd unit in packaging/),

@@ -20,6 +20,7 @@ fi
 echo "== engine"
 install -d /usr/local/lib/overlord
 install -m 0644 "$HERE/overlord.py" /usr/local/lib/overlord/overlord.py
+install -m 0644 "$HERE/ui.py" /usr/local/lib/overlord/ui.py
 install -m 0644 "$HERE/packaging/ebpf/provenance.bt" /usr/local/lib/overlord/provenance.bt
 install -m 0644 "$HERE/sdk/overlord_client.py" /usr/local/lib/overlord/overlord_client.py
 

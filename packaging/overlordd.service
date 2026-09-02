@@ -1,0 +1,13 @@
+# OVERLORD resident broker — install as a user service:
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/overlordd.service ~/.config/systemd/user/
+#   systemctl --user enable --now overlordd
+[Unit]
+Description=OVERLORD agent hypervisor daemon
+
+[Service]
+ExecStart=/usr/local/bin/overlord daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -87,6 +87,25 @@ Arbitration: one executing session per target (flock; `--wait` queues), and a
 new session is refused while another is pending on the same target (`--stack`
 overrides).
 
+## Resident mode: daemon, policy, SDK
+
+`overlord daemon` (or the systemd unit in packaging/) makes OVERLORD a
+resident broker on a 0600 unix socket. Sessions requested through it are
+bound by `~/.overlord/policy.json` — deny-by-default targets, forced jail/net,
+timeout caps, force-commit gating — and callers can never obtain a looser
+scope than policy grants. The Python SDK (`overlord_client.py`, installed to
+/usr/local/lib/overlord/) embeds this in any harness: `run() -> Session`,
+`session.diff/log/commit/rollback`. See docs/INTEGRATION.md.
+
+## Red team
+
+`test/redteam.sh` attacks the jail: symlink escape, dotdot traversal,
+session-record tampering, host sysctl writes, device forgery, host pid
+visibility, real-fs reads, overlay-internals reach, fd leaks, mount games.
+Finding A3 (session records reachable via the strace bind) was found by this
+suite and fixed — records are never exposed; strace gets an isolated trace/
+bind only when in use. Every future breach becomes a fix + regression test.
+
 ## Backends
 
 | | containment | privileges |
@@ -141,3 +160,6 @@ grants are absent.
 - 2026-09-01 — v0.2: capability manifests (jail / net / timeout), pivot_root
   jail, network scoping, arbitration (locks + pending guard), three-way merge
   on commit, eBPF recorder wired (`--trace ebpf`, root-only).
+- 2026-09-01 — v0.3: red team suite (10 attacks; found + fixed A3 session-record
+  exposure), resident daemon with policy brokering (deny-by-default, grant caps,
+  force gating), Python SDK, systemd unit, integration docs.

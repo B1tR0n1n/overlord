@@ -20,6 +20,7 @@ fi
 echo "== engine"
 install -d /usr/local/lib/overlord
 install -m 0644 "$HERE/overlord.py" /usr/local/lib/overlord/overlord.py
+install -m 0644 "$HERE/packaging/ebpf/provenance.bt" /usr/local/lib/overlord/provenance.bt
 
 echo "== launcher"
 gcc -O2 -o /usr/local/bin/overlord "$HERE/packaging/launcher.c"

@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
-"""OVERLORD — transactional execution for agent processes.
+"""OVERLORD — an agent hypervisor: transactional, scoped, recorded execution.
 
-The keystone primitive of an agent hypervisor: snapshot, execute, inspect,
-commit or roll back.
-
-    overlord run   -t <dir> [--trace] -- <any command>
-    overlord shell -t <dir>
+    overlord run   -t <dir> [grants] [--trace[=strace|ebpf]] -- <any command>
+    overlord shell -t <dir> [grants]
     overlord sessions
     overlord diff <session>
     overlord log <session>
-    overlord commit <session> [--force]
+    overlord commit <session> [--merge] [--force]
     overlord rollback <session>
     overlord doctor
 
 A wrapped command runs against an overlay of the target directory. Every write
 lands in the session's upper layer; the real tree is untouched until an
-explicit commit. Rollback is deletion of the upper layer. Commit verifies the
-real tree has not drifted since the snapshot (conflict detection) and refuses
-to clobber external changes unless forced.
+explicit commit. Commit verifies the real tree has not drifted since the
+snapshot and refuses to clobber external changes (or three-way merges them
+with --merge when the session kept a base copy).
+
+Grants (the capability manifest, via flags or --manifest file):
+    --jail          pivot_root jail: the process sees system dirs + the target
+                    and nothing else — $HOME and the rest of the fs don't exist
+    --net none      private network namespace: no network, not even loopback
+                    to host services
+    --timeout N     hard wall-clock limit; the process group is killed
+    --merge-base    keep a base copy of the target to enable commit --merge
 
 Backends:
-  kernel  overlayfs inside an unprivileged user namespace. The overlay is
-          mounted OVER the target's own path inside the namespace, so even
-          absolute-path writes into the target are contained. Requires userns
-          capability grants (on Ubuntu 24.04+ install the AppArmor profile
-          shipped in packaging/).
-  fuse    fuse-overlayfs, no privileges needed. Cooperative containment only:
-          the command runs with cwd inside the overlay, but absolute-path
-          writes to the real target are NOT intercepted.
+  kernel  overlayfs in an unprivileged user namespace; overlay is mounted over
+          the target's own path (or into the jail), so absolute-path writes
+          are contained. jail/net grants require this backend. On Ubuntu
+          24.04+ install packaging/ (AppArmor profile grants userns to the
+          overlord launcher only).
+  fuse    fuse-overlayfs, no privileges. Cooperative containment: cwd is
+          inside the overlay, absolute-path writes are NOT intercepted.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +50,9 @@ import uuid
 
 OVERLORD_HOME = os.environ.get("OVERLORD_HOME", os.path.expanduser("~/.overlord"))
 SESSIONS_DIR = os.path.join(OVERLORD_HOME, "sessions")
+LOCKS_DIR = os.path.join(OVERLORD_HOME, "locks")
+EBPF_SCRIPT = "/usr/local/lib/overlord/provenance.bt"
+TIMEOUT_RC = 124
 
 # ---------------------------------------------------------------- backends
 
@@ -75,39 +83,91 @@ def _check_mount_path(path, name):
         )
 
 
-def run_kernel(target, upper, work, merged, cmd):
-    """Mount the overlay over the target's own path inside a private mount ns.
+def _jail_script(target, opts, sdir, cmd):
+    """Inner script for the pivot_root jail: tmpfs root, system dirs bound,
+    overlay at the target's path, private /proc. $HOME and the rest of the
+    real filesystem do not exist inside."""
+    tgt_rel = target.lstrip("/")
+    jail = os.path.join(sdir, "jail")
+    return f"""set -e
+mount --make-rprivate /
+J={shlex.quote(jail)}
+mount -t tmpfs tmpfs "$J"
+cd "$J"
+mkdir -p oldroot proc tmp dev .overlord
+chmod 1777 tmp
+for d in usr bin sbin lib lib64 lib32 etc opt; do
+  if [ -L "/$d" ]; then ln -s "$(readlink "/$d")" "$d"
+  elif [ -d "/$d" ]; then mkdir -p "$d"; mount --rbind "/$d" "$d"; fi
+done
+for n in null zero full random urandom tty; do
+  if [ -e "/dev/$n" ]; then touch "dev/$n"; mount --bind "/dev/$n" "dev/$n"; fi
+done
+ln -s /proc/self/fd dev/fd
+RESOLV="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
+if [ -n "$RESOLV" ] && [ "${{RESOLV#/run/}}" != "$RESOLV" ] && [ -f "$RESOLV" ]; then
+  mkdir -p "$(dirname "${{RESOLV#/}}")"; cp "$RESOLV" "${{RESOLV#/}}"
+fi
+mount --bind {shlex.quote(sdir)} .overlord
+mkdir -p {shlex.quote(tgt_rel)}
+mount -t overlay overlay -o {shlex.quote(opts)} "$J/{tgt_rel}"
+mount -t proc proc proc
+pivot_root . oldroot
+cd /
+umount -l /oldroot 2>/dev/null || true
+export HOME=/{shlex.quote(tgt_rel)} TMPDIR=/tmp
+cd /{shlex.quote(tgt_rel)}
+exec {shlex.join(cmd)}
+"""
 
-    Absolute references to the target resolve into the overlay; the real tree
-    is untouched. `merged` is unused by this backend.
-    """
+
+def prepare_kernel(target, sdir, cmd, grants):
+    """Returns (argv, cwd, cleanup) for the kernel backend."""
+    upper, work = os.path.join(sdir, "upper"), os.path.join(sdir, "work")
     _check_mount_path(target, "target")
-    _check_mount_path(upper, "session")
+    _check_mount_path(sdir, "session")
     opts = f"lowerdir={target},upperdir={upper},workdir={work},userxattr"
-    inner = (
-        f"mount -t overlay overlay -o {shlex.quote(opts)} {shlex.quote(target)} "
-        f"&& cd {shlex.quote(target)} && exec {shlex.join(cmd)}"
-    )
-    proc = subprocess.run(["unshare", "--map-root-user", "--mount", "bash", "-c", inner])
-    return proc.returncode
+    argv = ["unshare", "--map-root-user", "--mount"]
+    if grants.get("net") == "none":
+        argv.append("--net")
+    if grants.get("jail"):
+        argv += ["--pid", "--fork"]
+        os.makedirs(os.path.join(sdir, "jail"), exist_ok=True)
+        inner = _jail_script(target, opts, sdir, cmd)
+    else:
+        inner = (
+            f"mount -t overlay overlay -o {shlex.quote(opts)} {shlex.quote(target)} "
+            f"&& cd {shlex.quote(target)} && exec {shlex.join(cmd)}"
+        )
+    return argv + ["bash", "-c", inner], None, None
 
 
-def run_fuse(target, upper, work, merged, cmd):
+def prepare_fuse(target, sdir, cmd, grants):
+    """Returns (argv, cwd, cleanup) for the fuse backend."""
+    for grant in ("jail", "net"):
+        if grants.get(grant) and grants[grant] != "host":
+            raise SystemExit(
+                f"error: --{grant} requires the kernel backend "
+                "(install packaging/apparmor profile)"
+            )
+    upper, work = os.path.join(sdir, "upper"), os.path.join(sdir, "work")
+    merged = os.path.join(sdir, "merged")
     _check_mount_path(target, "target")
-    _check_mount_path(upper, "session")
+    _check_mount_path(sdir, "session")
     opts = f"lowerdir={target},upperdir={upper},workdir={work}"
     mnt = subprocess.run(
         ["fuse-overlayfs", "-o", opts, merged], capture_output=True, text=True
     )
     if mnt.returncode != 0:
         raise SystemExit(f"error: fuse-overlayfs mount failed: {mnt.stderr.strip()}")
-    try:
-        return subprocess.run(cmd, cwd=merged).returncode
-    finally:
+
+    def cleanup():
         subprocess.run(["fusermount3", "-u", merged], capture_output=True)
 
+    return cmd, merged, cleanup
 
-BACKENDS = {"kernel": run_kernel, "fuse": run_fuse}
+
+PREPARE = {"kernel": prepare_kernel, "fuse": prepare_fuse}
 
 # ---------------------------------------------------------------- sessions
 
@@ -140,6 +200,29 @@ def list_sessions():
         d for d in os.listdir(SESSIONS_DIR)
         if os.path.isfile(os.path.join(SESSIONS_DIR, d, "meta.json"))
     )
+
+
+def pending_sessions_for(target):
+    hits = []
+    for sid in list_sessions():
+        m = load_meta(sid)
+        if m.get("status") == "pending" and m.get("target") == target:
+            hits.append(sid)
+    return hits
+
+
+def acquire_target_lock(target, wait):
+    """Arbitration: one executing session per target. Returns held lock fd."""
+    os.makedirs(LOCKS_DIR, exist_ok=True)
+    name = hashlib.sha256(target.encode()).hexdigest()[:24] + ".lock"
+    fd = open(os.path.join(LOCKS_DIR, name), "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        raise SystemExit(
+            f"error: another session is executing against {target} (use --wait to queue)"
+        )
+    return fd
 
 
 # ---------------------------------------------------------------- snapshot
@@ -257,6 +340,40 @@ def find_conflicts(changes, manifest, target):
     return conflicts
 
 
+def try_merge(conflicts, sdir, target):
+    """Three-way merge modified-externally conflicts using the session's base
+    copy. Merged content is written into the upper layer, so a subsequent
+    apply replays it. Returns (resolved, unresolved)."""
+    base_dir = os.path.join(sdir, "base")
+    upper = os.path.join(sdir, "upper")
+    if not os.path.isdir(base_dir):
+        raise SystemExit(
+            "error: --merge needs a base copy — session was not run with --merge-base"
+        )
+    resolved, unresolved = [], []
+    for reason, rel in conflicts:
+        ours = os.path.join(upper, rel)       # session's version
+        base = os.path.join(base_dir, rel)    # common ancestor
+        theirs = os.path.join(target, rel)    # external version
+        if reason != "modified-externally" or not all(
+            os.path.isfile(p) and not os.path.islink(p) for p in (ours, base, theirs)
+        ):
+            unresolved.append((reason, rel))
+            continue
+        r = subprocess.run(
+            ["git", "merge-file", "-p", "-L", "session", "-L", "base", "-L",
+             "external", ours, base, theirs],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            with open(ours, "wb") as f:
+                f.write(r.stdout)
+            resolved.append(rel)
+        else:
+            unresolved.append(("merge-conflict", rel))
+    return resolved, unresolved
+
+
 # ---------------------------------------------------------------- provenance
 
 
@@ -311,12 +428,11 @@ def parse_strace(raw_path):
             if not m or m.group(3) not in _TRACED:
                 continue
             pid, ts, syscall, args, ret = m.groups()
-            paths = _QUOTED_RE.findall(args)
             events.append({
                 "pid": int(pid),
                 "ts": float(ts),
                 "syscall": syscall,
-                "paths": paths[:2],
+                "paths": _QUOTED_RE.findall(args)[:2],
                 "write": syscall != "connect" and (
                     syscall not in ("openat", "open")
                     or any(fl in args for fl in _WRITE_FLAGS)
@@ -324,6 +440,23 @@ def parse_strace(raw_path):
                 "ret": ret,
             })
     return events
+
+
+def start_ebpf(pid, sdir):
+    """Attach the bpftrace flight recorder to a process tree. Root-only."""
+    script = EBPF_SCRIPT if os.path.isfile(EBPF_SCRIPT) else os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "packaging", "ebpf", "provenance.bt"
+    )
+    if not os.path.isfile(script):
+        raise SystemExit("error: ebpf recorder script not found")
+    argv = ["bpftrace", "-o", os.path.join(sdir, "ebpf.log"), script, str(pid)]
+    if os.geteuid() != 0:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+            raise SystemExit(
+                "error: --trace ebpf needs root (or passwordless sudo for bpftrace)"
+            )
+        argv = ["sudo", "-n"] + argv
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ---------------------------------------------------------------- commit
@@ -400,7 +533,29 @@ def apply_upper(upper, target):
 # ---------------------------------------------------------------- execution
 
 
-def execute_session(target, cmd, backend=None, trace=False):
+def load_grants(args):
+    """Capability manifest: --manifest file defaults, CLI flags override."""
+    grants = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    manifest_file = getattr(args, "manifest", None)
+    if manifest_file:
+        with open(manifest_file) as f:
+            declared = json.load(f)
+        unknown = set(declared) - set(grants)
+        if unknown:
+            raise SystemExit(f"error: unknown manifest keys: {', '.join(sorted(unknown))}")
+        grants.update(declared)
+    if getattr(args, "net", None):
+        grants["net"] = args.net
+    if getattr(args, "jail", False):
+        grants["jail"] = True
+    if getattr(args, "timeout", None):
+        grants["timeout"] = args.timeout
+    if getattr(args, "merge_base", False):
+        grants["merge_base"] = True
+    return grants
+
+
+def execute_session(target, cmd, backend, grants, trace=None, wait=False, stack=False):
     """Core transactional run. Returns (sid, exit_code, changes)."""
     target = os.path.realpath(target)
     if not os.path.isdir(target):
@@ -409,41 +564,73 @@ def execute_session(target, cmd, backend=None, trace=False):
     if backend is None:
         raise SystemExit(
             "error: no overlay backend available.\n"
-            "  kernel: userns capability grants restricted (install packaging/apparmor profile)\n"
+            "  kernel: userns capability grants restricted (install packaging/)\n"
             "  fuse:   install fuse-overlayfs (sudo apt install fuse-overlayfs)"
         )
+    pending = pending_sessions_for(target)
+    if pending and not stack:
+        raise SystemExit(
+            f"error: {len(pending)} pending session(s) already exist for {target}: "
+            f"{', '.join(pending)}\ncommit or roll back first, or pass --stack"
+        )
+    lock = acquire_target_lock(target, wait)
+
     sid = new_session_id()
     sdir = session_path(sid)
-    upper, work, merged = (os.path.join(sdir, d) for d in ("upper", "work", "merged"))
-    for d in (upper, work, merged):
-        os.makedirs(d)
+    for d in ("upper", "work", "merged"):
+        os.makedirs(os.path.join(sdir, d))
 
     manifest = snapshot_manifest(target)
     with open(os.path.join(sdir, "manifest.json"), "w") as f:
         json.dump(manifest, f)
+    if grants.get("merge_base"):
+        subprocess.run(
+            ["cp", "-a", "--reflink=auto", target, os.path.join(sdir, "base")],
+            check=True,
+        )
 
     raw_trace = os.path.join(sdir, "raw.strace")
-    if trace:
+    if trace == "strace":
         if not shutil.which("strace"):
             raise SystemExit("error: --trace requires strace (sudo apt install strace)")
+        strace_out = "/.overlord/raw.strace" if grants.get("jail") else raw_trace
         cmd = ["strace", "-f", "-qq", "-ttt", "-e",
-               "trace=%file,%process,%network", "-o", raw_trace] + cmd
+               "trace=%file,%process,%network", "-o", strace_out] + cmd
 
     meta = {
         "id": sid, "target": target, "cmd": cmd, "backend": backend,
-        "trace": trace, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "status": "running",
+        "grants": grants, "trace": trace,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "running",
     }
     save_meta(sid, meta)
 
-    rc = BACKENDS[backend](target, upper, work, merged, cmd)
+    argv, cwd, cleanup = PREPARE[backend](target, sdir, cmd, grants)
+    ebpf = None
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True)
+        if trace == "ebpf":
+            ebpf = start_ebpf(proc.pid, sdir)
+        try:
+            rc = proc.wait(timeout=grants.get("timeout"))
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.wait()
+            rc = TIMEOUT_RC
+            meta["timed_out"] = True
+    finally:
+        if cleanup:
+            cleanup()
+        if ebpf:
+            ebpf.terminate()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
+    upper = os.path.join(sdir, "upper")
     changes = compute_diff(upper, target)
-    provenance = build_provenance(changes, upper, target)
     with open(os.path.join(sdir, "provenance.jsonl"), "w") as f:
-        for rec in provenance:
+        for rec in build_provenance(changes, upper, target):
             f.write(json.dumps(rec) + "\n")
-    if trace and os.path.isfile(raw_trace):
+    if trace == "strace" and os.path.isfile(raw_trace):
         with open(os.path.join(sdir, "syscalls.jsonl"), "w") as f:
             for ev in parse_strace(raw_trace):
                 f.write(json.dumps(ev) + "\n")
@@ -457,9 +644,7 @@ def execute_session(target, cmd, backend=None, trace=False):
 # ---------------------------------------------------------------- commands
 
 
-def cmd_run(args):
-    sid, rc, changes = execute_session(args.target, args.cmd, args.backend, args.trace)
-    backend = load_meta(sid)["backend"]
+def _print_session_footer(sid, rc, backend, changes):
     print(f"\nsession {sid}  exit={rc}  backend={backend}  changes={len(changes)}")
     for kind, rel in changes[:20]:
         print(f"  {kind:12s} {rel}")
@@ -468,16 +653,28 @@ def cmd_run(args):
     print(f"\n  inspect:  overlord diff {sid}   |   overlord log {sid}")
     print(f"  commit:   overlord commit {sid}")
     print(f"  rollback: overlord rollback {sid}")
+
+
+def cmd_run(args):
+    grants = load_grants(args)
+    sid, rc, changes = execute_session(
+        args.target, args.cmd, args.backend, grants,
+        trace=args.trace, wait=args.wait, stack=args.stack,
+    )
+    _print_session_footer(sid, rc, load_meta(sid)["backend"], changes)
     return rc
 
 
 def cmd_shell(args):
+    grants = load_grants(args)
     shell = os.environ.get("SHELL", "/bin/bash")
-    print(f"overlord: transactional shell over {args.target} — exit to close", file=sys.stderr)
-    sid, rc, changes = execute_session(args.target, [shell], args.backend, False)
-    print(f"\nsession {sid}  exit={rc}  changes={len(changes)}")
-    print(f"  commit:   overlord commit {sid}")
-    print(f"  rollback: overlord rollback {sid}")
+    print(f"overlord: transactional shell over {args.target} — exit to close",
+          file=sys.stderr)
+    sid, rc, changes = execute_session(
+        args.target, [shell], args.backend, grants,
+        wait=args.wait, stack=args.stack,
+    )
+    _print_session_footer(sid, rc, load_meta(sid)["backend"], changes)
     return rc
 
 
@@ -488,7 +685,13 @@ def cmd_sessions(args):
         return 0
     for sid in rows:
         m = load_meta(sid)
-        print(f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}  "
+        g = m.get("grants", {})
+        tags = "".join(
+            f" [{t}]" for t, on in
+            (("jail", g.get("jail")), ("net:none", g.get("net") == "none"),
+             ("timed-out", m.get("timed_out"))) if on
+        )
+        print(f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
               f"{m.get('target', '')}  :: {shlex.join(m.get('cmd', []))}")
     return 0
 
@@ -519,11 +722,12 @@ def cmd_log(args):
             before = (rec.get("before_sha256") or "-")[:12]
             after = (rec.get("after_sha256") or "-")[:12]
             print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
-    sc = os.path.join(sdir, "syscalls.jsonl")
-    if os.path.isfile(sc):
-        with open(sc) as f:
-            n = sum(1 for _ in f)
-        print(f"\nsyscall trace: {n} events in {sc}")
+    for name, label in (("syscalls.jsonl", "syscall trace"), ("ebpf.log", "ebpf trace")):
+        p = os.path.join(sdir, name)
+        if os.path.isfile(p):
+            with open(p, errors="replace") as f:
+                n = sum(1 for _ in f)
+            print(f"\n{label}: {n} events in {p}")
     return 0
 
 
@@ -537,23 +741,29 @@ def cmd_commit(args):
         manifest = json.load(f)
     changes = compute_diff(upper, m["target"])
     conflicts = find_conflicts(changes, manifest, m["target"])
+    merged = []
+    if conflicts and args.merge:
+        merged, conflicts = try_merge(conflicts, sdir, m["target"])
     if conflicts and not args.force:
         print("error: target drifted since snapshot — refusing to commit:", file=sys.stderr)
         for reason, rel in conflicts:
             print(f"  {reason:22s} {rel}", file=sys.stderr)
-        print("override with: overlord commit --force " + args.session, file=sys.stderr)
+        hint = "--merge (needs --merge-base session) or --force" if not args.merge else "--force"
+        print(f"override with: overlord commit {hint} {args.session}", file=sys.stderr)
         return 1
     n = apply_upper(upper, m["target"])
     m.update(status="committed", committed=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-             forced=bool(conflicts))
+             forced=bool(conflicts), merged_paths=merged)
     save_meta(args.session, m)
-    for sub in ("upper", "work", "merged", "manifest.json", "raw.strace"):
-        p = os.path.join(sdir, sub)
+    for sub in ("upper", "work", "merged", "base", "jail", "manifest.json", "raw.strace"):
         try:
-            _force_rmtree(p)
+            _force_rmtree(os.path.join(sdir, sub))
         except OSError:
             pass
-    print(f"committed {n} changes to {m['target']}")
+    msg = f"committed {n} changes to {m['target']}"
+    if merged:
+        msg += f" ({len(merged)} three-way merged)"
+    print(msg)
     return 0
 
 
@@ -567,30 +777,33 @@ def cmd_rollback(args):
 
 
 def cmd_doctor(args):
-    checks = []
-    checks.append(("python", sys.version.split()[0], True))
     k = _kernel_backend_available()
-    checks.append(("kernel backend (userns overlay, full containment)",
-                   "available" if k else "blocked", k))
     fu = _fuse_backend_available()
-    checks.append(("fuse backend (fuse-overlayfs, cooperative)",
-                   "available" if fu else "missing", fu))
-    st_ = bool(shutil.which("strace"))
-    checks.append(("syscall trace (--trace, strace)",
-                   "available" if st_ else "missing", st_))
+    checks = [
+        ("python", sys.version.split()[0], True),
+        ("kernel backend (userns overlay; jail + net grants)",
+         "available" if k else "blocked", k),
+        ("fuse backend (fuse-overlayfs, cooperative)",
+         "available" if fu else "missing", fu),
+        ("syscall trace (--trace, strace)",
+         "available" if shutil.which("strace") else "missing",
+         bool(shutil.which("strace"))),
+        ("ebpf trace (--trace ebpf, bpftrace, root-only)",
+         "available" if shutil.which("bpftrace") else "missing",
+         bool(shutil.which("bpftrace"))),
+        ("three-way merge (git merge-file)",
+         "available" if shutil.which("git") else "missing",
+         bool(shutil.which("git"))),
+    ]
     try:
         with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
-            restr = f.read().strip()
-        checks.append(("apparmor userns restriction", restr, True))
+            checks.append(("apparmor userns restriction", f.read().strip(), True))
     except OSError:
         pass
-    ok = True
     for name, val, good in checks:
-        mark = "ok " if good else "!! "
-        ok = ok and (good or name.startswith("apparmor"))
-        print(f"  {mark} {name}: {val}")
+        print(f"  {'ok ' if good else '!! '} {name}: {val}")
     if not (k or fu):
-        print("\n  NO BACKEND AVAILABLE — run packaging/install.sh")
+        print("\n  NO BACKEND AVAILABLE — run: sudo bash packaging/install.sh")
         return 1
     print(f"\n  active backend: {'kernel' if k else 'fuse'}")
     return 0
@@ -599,20 +812,37 @@ def cmd_doctor(args):
 # ---------------------------------------------------------------- main
 
 
+def _add_exec_flags(parser):
+    parser.add_argument("-t", "--target", required=True)
+    parser.add_argument("--backend", choices=list(PREPARE))
+    parser.add_argument("--manifest", help="capability manifest JSON (flags override)")
+    parser.add_argument("--jail", action="store_true",
+                        help="pivot_root jail: only system dirs + target exist")
+    parser.add_argument("--net", choices=["host", "none"],
+                        help="network grant (none = private empty netns)")
+    parser.add_argument("--timeout", type=float, metavar="SECS",
+                        help="hard wall-clock limit; kills the process group")
+    parser.add_argument("--merge-base", action="store_true",
+                        help="keep a base copy enabling commit --merge")
+    parser.add_argument("--wait", action="store_true",
+                        help="queue behind an executing session instead of failing")
+    parser.add_argument("--stack", action="store_true",
+                        help="allow a new session while others are pending on this target")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="overlord", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
 
     pr = sub.add_parser("run", help="run a command transactionally against a target dir")
-    pr.add_argument("-t", "--target", required=True)
-    pr.add_argument("--backend", choices=list(BACKENDS))
-    pr.add_argument("--trace", action="store_true", help="record syscall provenance (strace)")
+    _add_exec_flags(pr)
+    pr.add_argument("--trace", nargs="?", const="strace", choices=["strace", "ebpf"],
+                    help="record syscall provenance")
     pr.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- CMD")
     pr.set_defaults(fn=cmd_run)
 
     ps = sub.add_parser("shell", help="interactive transactional shell over a target dir")
-    ps.add_argument("-t", "--target", required=True)
-    ps.add_argument("--backend", choices=list(BACKENDS))
+    _add_exec_flags(ps)
     ps.set_defaults(fn=cmd_shell)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)
@@ -625,6 +855,8 @@ def main(argv=None):
 
     pc = sub.add_parser("commit")
     pc.add_argument("session")
+    pc.add_argument("--merge", action="store_true",
+                    help="three-way merge external drift (session needs --merge-base)")
     pc.add_argument("--force", action="store_true",
                     help="commit even if the target drifted since snapshot")
     pc.set_defaults(fn=cmd_commit)

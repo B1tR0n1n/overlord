@@ -42,13 +42,18 @@ that enables the kernel backend on Ubuntu 24.04+, and the runtime deps
 
 ```bash
 overlord run -t /srv/app -- some-agent --do-things   # transactional execution
-overlord run --trace -t /srv/app -- <cmd>            # + syscall flight recorder
+overlord run --jail --net none --timeout 300 -t /srv/app -- <cmd>   # scoped grants
+overlord run --manifest cap.json -t /srv/app -- <cmd>               # grants from file
+overlord run --trace -t /srv/app -- <cmd>            # + syscall flight recorder (strace)
+overlord run --trace ebpf -t /srv/app -- <cmd>       # kernel-side recorder (root-only)
+overlord run --merge-base -t /srv/app -- <cmd>       # keep base copy for commit --merge
 overlord shell -t /srv/app                           # interactive transactional shell
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
 overlord log <session>           # per-change sha256 before -> after, syscall count
 overlord commit <session>        # verify no external drift, replay onto real tree
+overlord commit --merge <sess>   # three-way merge non-overlapping drift (needs --merge-base)
 overlord commit --force <sess>   # commit despite drift (explicit override)
 overlord rollback <session>      # discard — target byte-identical
 overlord doctor                  # backend / dependency diagnostics
@@ -57,7 +62,30 @@ overlord doctor                  # backend / dependency diagnostics
 The wrapped command sees a fully writable tree and exits believing everything
 happened. Nothing touches the real tree until `commit`. Commit re-verifies the
 snapshot fingerprints (size + mtime_ns of every file) and **refuses to clobber
-external changes** made while the session was pending.
+external changes** made while the session was pending. If the session was run
+with `--merge-base`, `commit --merge` three-way merges non-overlapping drift
+(git merge-file against the kept base) and still refuses overlapping edits.
+
+## Grants (the capability manifest)
+
+Grants scope what a session may do — commander's intent as enforced constraints.
+Set via flags or a JSON manifest (`--manifest cap.json`, flags override):
+
+```json
+{ "jail": true, "net": "none", "timeout": 300, "merge_base": false }
+```
+
+- **jail** — pivot_root jail: the process sees system dirs (ro by real perms),
+  a private /tmp and /proc, and the target. `$HOME`, `/mnt`, and the rest of
+  the filesystem *do not exist*. Kernel backend only.
+- **net: none** — private empty network namespace. No egress, no loopback to
+  host services. Kernel backend only.
+- **timeout** — hard wall-clock limit; the process group is killed (exit 124).
+- **merge_base** — keep a base copy (`cp --reflink=auto`) enabling `commit --merge`.
+
+Arbitration: one executing session per target (flock; `--wait` queues), and a
+new session is refused while another is pending on the same target (`--stack`
+overrides).
 
 ## Backends
 
@@ -68,19 +96,20 @@ external changes** made while the session was pending.
 
 Auto-detected, kernel preferred. `overlord doctor` shows what's active.
 
-**Containment scope (both backends):** the transactional guarantee covers the
-target tree. OVERLORD v0 is not a jail — the command can still write elsewhere
-on the filesystem. Full isolation (pivot_root, network scoping) is the
-capability-manifest milestone.
+**Containment scope:** without `--jail`, the transactional guarantee covers the
+target tree only — the command can still write elsewhere on the filesystem.
+With `--jail` (kernel backend), the rest of the filesystem does not exist for
+the process; add `--net none` to remove the network as well.
 
 ## Provenance
 
 Every session records `provenance.jsonl` — one record per change with sha256
 before (lower) and after (upper), which survives commit. With `--trace`, a
 syscall-level record (`syscalls.jsonl`: exec, file mutation, connect, per pid,
-timestamped) is captured via strace. `packaging/ebpf/provenance.bt` is the
-experimental bpftrace equivalent — lower overhead, unfakeable by the traced
-process, root-only, not yet wired into the CLI.
+timestamped) is captured via strace. `--trace ebpf` uses the bpftrace recorder
+instead (installed to /usr/local/lib/overlord/provenance.bt) — lower overhead
+and unfakeable by the traced process, but root-only and with a known
+attach-race at process start.
 
 ## Test
 
@@ -88,18 +117,19 @@ process, root-only, not yet wired into the CLI.
 bash test/smoke.sh
 ```
 
-E2E assertions: isolation, diff completeness, provenance hashes, byte-identical
-rollback, exact-replay commit, commit finality, conflict refusal + `--force`,
-create-collision refusal, shell, syscall trace, absolute-path containment.
-Trace and containment tests self-skip on hosts without strace / userns grants.
+18 e2e assertions: isolation, diff completeness, provenance hashes,
+byte-identical rollback, exact-replay commit, commit finality, conflict refusal
++ `--force`, create-collision refusal, shell, syscall trace, absolute-path
+containment, mode-000 cleanup, timeout, manifest, arbitration, three-way merge,
+jail sealing, net:none isolation. Kernel-only tests self-skip where userns
+grants are absent.
 
 ## Roadmap
 
-- capability manifests: scoped grants (paths, egress, budget) enforced at run
-- pivot_root jail + network namespace scoping for the kernel backend
-- eBPF provenance wired into `--trace` (bpftrace script exists, unwired)
-- arbitration: session locks per target, queueing for contending agents
-- merge-on-commit (three-way) instead of refuse-on-drift
+- fine-grained path grants (extra read-only / writable mounts in the jail)
+- token/cost budget grants for LLM-backed agents
+- eBPF recorder hardening (attach-race close, structured output)
+- multi-target sessions; cross-target atomic commit
 
 ## Status
 
@@ -108,3 +138,6 @@ Trace and containment tests self-skip on hosts without strace / userns grants.
 - 2026-09-01 — v0.1: conflict detection, provenance flight recorder (hashes +
   strace), interactive shell, kernel-backend overmount containment, AppArmor
   packaging, installer.
+- 2026-09-01 — v0.2: capability manifests (jail / net / timeout), pivot_root
+  jail, network scoping, arbitration (locks + pending guard), three-way merge
+  on commit, eBPF recorder wired (`--trace ebpf`, root-only).

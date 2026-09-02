@@ -142,4 +142,93 @@ $OVERLORD rollback "$SID" > /dev/null || fail "rollback died on mode-000 work di
 [ ! -d "$OVERLORD_HOME/sessions/$SID" ] || fail "session dir survived rollback"
 pass "mode-000 cleanup"
 
+# --- 13. timeout grant kills the process group
+reset_target
+if OUT=$($OVERLORD run --timeout 1 -t "$TARGET" -- sleep 30 2>/dev/null); then
+    fail "timeout did not produce nonzero exit"
+fi
+SID=$($OVERLORD sessions | grep timed-out | tail -1 | cut -d' ' -f1)
+[ -n "$SID" ] || fail "timed-out session not recorded"
+$OVERLORD rollback "$SID" > /dev/null
+pass "timeout grant"
+
+# --- 14. manifest file drives grants
+reset_target
+echo '{"timeout": 1}' > "$WORK/cap.json"
+if $OVERLORD run --manifest "$WORK/cap.json" -t "$TARGET" -- sleep 30 > /dev/null 2>&1; then
+    fail "manifest timeout not enforced"
+fi
+$OVERLORD rollback "$($OVERLORD sessions | grep timed-out | tail -1 | cut -d' ' -f1)" > /dev/null
+pass "capability manifest"
+
+# --- 15. arbitration: pending session blocks new runs; --stack overrides
+reset_target
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'echo a > a.txt'); SIDA=$(sid_of "$OUT")
+if $OVERLORD run -t "$TARGET" -- true > /dev/null 2>&1; then
+    fail "second run allowed with pending session"
+fi
+OUT=$($OVERLORD run --stack -t "$TARGET" -- true); SIDB=$(sid_of "$OUT")
+$OVERLORD rollback "$SIDA" > /dev/null; $OVERLORD rollback "$SIDB" > /dev/null
+pass "arbitration"
+
+# --- 16. three-way merge: non-overlapping drift merges; overlapping refuses
+reset_target
+printf 'l1\nl2\nl3\n' > "$TARGET/merge.txt"
+OUT=$($OVERLORD run --merge-base -t "$TARGET" -- bash -c "sed -i 's/l1/session1/' merge.txt")
+SID=$(sid_of "$OUT")
+sleep 0.01; sed -i 's/l3/external3/' "$TARGET/merge.txt"
+$OVERLORD commit "$SID" 2>/dev/null && fail "drift committed without merge" || true
+$OVERLORD commit --merge "$SID" > /dev/null || fail "clean three-way merge refused"
+grep -q session1 "$TARGET/merge.txt" && grep -q external3 "$TARGET/merge.txt" \
+  || fail "merge lost an edit"
+# overlapping edit must refuse even with --merge
+printf 'x1\nx2\n' > "$TARGET/clash.txt"
+OUT=$($OVERLORD run --merge-base -t "$TARGET" -- bash -c "sed -i 's/x1/session/' clash.txt")
+SID=$(sid_of "$OUT")
+sleep 0.01; sed -i 's/x1/external/' "$TARGET/clash.txt"
+$OVERLORD commit --merge "$SID" 2>/dev/null && fail "overlapping edit merged silently" || true
+$OVERLORD rollback "$SID" > /dev/null
+pass "three-way merge"
+
+KERNEL_OK=false
+if $OVERLORD doctor 2>/dev/null | grep -q 'kernel backend.*: available'; then KERNEL_OK=true; fi
+
+# --- 17. jail grant: rest of the filesystem does not exist (kernel only)
+if $KERNEL_OK; then
+    reset_target
+    OUT=$($OVERLORD run --jail -t "$TARGET" -- bash -c \
+      '[ ! -d /home ] && [ ! -d /mnt ] && echo sealed > verdict.txt; ls /usr > /dev/null && echo tools >> verdict.txt')
+    SID=$(sid_of "$OUT")
+    $OVERLORD diff "$SID" | grep -q 'added.*verdict.txt' || fail "jail session lost its write"
+    $OVERLORD commit "$SID" > /dev/null
+    grep -q sealed "$TARGET/verdict.txt" || fail "jail did not seal the filesystem"
+    grep -q tools "$TARGET/verdict.txt"  || fail "jail broke system dir access"
+    pass "jail grant"
+else
+    echo "  skip: jail grant (kernel backend unavailable)"
+fi
+
+# --- 18. net:none grant: even loopback to host services is unreachable (kernel only)
+if $KERNEL_OK; then
+    reset_target
+    python3 -m http.server 8377 --bind 127.0.0.1 --directory "$TARGET" > /dev/null 2>&1 &
+    HTTP_PID=$!
+    sleep 0.7
+    OUT=$($OVERLORD run -t "$TARGET" -- bash -c \
+      'if (echo > /dev/tcp/127.0.0.1/8377) 2>/dev/null; then echo open > net.txt; else echo closed > net.txt; fi')
+    SID=$(sid_of "$OUT")
+    grep -q '"after' "$OVERLORD_HOME/sessions/$SID/provenance.jsonl" || true
+    $OVERLORD commit "$SID" > /dev/null
+    grep -q open "$TARGET/net.txt" || fail "host-net control failed (server unreachable?)"
+    OUT=$($OVERLORD run --net none -t "$TARGET" -- bash -c \
+      'if (echo > /dev/tcp/127.0.0.1/8377) 2>/dev/null; then echo open > net.txt; else echo closed > net.txt; fi')
+    SID=$(sid_of "$OUT")
+    $OVERLORD commit --force "$SID" > /dev/null
+    kill "$HTTP_PID" 2>/dev/null || true
+    grep -q closed "$TARGET/net.txt" || fail "net:none did not isolate the network"
+    pass "net:none grant"
+else
+    echo "  skip: net:none grant (kernel backend unavailable)"
+fi
+
 echo "PASS: all smoke assertions"

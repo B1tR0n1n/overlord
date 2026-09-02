@@ -231,4 +231,18 @@ else
     echo "  skip: net:none grant (kernel backend unavailable)"
 fi
 
+# --- 19. jail + strace combo: trace lands, records stay sealed (kernel only)
+if $KERNEL_OK && command -v strace > /dev/null; then
+    reset_target
+    OUT=$($OVERLORD run --jail --trace -t "$TARGET" -- bash -c \
+      'echo t > t.txt; ls /.overlord/manifest.json 2>/dev/null && echo BOOKS || echo SEALED')
+    SID=$(sid_of "$OUT")
+    [ -s "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" ] || fail "jail+trace produced no syscall log"
+    grep -q BOOKS <<< "$OUT" && fail "session records visible in jail+trace mode" || true
+    $OVERLORD rollback "$SID" > /dev/null
+    pass "jail + trace (records sealed)"
+else
+    echo "  skip: jail+trace combo"
+fi
+
 echo "PASS: all smoke assertions"

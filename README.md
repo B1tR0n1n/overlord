@@ -148,10 +148,13 @@ attach-race at process start.
 ## Test
 
 ```bash
-bash test/smoke.sh
+bash test/smoke.sh              # 19 core transactional assertions
+bash test/redteam.sh            # 10 jail escape attempts (kernel backend)
+python3 test/daemon_sdk_test.py # 8 daemon + SDK + policy assertions
+python3 test/ui_test.py         # 5 mission-control assertions
 ```
 
-18 e2e assertions: isolation, diff completeness, provenance hashes,
+Core suite (`smoke.sh`): isolation, diff completeness, provenance hashes,
 byte-identical rollback, exact-replay commit, commit finality, conflict refusal
 + `--force`, create-collision refusal, shell, syscall trace, absolute-path
 containment, mode-000 cleanup, timeout, manifest, arbitration, three-way merge,

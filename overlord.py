@@ -1031,6 +1031,11 @@ def cmd_log(args):
             before = (rec.get("before_sha256") or "-")[:12]
             after = (rec.get("after_sha256") or "-")[:12]
             print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
+            cause = rec.get("caused_by")
+            if cause:
+                print(f"{'':12s}   caused_by: turn {cause.get('turn')} "
+                      f"{cause.get('tool')}({cause.get('summary', '')}) "
+                      f"[{cause.get('tool_call_id')}]")
     for name, label in (("syscalls.jsonl", "syscall trace"), ("ebpf.log", "ebpf trace")):
         p = os.path.join(sdir, name)
         if os.path.isfile(p):

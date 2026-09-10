@@ -70,24 +70,29 @@ class OverlordClient:
         self.socket_path = socket_path or DEFAULT_SOCKET
         self.timeout = timeout
 
-    def _call(self, op, **kw):
+    def _call(self, op, on_event=None, **kw):
+        """One request, one final response. Streaming ops send intermediate
+        {"event": ...} lines first; each is passed to on_event."""
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.timeout)
                 sock.connect(self.socket_path)
                 sock.sendall((json.dumps({"op": op, **kw}) + "\n").encode())
-                buf = b""
-                while not buf.endswith(b"\n"):
-                    chunk = sock.recv(1 << 16)
-                    if not chunk:
-                        break
-                    buf += chunk
+                rf = sock.makefile("rb")
+                for line in rf:
+                    resp = json.loads(line)
+                    if resp.get("ok") and "event" in resp:
+                        if on_event:
+                            on_event(resp)
+                        continue
+                    break
+                else:
+                    raise OSError("connection closed before a response")
         except OSError as e:
             raise OverlordError(
                 f"cannot reach overlordd at {self.socket_path}: {e} "
                 "(is `overlord daemon` running?)"
             ) from e
-        resp = json.loads(buf)
         if not resp.get("ok"):
             raise OverlordError(resp.get("error", "unknown daemon error"))
         return resp
@@ -107,5 +112,55 @@ class OverlordClient:
         return Session(self, res["sid"], res["exit_code"], res["changes"],
                        res["grants"], res.get("output_tail", ""))
 
+    def open(self, target, jail=False, net="host", timeout=None, merge_base=False,
+             trace=None, wait=False, stack=False, agent=None):
+        """Open a live transaction: many commands, one commit. Returns LiveSession."""
+        res = self._call(
+            "open", target=str(target),
+            grants={"jail": jail, "net": net, "timeout": timeout,
+                    "merge_base": merge_base},
+            trace=trace, wait=wait, stack=stack, agent=agent,
+        )
+        return LiveSession(self, res["sid"], res["grants"], res["backend"])
+
     def sessions(self):
         return self._call("sessions")["sessions"]
+
+
+class LiveSession:
+    """A session that is still open on the daemon. exec() as many times as
+    needed, then close() to get the reviewable Session (or rollback())."""
+
+    def __init__(self, client, sid, grants, backend):
+        self._c, self.sid, self.grants, self.backend = client, sid, grants, backend
+
+    def exec(self, cmd, timeout=None, cwd=None, label=None, on_output=None):
+        """Run cmd inside the transaction. Streams output chunks to on_output.
+        Returns (exit_code, output, changes_so_far)."""
+        import base64
+
+        def _ev(ev):
+            if on_output and ev.get("event") == "out":
+                on_output(base64.b64decode(ev["data"]))
+        res = self._c._call("exec", on_event=_ev, sid=self.sid, cmd=list(cmd),
+                            timeout=timeout, cwd=cwd, label=label)
+        return res["exit_code"], res["output"], [tuple(c) for c in res["changes"]]
+
+    def shell(self, script, **kw):
+        return self.exec(["bash", "-c", script], **kw)
+
+    def diff(self):
+        return [tuple(c) for c in self._c._call("diff", sid=self.sid)["changes"]]
+
+    def close(self):
+        """Seal the transaction; returns a Session to inspect/commit/rollback."""
+        res = self._c._call("close", sid=self.sid)
+        return Session(self._c, self.sid, res.get("exit_code"),
+                       [tuple(c) for c in res["changes"]], res.get("grants"),
+                       res.get("output_tail", ""))
+
+    def rollback(self):
+        return self._c._call("rollback", sid=self.sid)["target"]
+
+    def __repr__(self):
+        return f"<LiveSession {self.sid} open>"

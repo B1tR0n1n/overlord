@@ -137,7 +137,7 @@ def prepare_kernel(target, sdir, cmd, grants):
     if grants.get("net") == "none":
         argv.append("--net")
     if grants.get("jail"):
-        argv += ["--pid", "--fork"]
+        argv += ["--pid", "--fork", "--uts", "--ipc"]
         os.makedirs(os.path.join(sdir, "jail"), exist_ok=True)
         inner = _jail_script(target, opts, sdir, cmd,
                              bind_trace=grants.get("_bind_trace", False))
@@ -192,7 +192,8 @@ def load_meta(sid):
     if not os.path.isfile(path):
         raise SystemExit(f"error: no such session: {sid}")
     with open(path) as f:
-        return json.load(f)
+        meta = json.load(f)
+    return reconcile_session(sid, meta)
 
 
 def save_meta(sid, meta):
@@ -213,7 +214,7 @@ def pending_sessions_for(target):
     hits = []
     for sid in list_sessions():
         m = load_meta(sid)
-        if m.get("status") == "pending" and m.get("target") == target:
+        if m.get("status") in ("pending", "open") and m.get("target") == target:
             hits.append(sid)
     return hits
 
@@ -562,9 +563,287 @@ def load_grants(args):
     return grants
 
 
-def execute_session(target, cmd, backend, grants, trace=None, wait=False,
-                    stack=False, capture=False):
-    """Core transactional run. Returns (sid, exit_code, changes)."""
+# ---------------------------------------------------------------- live sessions
+#
+# A live session keeps the overlay mounted (and the jail/netns alive) for as
+# long as its holder process runs, so N commands can execute inside one
+# transaction. The holder is a tiny executor loop (python, inline source —
+# nothing from the session dir is exposed to the jail) that speaks JSON lines
+# over an inherited socketpair: run / kill / close. It exits on EOF, so a
+# dead opener always tears the namespace down; the session dir is then
+# reconciled to "pending" by whoever loads it next.
+
+_EXECUTOR_SRC = r"""
+import base64, json, os, signal, socket, subprocess, sys, threading
+sock = socket.socket(fileno=int(sys.argv[1]))
+rf = sock.makefile("rb")
+wl = threading.Lock()
+procs = {}
+def send(o):
+    with wl:
+        sock.sendall((json.dumps(o) + "\n").encode())
+def run(req):
+    rid, cmd = req["id"], req["cmd"]
+    cwd = os.path.join(os.getcwd(), req["cwd"]) if req.get("cwd") else None
+    kw = {}
+    if req.get("capture", True):
+        kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True, **kw)
+    except OSError as e:
+        send({"id": rid, "exit": 127, "error": str(e)}); return
+    procs[rid] = p
+    if p.stdout is not None:
+        while True:
+            chunk = p.stdout.read1(65536)
+            if not chunk: break
+            send({"id": rid, "out": base64.b64encode(chunk).decode()})
+    rc = p.wait()
+    procs.pop(rid, None)
+    send({"id": rid, "exit": rc})
+def killall():
+    for p in list(procs.values()):
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except OSError: pass
+send({"ready": True, "pid": os.getpid()})
+for line in rf:
+    try: req = json.loads(line)
+    except ValueError: continue
+    if req.get("op") == "run":
+        threading.Thread(target=run, args=(req,), daemon=True).start()
+    elif req.get("op") == "kill":
+        p = procs.get(req.get("id"))
+        if p:
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except OSError: pass
+    elif req.get("op") == "close":
+        break
+killall()
+os._exit(0)
+"""
+
+
+class LiveSession:
+    """An open transaction: overlay mounted, holder alive, commands accepted."""
+
+    def __init__(self, sid, meta, proc, sock, lock, cleanup, ebpf, trace_inside):
+        import queue
+        import socket as _socket
+        import threading
+        self.sid, self.meta, self.proc = sid, meta, proc
+        self.sdir = session_path(sid)
+        self._sock, self._lock, self._cleanup, self._ebpf = sock, lock, cleanup, ebpf
+        self._trace_inside = trace_inside
+        self._q = {}
+        self._qlock = threading.Lock()
+        self._wlock = threading.Lock()
+        self._queue = queue
+        self.expired = False
+        self.closed = False
+        self._ready = threading.Event()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._deadline = None
+        t = meta["grants"].get("timeout")
+        if t:
+            self._deadline = threading.Timer(t, self._expire)
+            self._deadline.daemon = True
+            self._deadline.start()
+        if not self._ready.wait(30):
+            self._kill()
+            raise SystemExit("error: session holder did not start (backend failure?)")
+
+    # -- transport
+    def _read_loop(self):
+        rf = self._sock.makefile("rb")
+        for line in rf:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("ready"):
+                self._ready.set()
+                continue
+            with self._qlock:
+                q = self._q.get(msg.get("id"))
+            if q:
+                q.put(msg)
+        # EOF: holder is gone — release every waiter
+        with self._qlock:
+            for q in self._q.values():
+                q.put({"exit": TIMEOUT_RC if self.expired else 137, "eof": True})
+
+    def _send(self, obj):
+        with self._wlock:
+            try:
+                self._sock.sendall((json.dumps(obj) + "\n").encode())
+            except OSError:
+                pass
+
+    def _kill(self):
+        try:
+            os.killpg(self.proc.pid, 9)
+        except OSError:
+            pass
+
+    def _expire(self):
+        self.expired = True
+        self.meta["timed_out"] = True
+        self._kill()
+
+    # -- api
+    def exec(self, cmd, timeout=None, capture=True, cwd=None, on_output=None,
+             label=None):
+        """Run one command inside the transaction. Returns (rc, output_bytes)."""
+        import threading
+        if self.closed or self.expired:
+            raise SystemExit("error: session is closed" if self.closed else
+                             "error: session expired (timeout grant)")
+        rid = uuid.uuid4().hex[:8]
+        q = self._queue.Queue()
+        with self._qlock:
+            self._q[rid] = q
+        real_cmd = list(cmd)
+        if self._trace_inside:
+            real_cmd = ["strace", "-f", "-qq", "-ttt", "-e",
+                        "trace=%file,%process,%network", "-o",
+                        f"{self._trace_inside}/raw.{rid}.strace"] + real_cmd
+        rec = {"id": rid, "cmd": list(cmd), "label": label,
+               "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        self.meta.setdefault("execs", []).append(rec)
+        if not self.meta.get("cmd"):
+            self.meta["cmd"] = list(cmd)
+        save_meta(self.sid, self.meta)
+        self._send({"op": "run", "id": rid, "cmd": real_cmd, "capture": capture,
+                    "cwd": cwd})
+        timer = None
+        timed_out = [False]
+        if timeout:
+            def _kill_exec():
+                timed_out[0] = True
+                self._send({"op": "kill", "id": rid})
+            timer = threading.Timer(timeout, _kill_exec)
+            timer.daemon = True
+            timer.start()
+        out = bytearray()
+        outlog = open(os.path.join(self.sdir, "output.log"), "ab") if capture else None
+        try:
+            while True:
+                msg = q.get()
+                if "out" in msg:
+                    import base64
+                    chunk = base64.b64decode(msg["out"])
+                    out += chunk
+                    if outlog:
+                        outlog.write(chunk)
+                        outlog.flush()
+                    if on_output:
+                        on_output(chunk)
+                if "exit" in msg:
+                    rc = msg["exit"]
+                    if msg.get("error") and outlog:
+                        outlog.write((msg["error"] + "\n").encode())
+                    break
+        finally:
+            if timer:
+                timer.cancel()
+            if outlog:
+                outlog.close()
+            with self._qlock:
+                self._q.pop(rid, None)
+        if timed_out[0] or (self.expired and rc in (137, TIMEOUT_RC)):
+            rc = TIMEOUT_RC
+            rec["timed_out"] = True
+        rec.update(exit_code=rc, finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        save_meta(self.sid, self.meta)
+        return rc, bytes(out)
+
+    def changes(self):
+        return compute_diff(os.path.join(self.sdir, "upper"), self.meta["target"])
+
+    def close(self):
+        """Tear the namespace down and finalize the session as pending.
+        Returns (sid, changes)."""
+        if self.closed:
+            return self.sid, self.changes()
+        self.closed = True
+        if self._deadline:
+            self._deadline.cancel()
+        self._send({"op": "close"})
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._kill()
+            self.proc.wait()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._cleanup:
+            self._cleanup()
+        if self._ebpf:
+            self._ebpf.terminate()
+        fcntl.flock(self._lock, fcntl.LOCK_UN)
+        self._lock.close()
+        changes = _finalize_session(self.sid, self.meta)
+        return self.sid, changes
+
+
+def _finalize_session(sid, meta):
+    """Compute diff + provenance, parse traces, mark pending. Idempotent."""
+    sdir = session_path(sid)
+    upper = os.path.join(sdir, "upper")
+    changes = compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
+    with open(os.path.join(sdir, "provenance.jsonl"), "w") as f:
+        for rec in build_provenance(changes, upper, meta["target"]):
+            f.write(json.dumps(rec) + "\n")
+    tdir = os.path.join(sdir, "trace")
+    if meta.get("trace") == "strace" and os.path.isdir(tdir):
+        raws = sorted(p for p in os.listdir(tdir) if p.endswith(".strace"))
+        raw = os.path.join(sdir, "raw.strace")
+        with open(raw, "wb") as out:
+            for p in raws:
+                with open(os.path.join(tdir, p), "rb") as f:
+                    shutil.copyfileobj(f, out)
+        with open(os.path.join(sdir, "syscalls.jsonl"), "w") as f:
+            for ev in parse_strace(raw):
+                f.write(json.dumps(ev) + "\n")
+    execs = meta.get("execs") or []
+    rc = execs[-1].get("exit_code") if execs else None
+    if any(e.get("timed_out") for e in execs) or meta.get("timed_out"):
+        meta["timed_out"] = True
+        if rc is None or rc == 0:
+            rc = TIMEOUT_RC
+    meta.update(exit_code=rc, status="pending",
+                finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    meta.pop("holder_pid", None)
+    save_meta(sid, meta)
+    return changes
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def reconcile_session(sid, meta):
+    """An 'open' session whose holder is gone (opener crashed) becomes pending."""
+    if meta.get("status") == "open":
+        pid = meta.get("holder_pid")
+        if not pid or not _pid_alive(pid):
+            _finalize_session(sid, meta)
+    return meta
+
+
+def open_session(target, backend, grants, trace=None, wait=False, stack=False,
+                 capture=False, agent=None):
+    """Snapshot the target, mount the overlay, start the holder. Returns LiveSession."""
+    import socket
     target = os.path.realpath(target)
     if not os.path.isdir(target):
         raise SystemExit(f"error: target is not a directory: {target}")
@@ -598,72 +877,61 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
         )
 
     grants = dict(grants)
-    raw_trace = os.path.join(sdir, "raw.strace")
+    trace_inside = None
     if trace == "strace":
         if not shutil.which("strace"):
             raise SystemExit("error: --trace requires strace (sudo apt install strace)")
+        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
         if grants.get("jail"):
             # red team finding A3: never expose session records to the jail —
             # strace gets an isolated trace/ subdir bound at /.overlord
             grants["_bind_trace"] = True
-            os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
-            raw_trace = os.path.join(sdir, "trace", "raw.strace")
-            strace_out = "/.overlord/raw.strace"
+            trace_inside = "/.overlord"
         else:
-            strace_out = raw_trace
-        cmd = ["strace", "-f", "-qq", "-ttt", "-e",
-               "trace=%file,%process,%network", "-o", strace_out] + cmd
+            trace_inside = os.path.join(sdir, "trace")
 
     meta = {
-        "id": sid, "target": target, "cmd": cmd, "backend": backend,
+        "id": sid, "target": target, "cmd": [], "execs": [], "backend": backend,
         "grants": {k: v for k, v in grants.items() if not k.startswith("_")},
-        "trace": trace,
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "running",
+        "trace": trace, "agent": agent,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "open",
     }
-    save_meta(sid, meta)
 
-    argv, cwd, cleanup = PREPARE[backend](target, sdir, cmd, grants)
-    ebpf = None
-    outfile = None
-    popen_kw = {}
+    parent_sock, child_sock = socket.socketpair()
+    py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
+    executor = [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
+    argv, cwd, cleanup = PREPARE[backend](target, sdir, executor, grants)
+    popen_kw = {"pass_fds": (child_sock.fileno(),)}
     if capture:
-        outfile = open(os.path.join(sdir, "output.log"), "wb")
-        popen_kw = {"stdout": outfile, "stderr": subprocess.STDOUT,
-                    "stdin": subprocess.DEVNULL}
+        outfile = open(os.path.join(sdir, "output.log"), "ab")
+        popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     try:
         proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, **popen_kw)
-        if trace == "ebpf":
-            ebpf = start_ebpf(proc.pid, sdir)
-        try:
-            rc = proc.wait(timeout=grants.get("timeout"))
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            proc.wait()
-            rc = TIMEOUT_RC
-            meta["timed_out"] = True
-    finally:
+    except OSError:
         if cleanup:
             cleanup()
-        if ebpf:
-            ebpf.terminate()
-        if outfile:
+        raise
+    finally:
+        child_sock.close()
+        if capture:
             outfile.close()
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
-
-    upper = os.path.join(sdir, "upper")
-    changes = compute_diff(upper, target)
-    with open(os.path.join(sdir, "provenance.jsonl"), "w") as f:
-        for rec in build_provenance(changes, upper, target):
-            f.write(json.dumps(rec) + "\n")
-    if trace == "strace" and os.path.isfile(raw_trace):
-        with open(os.path.join(sdir, "syscalls.jsonl"), "w") as f:
-            for ev in parse_strace(raw_trace):
-                f.write(json.dumps(ev) + "\n")
-
-    meta.update(exit_code=rc, status="pending",
-                finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    meta["holder_pid"] = proc.pid
     save_meta(sid, meta)
+    ebpf = start_ebpf(proc.pid, sdir) if trace == "ebpf" else None
+    return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+
+
+def execute_session(target, cmd, backend, grants, trace=None, wait=False,
+                    stack=False, capture=False):
+    """One-shot transactional run (open, exec, close). Returns (sid, exit_code, changes)."""
+    live = open_session(target, backend, grants, trace=trace, wait=wait,
+                        stack=stack, capture=capture)
+    try:
+        rc, _ = live.exec(cmd, capture=capture)
+    finally:
+        sid, changes = live.close()
+    if live.expired:
+        rc = TIMEOUT_RC
     return sid, rc, changes
 
 
@@ -717,8 +985,14 @@ def cmd_sessions(args):
             (("jail", g.get("jail")), ("net:none", g.get("net") == "none"),
              ("timed-out", m.get("timed_out"))) if on
         )
+        execs = m.get("execs") or []
+        what = shlex.join(m.get("cmd") or [])
+        if len(execs) > 1:
+            what = f"{len(execs)} commands, first: {what}"
+        if m.get("agent"):
+            what = f"agent {m['agent']} — {what}"
         print(f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
-              f"{m.get('target', '')}  :: {shlex.join(m.get('cmd', []))}")
+              f"{m.get('target', '')}  :: {what}")
     return 0
 
 
@@ -791,6 +1065,15 @@ def rollback_session(sid):
     m = load_meta(sid)
     if m.get("status") == "committed":
         raise SystemExit("error: session already committed; nothing to roll back")
+    if m.get("status") == "open" and m.get("holder_pid"):
+        try:
+            os.killpg(m["holder_pid"], 9)
+        except OSError:
+            pass
+        for _ in range(50):
+            if not _pid_alive(m["holder_pid"]):
+                break
+            time.sleep(0.1)
     _force_rmtree(session_path(sid))
     return m["target"]
 
@@ -939,16 +1222,79 @@ def _api_log(req):
     return {"provenance": records}
 
 
+# live sessions brokered by this daemon process: sid -> LiveSession
+LIVE = {}
+LIVE_LOCK = None  # created lazily (threading) in cmd_daemon
+
+
+def _live(sid):
+    ls = LIVE.get(sid)
+    if ls is None:
+        raise SystemExit(f"error: session {sid} is not open in this daemon")
+    return ls
+
+
+def _api_open(req):
+    target = os.path.realpath(req["target"])
+    requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    requested.update(req.get("grants") or {})
+    grants, _rule = resolve_policy(target, requested)
+    ls = open_session(target, req.get("backend"), grants, trace=req.get("trace"),
+                      wait=bool(req.get("wait")), stack=bool(req.get("stack")),
+                      capture=True, agent=req.get("agent"))
+    LIVE[ls.sid] = ls
+    return {"sid": ls.sid, "grants": grants, "backend": ls.meta["backend"]}
+
+
+def _api_exec(req, emit):
+    """Streaming op: emits {"event":"out","data":...} lines, then the final result."""
+    ls = _live(req["sid"])
+    import base64
+    rc, out = ls.exec(list(req["cmd"]), timeout=req.get("timeout"), cwd=req.get("cwd"),
+                      label=req.get("label"),
+                      on_output=lambda chunk: emit(
+                          {"ok": True, "event": "out",
+                           "data": base64.b64encode(chunk).decode()}))
+    return {"exit_code": rc, "output": out.decode(errors="replace"),
+            "changes": ls.changes()}
+
+
+def _api_close(req):
+    ls = LIVE.pop(req["sid"], None)
+    if ls is None:
+        m = load_meta(req["sid"])  # may reconcile an orphan
+        return {"sid": req["sid"], "status": m.get("status"), "changes": []}
+    sid, changes = ls.close()
+    m = load_meta(sid)
+    out_path = os.path.join(session_path(sid), "output.log")
+    tail = ""
+    if os.path.isfile(out_path):
+        with open(out_path, errors="replace") as f:
+            tail = "".join(f.readlines()[-50:])
+    return {"sid": sid, "exit_code": m.get("exit_code"), "changes": changes,
+            "grants": m.get("grants"), "output_tail": tail}
+
+
+def _api_rollback(req):
+    ls = LIVE.pop(req["sid"], None)
+    if ls is not None:
+        ls.close()
+    return {"target": rollback_session(req["sid"])}
+
+
 DAEMON_OPS = {
     "ping": lambda req: {"version": VERSION, "pid": os.getpid()},
     "run": _api_run,
+    "open": _api_open,
+    "close": _api_close,
     "diff": lambda req: {"changes": compute_diff(
         os.path.join(session_path(req["sid"]), "upper"), load_meta(req["sid"])["target"])},
     "log": _api_log,
     "commit": _api_commit,
-    "rollback": lambda req: {"target": rollback_session(req["sid"])},
+    "rollback": _api_rollback,
     "sessions": lambda req: {"sessions": [load_meta(s) for s in list_sessions()]},
 }
+STREAMING_OPS = {"exec": _api_exec}
 
 
 def cmd_daemon(args):
@@ -961,13 +1307,20 @@ def cmd_daemon(args):
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
+            def emit(obj):
+                self.wfile.write((json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+
             for line in self.rfile:
                 try:
                     req = json.loads(line)
                     op = req.get("op")
-                    if op not in DAEMON_OPS:
+                    if op in STREAMING_OPS:
+                        resp = {"ok": True, **STREAMING_OPS[op](req, emit)}
+                    elif op in DAEMON_OPS:
+                        resp = {"ok": True, **DAEMON_OPS[op](req)}
+                    else:
                         raise ValueError(f"unknown op: {op}")
-                    resp = {"ok": True, **DAEMON_OPS[op](req)}
                 except SystemExit as e:
                     resp = {"ok": False, "error": str(e)}
                 except Exception as e:  # daemon must survive any request
@@ -987,6 +1340,12 @@ def cmd_daemon(args):
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            for ls in list(LIVE.values()):
+                try:
+                    ls.close()
+                except Exception:
+                    pass
     return 0
 
 

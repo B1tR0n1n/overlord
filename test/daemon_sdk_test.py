@@ -112,7 +112,102 @@ try:
         fail("sessions op")
     ok("sessions over socket")
 
-    print("PASS: daemon + sdk + policy")
+    # 9. live session: many commands, one transaction, streamed output
+    with open(os.path.join(OVERLORD_HOME, "policy.json"), "w") as f:
+        json.dump({"default": {}}, f)
+    with open(os.path.join(target, "app.conf"), "w") as f:
+        f.write("v1\n")
+    live = ov.open(target, agent="test")
+    chunks = []
+    rc, out, ch = live.shell("echo step-one; echo a > a.txt",
+                             on_output=lambda b: chunks.append(b))
+    if rc != 0 or "step-one" not in out or b"step-one" not in b"".join(chunks):
+        fail(f"live exec 1: rc={rc} out={out!r} chunks={chunks!r}")
+    if ("added", "a.txt") not in ch:
+        fail(f"live exec 1 changes: {ch}")
+    rc, out, ch = live.shell("cat a.txt > b.txt; rm a.txt; echo v2 > app.conf")
+    if rc != 0 or ("added", "b.txt") not in ch or ("modified", "app.conf") not in ch:
+        fail(f"live exec 2 changes: {ch}")
+    if open(os.path.join(target, "app.conf")).read() != "v1\n":
+        fail("live session mutated target before close/commit")
+    ok("live session: multi-exec + streaming + cumulative diff")
+
+    # 10. live session cannot be committed until closed; close seals it
+    try:
+        Session = type(s)
+        Session(ov, live.sid, 0, [], {}).commit()
+        fail("committed an open session")
+    except OverlordError as e:
+        if "not pending" not in str(e):
+            fail(f"wrong open-commit refusal: {e}")
+    sealed = live.close()
+    if sealed.exit_code != 0 or ("added", "b.txt") not in sealed.changes:
+        fail(f"close: {sealed}")
+    metas = {m["id"]: m for m in ov.sessions()}
+    if metas[sealed.sid]["status"] != "pending" or len(metas[sealed.sid]["execs"]) != 2:
+        fail(f"sealed meta: {metas[sealed.sid]}")
+    sealed.commit()
+    if open(os.path.join(target, "b.txt")).read() != "a\n":
+        fail("live session commit did not apply")
+    ok("live session: open blocks commit, close seals, commit applies")
+
+    # 11. per-exec timeout kills only that command; session survives
+    live = ov.open(target)
+    rc, _, _ = live.exec(["sleep", "30"], timeout=1)
+    if rc != 124:
+        fail(f"exec timeout rc={rc}")
+    rc, out, _ = live.shell("echo still-alive")
+    if rc != 0 or "still-alive" not in out:
+        fail("session died with the timed-out command")
+    ok("live session: per-exec timeout")
+
+    # 12. rollback while open tears the holder down
+    live.rollback()
+    if any(m["id"] == live.sid for m in ov.sessions()):
+        fail("open session survived rollback")
+    try:
+        live.shell("true")
+        fail("exec succeeded on a rolled-back session")
+    except OverlordError:
+        pass
+    ok("live session: rollback while open")
+
+    # 13. session-level timeout grant expires the whole transaction
+    live = ov.open(target, timeout=1)
+    rc, _, _ = live.exec(["sleep", "30"])
+    if rc != 124:
+        fail(f"session timeout rc={rc}")
+    try:
+        live.shell("true")
+        fail("exec succeeded after session expiry")
+    except OverlordError as e:
+        if "expired" not in str(e):
+            fail(f"wrong expiry error: {e}")
+    sealed = live.close()
+    if not {m["id"]: m for m in ov.sessions()}[sealed.sid].get("timed_out"):
+        fail("expired session not marked timed_out")
+    sealed.rollback()
+    ok("live session: timeout grant expiry")
+
+    # 14. orphan reconcile: a dead opener leaves a pending session, not a wedged one
+    orphan = ov.open(target)
+    orphan.shell("echo orphan > o.txt")
+    daemon.kill(); daemon.wait()               # daemon dies hard with a session open
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ov", os.path.join(HERE, "overlord.py"))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    for _ in range(50):
+        if mod.load_meta(orphan.sid).get("status") == "pending":
+            break
+        time.sleep(0.1)
+    m = mod.load_meta(orphan.sid)
+    if m.get("status") != "pending" or ("added", "o.txt") not in [tuple(c) for c in mod.compute_diff(
+            os.path.join(mod.session_path(orphan.sid), "upper"), target)]:
+        fail(f"orphan not reconciled: {m}")
+    mod.rollback_session(orphan.sid)
+    ok("orphan session reconciled to pending")
+
+    print("PASS: daemon + sdk + policy + live sessions")
 finally:
     daemon.terminate()
     daemon.wait()

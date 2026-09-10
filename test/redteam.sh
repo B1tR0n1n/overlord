@@ -58,8 +58,10 @@ if grep -q BOOKS-VISIBLE <<< "$OUT"; then breach "A3 session records (manifest/m
 else hold "A3 session records sealed"; fi
 
 # --- A4: host sysctl write
+HOST_BEFORE=$(hostname)
 OUT=$(attack 'echo owned > /proc/sys/kernel/hostname 2>/dev/null && echo WROTE || echo DENIED')
-if grep -q WROTE <<< "$OUT"; then breach "A4 host sysctl writable"
+if [ "$(hostname)" != "$HOST_BEFORE" ]; then breach "A4 host sysctl writable (host hostname changed)"
+elif grep -q WROTE <<< "$OUT"; then hold "A4 host sysctls contained (write landed in private UTS ns)"
 else hold "A4 host sysctls read-only"; fi
 
 # --- A5: device node forgery

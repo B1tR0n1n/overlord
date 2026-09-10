@@ -95,11 +95,13 @@ overrides).
 overlord ui          # http://127.0.0.1:7777 — localhost only
 ```
 
-![OVERLORD mission control — pending session with per-file diff, before/after hashes, commit/rollback](assets/ui.png)
+![OVERLORD mission control — a pending session rendered as a dossier: grant envelope, manifest of changed paths with tool-call attribution and before/after hashes, commit or void](assets/ui.png)
 
-The review moment for human eyes: pending sessions with their grant badges,
-per-file changes with before → after hashes and provenance, one-click commit
-or rollback, and a live policy editor. Zero dependencies (stdlib http server),
+The review moment for human eyes, rendered as a document of record rather than
+a dashboard. The register indexes sessions; the dossier is the instrument a
+human signs: the grant envelope the session ran under, a manifest of every
+changed path with its before → after hashes and the tool call that caused it,
+and the disposition — commit or void. Zero dependencies (stdlib http server),
 server-rendered first paint, binds 127.0.0.1 only.
 
 ## Resident mode: daemon, policy, SDK

@@ -4,7 +4,12 @@
 
 Zero dependencies, single file, binds 127.0.0.1 only. The review moment —
 the receipt — rendered for human eyes: pending sessions, per-file diffs with
-before/after hashes, provenance, one-click commit or rollback, policy editor.
+before/after hashes, provenance attribution, commit or rollback, policy.
+
+Presentation is Field Systems Division: a document of record, not a console.
+The register indexes sessions; the dossier is the instrument a human signs.
+Serif carries the record, mono carries the system. No webfont is fetched —
+the stack degrades to Georgia / Consolas so the UI works airgapped.
 """
 
 import json
@@ -13,230 +18,590 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import overlord as core
 
-PALETTE = dict(bg="#0a0908", card="#151311", border="#2a2520",
-               text="#c8bda0", dim="#8a7f6e", gold="#c9a227")
+# Field Systems Division tokens. Dark ground is foundational; gold is earned.
+PALETTE = dict(
+    bg="#0a0908", bg2="#0f0e0b", bg3="#161410", panel="#1a1814",
+    border="#2a2620", border_lt="#3d362c",
+    text="#c8bda0", text_dim="#7a7060", text_bright="#ede5d0",
+    accent="#c9a227", accent_dim="#8b7320", accent_glow="rgba(201,162,39,.12)",
+    red="#a63d2f", green="#4a7a45",
+)
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
+CSS = """
+:root{
+  --bg:#0a0908; --bg2:#0f0e0b; --bg3:#161410; --panel:#1a1814;
+  --border:#2a2620; --border-lt:#3d362c;
+  --text:#c8bda0; --text-dim:#7a7060; --text-bright:#ede5d0;
+  --accent:#c9a227; --accent-dim:#8b7320; --accent-glow:rgba(201,162,39,.12);
+  --red:#a63d2f; --green:#4a7a45;
+  --mono:'JetBrains Mono','Fira Code',ui-monospace,SFMono-Regular,Consolas,monospace;
+  --serif:'Cormorant Garamond',Georgia,'Times New Roman',serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);
+  font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+
+/* the coordinate system beneath the content — structural, barely visible */
+.grid-bg{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.08;
+  background-image:linear-gradient(var(--border) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:80px 80px}
+.noise{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.03;
+  width:100%;height:100%}
+
+.frame{position:relative;z-index:1;display:grid;grid-template-rows:auto 1fr;height:100vh}
+
+/* ---- masthead: a document header, not a navbar ---------------------- */
+.masthead{display:flex;align-items:flex-end;gap:22px;padding:18px 26px 14px;
+  border-bottom:1px solid var(--accent)}
+.mark{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:7px;
+  color:var(--accent);text-transform:uppercase}
+.mark-sub{font-family:var(--serif);font-size:17px;color:var(--text-dim);
+  font-style:italic;padding-bottom:2px}
+.mark-sub .mc{text-transform:uppercase;font-style:normal;font-family:var(--mono);
+  font-size:9px;letter-spacing:4px;color:var(--accent-dim)}
+.masthead .desig{margin-left:auto;text-align:right}
+.desig-l{font-family:var(--mono);font-size:9px;letter-spacing:5px;
+  text-transform:uppercase;color:var(--accent-dim)}
+.desig-v{font-family:var(--mono);font-size:10px;letter-spacing:2px;
+  text-transform:uppercase;color:var(--text-dim);margin-top:3px}
+
+.body{display:grid;grid-template-columns:296px 1fr;min-height:0}
+
+/* ---- 00 register: an index, not a list of cards --------------------- */
+.register{border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+.reg-head{padding:20px 18px 0}
+.reg-scroll{overflow-y:auto;flex:1;min-height:0;margin-top:14px}
+.reg-item{display:block;width:100%;text-align:left;background:none;
+  border:0;border-bottom:1px solid var(--border);border-left:2px solid transparent;
+  padding:11px 16px;cursor:pointer;font-family:var(--mono);
+  transition:background .3s ease,border-color .3s ease}
+.reg-item:hover{background:var(--accent-glow)}
+.reg-item.sel{border-left-color:var(--accent);background:var(--accent-glow)}
+.reg-top{display:flex;align-items:baseline;gap:8px}
+.reg-idx{font-size:9px;letter-spacing:2px;color:var(--text-dim);flex:none}
+.reg-sid{font-size:11px;color:var(--text-bright);letter-spacing:.5px}
+.reg-item.sel .reg-sid{color:var(--accent)}
+.reg-tgt{font-size:10px;color:var(--text-dim);margin:3px 0 6px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.reg-marks{display:flex;gap:6px;flex-wrap:wrap}
+.reg-empty{padding:0 18px;font-family:var(--serif);font-size:16px;
+  font-style:italic;color:var(--text-dim)}
+
+/* ---- dossier: the instrument -------------------------------------- */
+.dossier{overflow-y:auto;padding:26px 34px 60px;min-height:0}
+.sheet{max-width:940px}
+.sec{margin-bottom:38px}
+.sec-label{font-family:var(--mono);font-size:9px;letter-spacing:5px;
+  text-transform:uppercase;color:var(--accent-dim)}
+.sec-title{font-family:var(--serif);font-size:27px;font-weight:600;
+  letter-spacing:-.6px;color:var(--text-bright);margin-top:3px;line-height:1.15}
+.sec-title .sid{font-family:var(--mono);font-size:16px;letter-spacing:1px;
+  font-weight:400;color:var(--text)}
+.rule{width:60px;height:1px;background:var(--accent);margin:13px 0 22px}
+
+.cmdline{font-family:var(--mono);font-size:12px;color:var(--text-bright);
+  background:var(--bg2);border:1px solid var(--border);border-left:2px solid var(--accent);
+  padding:12px 16px;word-break:break-all}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:1px;background:var(--border);border:1px solid var(--border);margin-top:1px}
+.fact{background:var(--bg2);padding:11px 14px}
+.fact-k{font-family:var(--mono);font-size:9px;letter-spacing:3px;
+  text-transform:uppercase;color:var(--text-dim)}
+.fact-v{font-family:var(--mono);font-size:12px;color:var(--text-bright);
+  margin-top:5px;word-break:break-all}
+.fact-v.ts{word-break:normal;overflow-wrap:normal;font-size:11px;letter-spacing:-.2px}
+
+/* stamps, not chips — bordered, tracked, never rounded */
+.stamp{display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:3px;
+  text-transform:uppercase;padding:3px 9px;border:1px solid currentColor;
+  color:var(--text-dim);white-space:nowrap}
+.stamp.pending,.stamp.open{color:var(--accent)}
+.stamp.committed{color:var(--green)}
+.stamp.rolled-back{color:var(--text-dim)}
+.stamp.grant{color:var(--accent-dim)}
+.stamp.alarm{color:var(--red)}
+.grants{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;align-items:center}
+.grants-l{font-family:var(--mono);font-size:9px;letter-spacing:4px;
+  text-transform:uppercase;color:var(--text-dim);margin-right:4px}
+
+/* ---- 02 manifest: line items on a bill of lading ------------------- */
+.manifest{width:100%;border-collapse:collapse}
+.manifest th{font-family:var(--mono);font-size:9px;letter-spacing:3px;font-weight:500;
+  text-transform:uppercase;color:var(--text-dim);text-align:left;
+  padding:0 14px 9px 0;border-bottom:1px solid var(--border-lt)}
+.manifest td{padding:11px 14px 11px 0;border-bottom:1px solid var(--border);
+  vertical-align:top}
+.manifest tr:hover td{background:var(--accent-glow)}
+.mk{font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  white-space:nowrap}
+.mk .g{display:inline-block;width:14px;color:var(--accent)}
+.k-added .g{color:var(--accent)}
+.k-modified .g{color:var(--text)}
+.k-deleted .g{color:var(--red)}
+.k-replaced-dir .g{color:var(--accent)}
+.mpath{font-family:var(--mono);font-size:12px;color:var(--text-bright);
+  word-break:break-all}
+.k-deleted .mpath{color:var(--text-dim);text-decoration:line-through}
+.cause{font-size:10px;color:var(--text-dim);margin-top:5px;line-height:1.6}
+.cause .arrow{color:var(--accent-dim);margin-right:5px}
+.cause b{color:var(--text);font-weight:400}
+.cause .cid{color:var(--text-dim);opacity:.7}
+.hash{font-family:var(--mono);font-size:10px;color:var(--text-dim);white-space:nowrap}
+.hash .to{color:var(--accent-dim);margin:0 5px}
+.empty{font-family:var(--serif);font-size:17px;font-style:italic;color:var(--text-dim)}
+
+/* ---- 03 disposition ------------------------------------------------ */
+.disposition{border:1px solid var(--border-lt);background:var(--bg2);padding:22px 24px}
+.disp-note{font-family:var(--serif);font-size:17px;color:var(--text-dim);
+  margin-bottom:18px;max-width:60ch}
+.acts{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.btn{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:2px;
+  text-transform:uppercase;padding:11px 28px;border:1px solid;cursor:pointer;
+  background:none;transition:background .3s ease,color .3s ease,border-color .3s ease}
+.btn-commit{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.btn-commit:hover{background:transparent;color:var(--accent)}
+.btn-void{background:transparent;color:var(--text-dim);border-color:var(--border-lt)}
+.btn-void:hover{color:var(--red);border-color:var(--red)}
+.btn-quiet{background:transparent;color:var(--text-dim);border-color:var(--border-lt);
+  padding:9px 20px;font-weight:500}
+.btn-quiet:hover{color:var(--accent);border-color:var(--accent)}
+.opt{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;
+  letter-spacing:2px;text-transform:uppercase;color:var(--text-dim);cursor:pointer}
+.opt input{accent-color:var(--accent);cursor:pointer}
+.refusal{border:1px solid var(--red);border-left:2px solid var(--red);
+  background:var(--bg3);padding:14px 16px;margin-top:18px;font-size:12px}
+.refusal b{color:var(--red);font-family:var(--mono);font-size:10px;letter-spacing:3px;
+  text-transform:uppercase;display:block;margin-bottom:8px}
+.refusal .why{color:var(--text-dim)}
+.refusal .hint{font-family:var(--serif);font-style:italic;font-size:15px;
+  color:var(--text-dim);margin-top:10px}
+
+/* ---- 04 policy ----------------------------------------------------- */
+.policy-wrap{padding:20px 18px;border-top:1px solid var(--border)}
+textarea{width:100%;height:150px;background:var(--bg2);color:var(--text);
+  border:1px solid var(--border);font-family:var(--mono);font-size:11px;
+  line-height:1.6;padding:11px;resize:vertical}
+textarea:focus{outline:none;border-color:var(--accent-dim)}
+.polmsg{font-family:var(--mono);font-size:10px;letter-spacing:2px;
+  text-transform:uppercase;color:var(--text-dim)}
+.polmsg.ok{color:var(--green)}
+.polmsg.err{color:var(--red)}
+.polrow{display:flex;gap:12px;align-items:center;margin-top:12px}
+
+a{color:var(--accent);text-decoration:none}
+:focus-visible{outline:1px solid var(--accent);outline-offset:2px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg2)}
+::-webkit-scrollbar-thumb{background:var(--border-lt)}
+::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+
+/* system coming online — staggered, and only if motion is welcome */
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.sec{animation:fadeUp .5s ease both}
+.sec:nth-child(2){animation-delay:.06s}
+.sec:nth-child(3){animation-delay:.12s}
+.sec:nth-child(4){animation-delay:.18s}
+@media (prefers-reduced-motion:reduce){.sec{animation:none}
+  *{transition-duration:0s!important}}
+
+@media (max-width:900px){
+  .body{grid-template-columns:1fr;grid-template-rows:auto 1fr}
+  .register{border-right:0;border-bottom:1px solid var(--border);max-height:38vh}
+  .dossier{padding:20px 18px 50px}
+  .masthead{flex-wrap:wrap;gap:12px;padding:14px 18px 12px}
+  .masthead .desig{margin-left:0;text-align:left}
+}
+
+/* A printed dossier is an audit artifact, not the product surface:
+   ink-economical on purpose. Delete this block to print the dark identity. */
+@media print{
+  .grid-bg,.noise,.register,.disposition,.policy-wrap{display:none!important}
+  body,.frame,.dossier{background:#fff;color:#000;height:auto;overflow:visible}
+  .masthead{border-bottom:1px solid #000}
+  .mark{color:#000}
+  .sec-title,.mpath,.fact-v,.cmdline{color:#000}
+  .sec-label,.fact-k,.hash,.cause{color:#444}
+  .rule{background:#000}
+  .cmdline{background:none;border-color:#000}
+  .sec{animation:none}
+}
+"""
+
+SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OVERLORD — mission control</title>
-<style>
-:root {{ --bg:{bg}; --card:{card}; --border:{border}; --text:{text}; --dim:{dim}; --gold:{gold}; }}
-* {{ box-sizing:border-box; margin:0; }}
-body {{ background:var(--bg); color:var(--text); font:14px/1.5 'JetBrains Mono',monospace; }}
-header {{ display:flex; align-items:baseline; gap:14px; padding:14px 22px;
-  border-bottom:1px solid var(--border); }}
-header b {{ color:var(--gold); letter-spacing:.18em; font-size:16px; }}
-header .sub {{ color:var(--dim); font-size:12px; }}
-header .right {{ margin-left:auto; color:var(--dim); font-size:12px; }}
-.layout {{ display:grid; grid-template-columns:340px 1fr; min-height:calc(100vh - 53px); }}
-aside {{ border-right:1px solid var(--border); padding:14px; overflow-y:auto; }}
-main {{ padding:20px 26px; overflow-y:auto; }}
-.sess {{ border:1px solid var(--border); background:var(--card); border-radius:6px;
-  padding:10px 12px; margin-bottom:10px; cursor:pointer; }}
-.sess:hover, .sess.sel {{ border-color:var(--gold); }}
-.sess .sid {{ font-size:12px; }}
-.sess .tgt {{ color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis;
-  white-space:nowrap; }}
-.chip {{ display:inline-block; font-size:10px; padding:1px 7px; border-radius:8px;
-  border:1px solid var(--border); color:var(--dim); margin-right:5px; }}
-.chip.pending {{ color:var(--gold); border-color:var(--gold); }}
-.chip.grant {{ color:var(--text); }}
-h2 {{ color:var(--gold); font-size:13px; letter-spacing:.14em; text-transform:uppercase;
-  margin:22px 0 10px; }}
-table {{ width:100%; border-collapse:collapse; font-size:13px; }}
-td {{ padding:5px 10px 5px 0; border-bottom:1px solid var(--border); vertical-align:top; }}
-.k-added {{ color:var(--gold); }}
-.k-deleted {{ color:var(--dim); text-decoration:line-through; }}
-.k-modified {{ color:var(--text); }}
-.k-replaced-dir {{ color:var(--gold); }}
-.hash {{ color:var(--dim); font-size:11px; }}
-.cmdline {{ background:var(--card); border:1px solid var(--border); border-radius:6px;
-  padding:10px 14px; margin-top:6px; word-break:break-all; }}
-button {{ background:none; font:inherit; cursor:pointer; padding:9px 26px;
-  border-radius:6px; letter-spacing:.1em; }}
-.commit {{ background:var(--gold); color:var(--bg); border:1px solid var(--gold);
-  font-weight:bold; }}
-.rollback {{ background:none; color:var(--dim); border:1px solid var(--border); }}
-.rollback:hover {{ color:var(--text); border-color:var(--dim); }}
-.actions {{ display:flex; gap:14px; align-items:center; margin-top:22px; }}
-.actions label {{ color:var(--dim); font-size:12px; }}
-.conflicts {{ border:1px solid var(--gold); border-radius:6px; padding:10px 14px;
-  margin-top:14px; font-size:12px; }}
-.conflicts b {{ color:var(--gold); }}
-textarea {{ width:100%; height:220px; background:var(--card); color:var(--text);
-  border:1px solid var(--border); border-radius:6px; font:12px 'JetBrains Mono',monospace;
-  padding:10px; }}
-.dimtext {{ color:var(--dim); }}
-.meta {{ color:var(--dim); font-size:12px; margin-top:4px; }}
-a {{ color:var(--gold); }}
-</style></head><body>
-<header><b>OVERLORD</b><span class="sub">agent hypervisor — mission control</span>
-<span class="right" id="status">{status}</span></header>
-<div class="layout">
-<aside><div id="list">{list_html}</div>
-<h2>policy</h2><textarea id="policy" spellcheck="false">{policy_text}</textarea>
-<div class="actions"><button class="rollback" onclick="savePolicy()">save policy</button>
-<span id="polmsg" class="dimtext"></span></div>
-</aside>
-<main id="detail">{detail_html}</main>
-</div>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0908'/%3E%3Crect x='4.5' y='4.5' width='23' height='23' fill='none' stroke='%232a2620'/%3E%3Crect x='10' y='10' width='12' height='12' fill='none' stroke='%23c9a227' stroke-width='2'/%3E%3Crect x='15' y='0' width='2' height='8' fill='%23c9a227'/%3E%3C/svg%3E">
+<style>__CSS__</style></head><body>
+<div class="grid-bg"></div>
+<svg class="noise" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><filter id="fsd-noise">
+<feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="4" stitchTiles="stitch"/>
+</filter><rect width="100%" height="100%" filter="url(#fsd-noise)"/></svg>
+<div class="frame">
+<header class="masthead">
+  <span class="mark">OVERLORD</span>
+  <span class="mark-sub">agent hypervisor &mdash; <span class="mc">mission control</span></span>
+  <div class="desig">
+    <div class="desig-l">Field Systems Division</div>
+    <div class="desig-v" id="status">__STATUS__</div>
+  </div>
+</header>
+<div class="body">
+  <nav class="register" aria-label="Session register">
+    <div class="reg-head">
+      <div class="sec-label">00 &mdash; Register</div>
+      <div class="rule" style="margin:11px 0 0"></div>
+    </div>
+    <div class="reg-scroll" id="list">__REGISTER__</div>
+    <div class="policy-wrap">
+      <div class="sec-label">04 &mdash; Policy</div>
+      <div class="rule" style="margin:11px 0 14px"></div>
+      <label for="policy" class="fact-k">broker ceiling &mdash; json</label>
+      <textarea id="policy" spellcheck="false" style="margin-top:8px">__POLICY__</textarea>
+      <div class="polrow">
+        <button class="btn btn-quiet" onclick="savePolicy()">Seal</button>
+        <span id="polmsg" class="polmsg"></span>
+      </div>
+    </div>
+  </nav>
+  <main class="dossier" id="detail" aria-live="polite"><div class="sheet">__DOSSIER__</div></main>
+</div></div>
 <script>
-let SEL = null;
-const BOOT = {boot};
-const esc = s => String(s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+const BOOT = __BOOT__;
+let SEL = BOOT.detail ? BOOT.detail.meta.id : null;
+
+const esc = s => String(s === null || s === undefined ? '' : s)
+  .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const j = (u, opt) => fetch(u, opt).then(r => r.json());
+const short = h => (h || '').slice(0, 12);
 
-async function loadList(pre) {{
+function grantMarks(m) {
+  const g = m.grants || {};
+  let out = '';
+  if (g.jail) out += '<span class="stamp grant">jail</span>';
+  if (g.net === 'none') out += '<span class="stamp grant">net:none</span>';
+  if (g.timeout) out += '<span class="stamp grant">timeout ' + esc(g.timeout) + 's</span>';
+  if (g.merge_base) out += '<span class="stamp grant">merge-base</span>';
+  if (m.agent) out += '<span class="stamp grant">agent ' + esc(m.agent) + '</span>';
+  return out;
+}
+function marks(m) {
+  let out = `<span class="stamp ${m.status}">${esc(m.status)}</span>` + grantMarks(m);
+  if (m.timed_out) out += '<span class="stamp alarm">timed-out</span>';
+  return out;
+}
+
+async function loadList(pre) {
   const d = pre || await j('/api/sessions');
-  document.getElementById('status').textContent = d.backend + ' backend · ' + d.sessions.length + ' sessions';
+  document.getElementById('status').textContent =
+    d.backend + ' backend \\u00b7 ' + d.sessions.length + ' records';
   const el = document.getElementById('list');
-  if (!d.sessions.length) {{ el.innerHTML = '<span class="dimtext">no sessions yet</span>'; return; }}
-  if (SEL === null && !pre) {{ const p = d.sessions.filter(m => m.status === 'pending'); if (p.length) select(p[p.length - 1].id); }}
-  el.innerHTML = d.sessions.slice().reverse().map(m => {{
-    const g = m.grants || {{}};
-    const badges =
-      `<span class="chip ${{m.status}}">${{m.status}}</span>` +
-      (g.jail ? '<span class="chip grant">jail</span>' : '') +
-      (g.net === 'none' ? '<span class="chip grant">net:none</span>' : '') +
-      (m.timed_out ? '<span class="chip">timed-out</span>' : '');
-    return `<div class="sess ${{m.id===SEL?'sel':''}}" onclick="select('${{m.id}}')">
-      <div class="sid">${{m.id}} <span class="dimtext">exit=${{m.exit_code ?? '…'}}</span></div>
-      <div class="tgt">${{esc(m.target)}}</div><div>${{badges}}</div></div>`;
-  }}).join('');
-}}
+  if (!d.sessions.length) {
+    el.innerHTML = '<div class="reg-empty">No records.</div>';
+    return;
+  }
+  const rev = d.sessions.slice().reverse();
+  el.innerHTML = rev.map((m, i) => {
+    const n = String(rev.length - i).padStart(2, '0');
+    return `<button type="button" class="reg-item ${m.id === SEL ? 'sel' : ''}"
+      onclick="select('${esc(m.id)}')" ${m.id === SEL ? 'aria-current="true"' : ''}>
+      <span class="reg-top"><span class="reg-idx">${n}</span>
+      <span class="reg-sid">${esc(m.id)}</span></span>
+      <div class="reg-tgt">${esc(m.target)}</div>
+      <div class="reg-marks">${marks(m)}</div></button>`;
+  }).join('');
+}
 
-async function select(sid) {{
+async function select(sid) {
   SEL = sid;
   renderDetail(await j('/api/session/' + sid));
   loadList();
-}}
+}
 
-function renderDetail(d) {{
-  const m = d.meta, g = m.grants || {{}};
-  let html = `<h2>session ${{m.id}}</h2>
-    <div class="cmdline">${{esc((m.cmd||[]).join(' '))}}</div>
-    <div class="meta">target ${{esc(m.target)}} · ${{m.backend}} backend · exit=${{m.exit_code}}
-      · ${{m.started}} → ${{m.finished || ''}}
-      ${{g.jail?' · jail':''}}${{g.net==='none'?' · net:none':''}}${{g.timeout?' · timeout '+g.timeout+'s':''}}</div>`;
-  html += '<h2>changes</h2>';
-  if (d.changes.length) {{
-    html += '<table>' + d.changes.map(([k, p]) => {{
-      const prov = d.provenance.find(r => r.path === p) || {{}};
-      const hb = (prov.before_sha256 || '').slice(0, 12), ha = (prov.after_sha256 || '').slice(0, 12);
-      return `<tr><td class="k-${{k}}">${{k}}</td><td>${{esc(p)}}</td>
-        <td class="hash">${{hb || '·'}} → ${{ha || '·'}}</td></tr>`;
-    }}).join('') + '</table>';
-  }} else html += '<span class="dimtext">no changes recorded</span>';
-  if (m.status === 'pending') {{
-    html += `<div class="actions">
-      <button class="commit" onclick="commit('${{sid}}')">COMMIT</button>
-      <button class="rollback" onclick="rollback('${{sid}}')">ROLLBACK</button>
-      <label><input type="checkbox" id="merge"> merge</label>
-      <label><input type="checkbox" id="force"> force</label></div>
-      <div id="conflicts"></div>`;
-  }} else if (m.status === 'committed') {{
-    html += `<div class="meta">committed ${{m.committed || ''}}${{m.forced ? ' (forced)' : ''}}
-      ${{(m.merged_paths||[]).length ? ' · ' + m.merged_paths.length + ' merged' : ''}}</div>`;
-  }}
-  document.getElementById('detail').innerHTML = html;
-}}
+function renderDetail(d) {
+  const m = d.meta, g = m.grants || {}, id = m.id;
+  const prov = {};
+  (d.provenance || []).forEach(r => { prov[r.path] = r; });
 
-async function commit(sid) {{
-  const body = JSON.stringify({{ merge: merge.checked, force: force.checked }});
-  const r = await j('/api/session/' + sid + '/commit', {{ method: 'POST', body }});
-  if (r.error) {{ conflicts.innerHTML = `<div class="conflicts"><b>refused</b> — ${{esc(r.error)}}</div>`; return; }}
-  if (!r.committed) {{
-    conflicts.innerHTML = `<div class="conflicts"><b>target drifted — refusing:</b><br>` +
-      r.conflicts.map(([why, p]) => `${{why}} · ${{esc(p)}}`).join('<br>') +
-      `<br><span class="dimtext">retry with merge (needs --merge-base) or force</span></div>`;
+  let h = `<section class="sec"><div class="sec-label">01 &mdash; Dossier</div>
+    <h1 class="sec-title">Session <span class="sid">${esc(id)}</span></h1>
+    <div class="rule"></div>
+    <div class="cmdline">${esc((m.cmd || []).join(' ')) || '&mdash;'}</div>
+    <div class="facts">
+      <div class="fact"><div class="fact-k">Target</div><div class="fact-v">${esc(m.target)}</div></div>
+      <div class="fact"><div class="fact-k">Backend</div><div class="fact-v">${esc(m.backend)}</div></div>
+      <div class="fact"><div class="fact-k">Exit</div><div class="fact-v">${m.exit_code ?? '\\u2026'}</div></div>
+      <div class="fact"><div class="fact-k">Opened</div><div class="fact-v ts">${esc(m.started)}</div></div>
+      <div class="fact"><div class="fact-k">Closed</div><div class="fact-v ts">${esc(m.finished) || '\\u2026'}</div></div>
+    </div>
+    <div class="grants"><span class="grants-l">Grants</span>${grantMarks(m) ||
+      '<span class="stamp">unscoped</span>'}${m.timed_out ?
+      '<span class="stamp alarm">timed-out</span>' : ''}</div>
+  </section>`;
+
+  const ch = d.changes || [];
+  h += `<section class="sec"><div class="sec-label">02 &mdash; Manifest</div>
+    <h2 class="sec-title">${ch.length} line item${ch.length === 1 ? '' : 's'} held in escrow</h2>
+    <div class="rule"></div>`;
+  if (ch.length) {
+    h += `<table class="manifest"><thead><tr>
+      <th style="width:130px">Disposition</th><th>Path &amp; attribution</th>
+      <th style="width:210px">Integrity</th></tr></thead><tbody>` +
+      ch.map(([k, p]) => {
+        const r = prov[p] || {}, c = r.caused_by;
+        const glyph = {added:'+', modified:'~', deleted:'\\u2212', 'replaced-dir':'\\u00b1'}[k] || '\\u00b7';
+        return `<tr class="k-${esc(k)}">
+          <td class="mk k-${esc(k)}"><span class="g">${glyph}</span>${esc(k)}</td>
+          <td><div class="mpath">${esc(p)}</div>${c ? `<div class="cause">
+            <span class="arrow">\\u21b3</span>turn <b>${esc(c.turn)}</b> \\u00b7
+            <b>${esc(c.tool)}</b>${c.summary ? ' \\u00b7 ' + esc(c.summary) : ''}
+            <span class="cid">${esc(c.tool_call_id)}</span></div>` : ''}</td>
+          <td class="hash">${short(r.before_sha256) || '\\u00b7'}<span class="to">\\u2192</span>${short(r.after_sha256) || '\\u00b7'}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
+  } else {
+    h += '<div class="empty">Nothing was written. The tree is as it was.</div>';
+  }
+  h += '</section>';
+
+  if (m.status === 'pending') {
+    h += `<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>
+      <h2 class="sec-title">Nothing has touched the tree yet</h2>
+      <div class="rule"></div>
+      <div class="disposition">
+        <p class="disp-note">Committing replays this manifest onto the real tree, after
+          verifying it has not drifted since the snapshot. Voiding discards the overlay
+          and leaves the target byte-identical.</p>
+        <div class="acts">
+          <button class="btn btn-commit" onclick="commit('${esc(id)}')">Commit</button>
+          <button class="btn btn-void" onclick="rollback('${esc(id)}')">Void</button>
+          <label class="opt"><input type="checkbox" id="merge"> merge</label>
+          <label class="opt"><input type="checkbox" id="force"> force</label>
+        </div>
+        <div id="conflicts"></div>
+      </div></section>`;
+  } else if (m.status === 'committed') {
+    const mg = (m.merged_paths || []).length;
+    h += `<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>
+      <h2 class="sec-title">Sealed &mdash; replayed onto the tree</h2>
+      <div class="rule"></div>
+      <div class="facts">
+        <div class="fact"><div class="fact-k">Committed</div><div class="fact-v">${esc(m.committed)}</div></div>
+        ${m.forced ? '<div class="fact"><div class="fact-k">Override</div><div class="fact-v">forced past drift</div></div>' : ''}
+        ${mg ? '<div class="fact"><div class="fact-k">Merged</div><div class="fact-v">' + mg + ' path(s)</div></div>' : ''}
+      </div></section>`;
+  }
+  document.getElementById('detail').innerHTML = '<div class="sheet">' + h + '</div>';
+}
+
+async function commit(sid) {
+  const body = JSON.stringify({
+    merge: !!(document.getElementById('merge') || {}).checked,
+    force: !!(document.getElementById('force') || {}).checked,
+  });
+  const r = await j('/api/session/' + sid + '/commit', { method: 'POST', body });
+  const box = document.getElementById('conflicts');
+  if (r.error) {
+    box.innerHTML = `<div class="refusal"><b>Refused</b>
+      <span class="why">${esc(r.error)}</span></div>`;
     return;
-  }}
+  }
+  if (!r.committed) {
+    box.innerHTML = `<div class="refusal"><b>Target drifted &mdash; refusing</b>
+      <div class="why">` + r.conflicts.map(([why, p]) =>
+        `${esc(why)} \\u00b7 ${esc(p)}`).join('<br>') + `</div>
+      <div class="hint">Retry with merge (needs &mdash;merge-base), or force past it deliberately.</div>
+    </div>`;
+    return;
+  }
   select(sid);
-}}
-async function rollback(sid) {{
-  await j('/api/session/' + sid + '/rollback', {{ method: 'POST', body: '{{}}' }});
-  SEL = null; document.getElementById('detail').innerHTML = '<span class="dimtext">rolled back</span>';
+}
+
+async function rollback(sid) {
+  await j('/api/session/' + sid + '/rollback', { method: 'POST', body: '{}' });
+  SEL = null;
+  document.getElementById('detail').innerHTML =
+    '<div class="sheet"><section class="sec"><div class="sec-label">01 &mdash; Dossier</div>' +
+    '<h1 class="sec-title">Voided</h1><div class="rule"></div>' +
+    '<div class="empty">The overlay was discarded. The target is byte-identical.</div>' +
+    '</section></div>';
   loadList();
-}}
-async function savePolicy() {{
-  const r = await j('/api/policy', {{ method: 'PUT', body: policy.value }});
-  polmsg.textContent = r.error ? ('error: ' + r.error) : 'saved';
-  setTimeout(() => polmsg.textContent = '', 2500);
-}}
-if (BOOT.detail) {{ SEL = BOOT.detail.meta.id; }}
-setInterval(() => {{ loadList(); }}, 2500);
+}
+
+async function savePolicy() {
+  const el = document.getElementById('polmsg');
+  const r = await j('/api/policy', {
+    method: 'PUT', body: document.getElementById('policy').value });
+  el.textContent = r.error ? ('rejected: ' + r.error) : 'sealed';
+  el.className = 'polmsg ' + (r.error ? 'err' : 'ok');
+  setTimeout(() => { el.textContent = ''; el.className = 'polmsg'; }, 3000);
+}
+
+// keyboard: the register is operable without a mouse
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  if (e.key !== 'j' && e.key !== 'k' && e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const items = [...document.querySelectorAll('.reg-item')];
+  if (!items.length) return;
+  const cur = items.findIndex(el => el.classList.contains('sel'));
+  const step = (e.key === 'j' || e.key === 'ArrowDown') ? 1 : -1;
+  const next = items[Math.min(items.length - 1, Math.max(0, (cur < 0 ? 0 : cur + step)))];
+  if (next) { next.click(); next.focus(); e.preventDefault(); }
+});
+
+setInterval(() => loadList(), 2500);
 </script></body></html>"""
 
 
 def _esc(s):
+    if s is None:
+        return ""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _render_list(metas, sel):
+GLYPH = {"added": "+", "modified": "~", "deleted": "\u2212", "replaced-dir": "\u00b1"}
+
+
+def _grant_marks(m):
+    """Capability grants only — the envelope the session ran under."""
+    g = m.get("grants") or {}
+    out = ""
+    if g.get("jail"):
+        out += '<span class="stamp grant">jail</span>'
+    if g.get("net") == "none":
+        out += '<span class="stamp grant">net:none</span>'
+    if g.get("timeout"):
+        out += f'<span class="stamp grant">timeout {_esc(g["timeout"])}s</span>'
+    if g.get("merge_base"):
+        out += '<span class="stamp grant">merge-base</span>'
+    if m.get("agent"):
+        out += f'<span class="stamp grant">agent {_esc(m["agent"])}</span>'
+    return out
+
+
+def _marks(m):
+    """Status stamp plus the grant envelope — used in the register."""
+    out = (f'<span class="stamp {_esc(m.get("status"))}">'
+           f'{_esc(m.get("status"))}</span>') + _grant_marks(m)
+    if m.get("timed_out"):
+        out += '<span class="stamp alarm">timed-out</span>'
+    return out
+
+
+def _render_register(metas, sel):
     if not metas:
-        return '<span class="dimtext">no sessions yet</span>'
-    rows = []
-    for m in reversed(metas):
-        g = m.get("grants") or {}
-        badges = f'<span class="chip {m.get("status")}">{m.get("status")}</span>'
-        if g.get("jail"):
-            badges += '<span class="chip grant">jail</span>'
-        if g.get("net") == "none":
-            badges += '<span class="chip grant">net:none</span>'
-        if m.get("timed_out"):
-            badges += '<span class="chip">timed-out</span>'
-        cls = "sess sel" if m["id"] == sel else "sess"
+        return '<div class="reg-empty">No records.</div>'
+    rows, rev = [], list(reversed(metas))
+    for i, m in enumerate(rev):
+        n = str(len(rev) - i).zfill(2)
+        cls = "reg-item sel" if m["id"] == sel else "reg-item"
+        cur = ' aria-current="true"' if m["id"] == sel else ""
         rows.append(
-            f'<div class="{cls}" onclick="select(\'{m["id"]}\')">'
-            f'<div class="sid">{m["id"]} <span class="dimtext">exit='
-            f'{m.get("exit_code", "…")}</span></div>'
-            f'<div class="tgt">{_esc(m.get("target"))}</div><div>{badges}</div></div>'
+            f'<button type="button" class="{cls}" onclick="select(\'{_esc(m["id"])}\')"{cur}>'
+            f'<span class="reg-top"><span class="reg-idx">{n}</span>'
+            f'<span class="reg-sid">{_esc(m["id"])}</span></span>'
+            f'<div class="reg-tgt">{_esc(m.get("target"))}</div>'
+            f'<div class="reg-marks">{_marks(m)}</div></button>'
         )
     return "".join(rows)
 
 
-def _render_detail(payload):
+def _render_dossier(payload):
     if payload is None:
-        return '<span class="dimtext">select a session</span>'
-    m, g = payload["meta"], payload["meta"].get("grants") or {}
+        return ('<section class="sec"><div class="sec-label">01 &mdash; Dossier</div>'
+                '<h1 class="sec-title">No record selected</h1><div class="rule"></div>'
+                '<div class="empty">Choose an entry from the register.</div></section>')
+    m = payload["meta"]
     prov = {r["path"]: r for r in payload["provenance"]}
-    grantline = "".join([
-        " · jail" if g.get("jail") else "",
-        " · net:none" if g.get("net") == "none" else "",
-        f" · timeout {g['timeout']}s" if g.get("timeout") else "",
-    ])
-    html = [
-        f'<h2>session {m["id"]}</h2>',
-        f'<div class="cmdline">{_esc(" ".join(m.get("cmd", [])))}</div>',
-        f'<div class="meta">target {_esc(m.get("target"))} · {m.get("backend")} '
-        f'backend · exit={m.get("exit_code")} · {m.get("started")} → '
-        f'{m.get("finished", "")}{grantline}</div>',
-        "<h2>changes</h2>",
+
+    grants_html = _grant_marks(m) or '<span class="stamp">unscoped</span>'
+    if m.get("timed_out"):
+        grants_html += '<span class="stamp alarm">timed-out</span>'
+
+    h = [
+        '<section class="sec"><div class="sec-label">01 &mdash; Dossier</div>',
+        f'<h1 class="sec-title">Session <span class="sid">{_esc(m["id"])}</span></h1>',
+        '<div class="rule"></div>',
+        f'<div class="cmdline">{_esc(" ".join(m.get("cmd") or [])) or "&mdash;"}</div>',
+        '<div class="facts">',
+        f'<div class="fact"><div class="fact-k">Target</div>'
+        f'<div class="fact-v">{_esc(m.get("target"))}</div></div>',
+        f'<div class="fact"><div class="fact-k">Backend</div>'
+        f'<div class="fact-v">{_esc(m.get("backend"))}</div></div>',
+        f'<div class="fact"><div class="fact-k">Exit</div>'
+        f'<div class="fact-v">{_esc(m.get("exit_code"))}</div></div>',
+        f'<div class="fact"><div class="fact-k">Opened</div>'
+        f'<div class="fact-v ts">{_esc(m.get("started"))}</div></div>',
+        f'<div class="fact"><div class="fact-k">Closed</div>'
+        f'<div class="fact-v ts">{_esc(m.get("finished")) or "&hellip;"}</div></div>',
+        '</div>',
+        f'<div class="grants"><span class="grants-l">Grants</span>{grants_html}</div>',
+        '</section>',
     ]
-    if payload["changes"]:
+
+    changes = payload["changes"]
+    n = len(changes)
+    h += ['<section class="sec"><div class="sec-label">02 &mdash; Manifest</div>',
+          f'<h2 class="sec-title">{n} line item{"" if n == 1 else "s"} held in escrow</h2>',
+          '<div class="rule"></div>']
+    if changes:
         rows = []
-        for k, p in payload["changes"]:
+        for k, p in changes:
             r = prov.get(p, {})
-            hb, ha = (r.get("before_sha256") or "")[:12], (r.get("after_sha256") or "")[:12]
-            rows.append(f'<tr><td class="k-{k}">{k}</td><td>{_esc(p)}</td>'
-                        f'<td class="hash">{hb or "·"} → {ha or "·"}</td></tr>')
-        html.append("<table>" + "".join(rows) + "</table>")
+            c = r.get("caused_by")
+            hb = (r.get("before_sha256") or "")[:12] or "\u00b7"
+            ha = (r.get("after_sha256") or "")[:12] or "\u00b7"
+            cause = ""
+            if c:
+                summary = f' &middot; {_esc(c.get("summary"))}' if c.get("summary") else ""
+                cause = (f'<div class="cause"><span class="arrow">&#8627;</span>'
+                         f'turn <b>{_esc(c.get("turn"))}</b> &middot; '
+                         f'<b>{_esc(c.get("tool"))}</b>{summary} '
+                         f'<span class="cid">{_esc(c.get("tool_call_id"))}</span></div>')
+            rows.append(
+                f'<tr class="k-{_esc(k)}">'
+                f'<td class="mk k-{_esc(k)}"><span class="g">{GLYPH.get(k, "&middot;")}</span>'
+                f'{_esc(k)}</td>'
+                f'<td><div class="mpath">{_esc(p)}</div>{cause}</td>'
+                f'<td class="hash">{hb}<span class="to">&rarr;</span>{ha}</td></tr>')
+        h.append('<table class="manifest"><thead><tr>'
+                 '<th style="width:130px">Disposition</th>'
+                 '<th>Path &amp; attribution</th>'
+                 '<th style="width:210px">Integrity</th></tr></thead><tbody>'
+                 + "".join(rows) + '</tbody></table>')
     else:
-        html.append('<span class="dimtext">no changes recorded</span>')
+        h.append('<div class="empty">Nothing was written. The tree is as it was.</div>')
+    h.append('</section>')
+
     if m.get("status") == "pending":
-        html.append(
-            f'<div class="actions">'
-            f'<button class="commit" onclick="commit(\'{m["id"]}\')">COMMIT</button>'
-            f'<button class="rollback" onclick="rollback(\'{m["id"]}\')">ROLLBACK</button>'
-            f'<label><input type="checkbox" id="merge"> merge</label>'
-            f'<label><input type="checkbox" id="force"> force</label></div>'
-            f'<div id="conflicts"></div>')
+        h.append(
+            '<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>'
+            '<h2 class="sec-title">Nothing has touched the tree yet</h2>'
+            '<div class="rule"></div><div class="disposition">'
+            '<p class="disp-note">Committing replays this manifest onto the real tree, '
+            'after verifying it has not drifted since the snapshot. Voiding discards the '
+            'overlay and leaves the target byte-identical.</p><div class="acts">'
+            f'<button class="btn btn-commit" onclick="commit(\'{_esc(m["id"])}\')">Commit</button>'
+            f'<button class="btn btn-void" onclick="rollback(\'{_esc(m["id"])}\')">Void</button>'
+            '<label class="opt"><input type="checkbox" id="merge"> merge</label>'
+            '<label class="opt"><input type="checkbox" id="force"> force</label></div>'
+            '<div id="conflicts"></div></div></section>')
     elif m.get("status") == "committed":
         merged = len(m.get("merged_paths") or [])
-        html.append(f'<div class="meta">committed {m.get("committed", "")}'
-                    f'{" (forced)" if m.get("forced") else ""}'
-                    f'{" · " + str(merged) + " merged" if merged else ""}</div>')
-    return "".join(html)
+        cells = (f'<div class="fact"><div class="fact-k">Committed</div>'
+                 f'<div class="fact-v">{_esc(m.get("committed"))}</div></div>')
+        if m.get("forced"):
+            cells += ('<div class="fact"><div class="fact-k">Override</div>'
+                      '<div class="fact-v">forced past drift</div></div>')
+        if merged:
+            cells += (f'<div class="fact"><div class="fact-k">Merged</div>'
+                      f'<div class="fact-v">{merged} path(s)</div></div>')
+        h.append('<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>'
+                 '<h2 class="sec-title">Sealed &mdash; replayed onto the tree</h2>'
+                 f'<div class="rule"></div><div class="facts">{cells}</div></section>')
+    return "".join(h)
 
 
 def _session_payload(sid):
@@ -251,6 +616,19 @@ def _session_payload(sid):
     if not changes and provenance:  # committed sessions: show from the record
         changes = [[r["kind"], r["path"]] for r in provenance]
     return {"meta": meta, "changes": changes, "provenance": provenance}
+
+
+def _build_page(status, register_html, dossier_html, policy_text, boot):
+    """Token substitution, not str.format — the CSS and JS are full of braces."""
+    page = SHELL
+    for token, value in (("__CSS__", CSS),
+                         ("__STATUS__", status),
+                         ("__REGISTER__", register_html),
+                         ("__DOSSIER__", dossier_html),
+                         ("__POLICY__", policy_text),
+                         ("__BOOT__", boot)):
+        page = page.replace(token, value)
+    return page
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -284,12 +662,12 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.isfile(core.POLICY_FILE):
                     with open(core.POLICY_FILE) as f:
                         policy_text = f.read()
-                page = PAGE.format(
-                    **PALETTE, boot=json.dumps(boot),
-                    status=f"{backend} backend · {len(metas)} sessions",
-                    list_html=_render_list(metas, sel),
-                    detail_html=_render_detail(boot["detail"]),
+                page = _build_page(
+                    status=f"{_esc(backend)} backend &middot; {len(metas)} records",
+                    register_html=_render_register(metas, sel),
+                    dossier_html=_render_dossier(boot["detail"]),
                     policy_text=_esc(policy_text),
+                    boot=json.dumps(boot),
                 )
                 self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8")
             elif self.path == "/api/sessions":

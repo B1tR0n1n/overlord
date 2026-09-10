@@ -31,7 +31,7 @@ import urllib.request
 
 import overlord as ov
 
-DEFAULT_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-5"}
+DEFAULT_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-5.5"}
 MAX_TOOL_OUTPUT = 32_000       # chars fed back to the model per tool result
 DEFAULT_MAX_TURNS = 40
 

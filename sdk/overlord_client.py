@@ -123,6 +123,36 @@ class OverlordClient:
         )
         return LiveSession(self, res["sid"], res["grants"], res["backend"])
 
+    def agent(self, target, task, provider="anthropic", model=None, max_turns=None,
+              jail=False, net="host", timeout=None, merge_base=False, trace=None,
+              wait=False, stack=False, on_event=None):
+        """Run the built-in agent against target inside a live session, then
+        seal it. on_event receives transcript events (assistant, tool_call,
+        tool_result, done, error) and one initial {"type": "session", "sid"}.
+        Returns a Session plus the agent's final text."""
+        def _ev(ev):
+            if not on_event:
+                return
+            if ev.get("event") == "session":
+                on_event({"type": "session", "sid": ev["sid"], "grants": ev["grants"]})
+            elif ev.get("event") == "agent":
+                on_event({k: v for k, v in ev.items() if k not in ("ok", "event")})
+        res = self._call(
+            "agent", on_event=_ev, target=str(target), task=task, provider=provider,
+            model=model, max_turns=max_turns,
+            grants={"jail": jail, "net": net, "timeout": timeout, "merge_base": merge_base},
+            trace=trace, wait=wait, stack=stack,
+        )
+        s = Session(self, res["sid"], res.get("exit_code"), res["changes"], res.get("grants"))
+        s.final, s.usage = res.get("final", ""), res.get("usage")
+        return s
+
+    def agent_cancel(self, sid):
+        return self._call("agent_cancel", sid=sid)
+
+    def transcript(self, sid):
+        return self._call("transcript", sid=sid)["transcript"]
+
     def sessions(self):
         return self._call("sessions")["sessions"]
 

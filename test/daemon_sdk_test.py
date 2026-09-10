@@ -189,7 +189,38 @@ try:
     sealed.rollback()
     ok("live session: timeout grant expiry")
 
-    # 14. orphan reconcile: a dead opener leaves a pending session, not a wedged one
+    # 14. built-in agent over the wire: events stream, session sealed, cancel op
+    script = os.path.join(OVERLORD_HOME, "script.json")
+    with open(script, "w") as f:
+        json.dump([{"text": "hello", "tool_calls": [
+                        {"name": "write_file", "input": {"path": "agent.txt", "content": "x\n"}}]},
+                   {"text": "finished"}], f)
+    os.environ["OVERLORD_AGENT_SCRIPT"] = script
+    daemon.terminate(); daemon.wait()
+    os.remove(SOCK)
+    daemon = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "overlord.py"), "daemon", "--socket", SOCK],
+        env=os.environ.copy(), stderr=subprocess.DEVNULL)
+    for _ in range(50):
+        if os.path.exists(SOCK):
+            break
+        time.sleep(0.1)
+    evs = []
+    s = ov.agent(target, "do it", provider="scripted", on_event=evs.append)
+    types = [e["type"] for e in evs]
+    if types[0] != "session" or "tool_call" not in types or types[-1] != "done":
+        fail(f"agent events: {types}")
+    if s.final != "finished" or ("added", "agent.txt") not in s.changes:
+        fail(f"agent result: {s} final={s.final!r}")
+    if not any(t["type"] == "tool_result" for t in ov.transcript(s.sid)):
+        fail("transcript op")
+    prov = [r for r in s.log() if r["path"] == "agent.txt"]
+    if not prov or prov[0].get("caused_by", {}).get("tool") != "write_file":
+        fail(f"agent provenance over socket: {prov}")
+    s.rollback()
+    ok("agent over socket: streamed events, sealed session, linked provenance")
+
+    # 15. orphan reconcile: a dead opener leaves a pending session, not a wedged one
     orphan = ov.open(target)
     orphan.shell("echo orphan > o.txt")
     daemon.kill(); daemon.wait()               # daemon dies hard with a session open

@@ -9,6 +9,8 @@
     overlord commit <session> [--merge] [--force]
     overlord rollback <session>
     overlord doctor
+    overlord agent -t <dir> [grants] [--provider anthropic|openai] "<task>"
+    overlord keys <provider> <key>
 
 A wrapped command runs against an overlay of the target directory. Every write
 lands in the session's upper layer; the real tree is untouched until an
@@ -794,8 +796,15 @@ def _finalize_session(sid, meta):
     sdir = session_path(sid)
     upper = os.path.join(sdir, "upper")
     changes = compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
+    attribution = {}
+    apath = os.path.join(sdir, "attribution.json")
+    if os.path.isfile(apath):
+        with open(apath) as f:
+            attribution = json.load(f)
     with open(os.path.join(sdir, "provenance.jsonl"), "w") as f:
         for rec in build_provenance(changes, upper, meta["target"]):
+            if rec["path"] in attribution:
+                rec["caused_by"] = attribution[rec["path"]]   # agent tool call
             f.write(json.dumps(rec) + "\n")
     tdir = os.path.join(sdir, "trace")
     if meta.get("trace") == "strace" and os.path.isdir(tdir):
@@ -1282,6 +1291,59 @@ def _api_rollback(req):
     return {"target": rollback_session(req["sid"])}
 
 
+AGENT_CANCEL = set()
+
+
+def _api_agent(req, emit):
+    """Streaming op: open a session, run the built-in agent, close it. Emits
+    transcript events as they happen; returns the sealed session."""
+    import agent as agent_mod
+    target = os.path.realpath(req["target"])
+    requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    requested.update(req.get("grants") or {})
+    grants, _rule = resolve_policy(target, requested)
+    provider = agent_mod.make_provider(req.get("provider", "anthropic"), req.get("model"))
+    ls = open_session(target, req.get("backend"), grants, trace=req.get("trace"),
+                      wait=bool(req.get("wait")), stack=bool(req.get("stack")),
+                      capture=True, agent=f"{provider.name}:{provider.model}")
+    LIVE[ls.sid] = ls
+    emit({"ok": True, "event": "session", "sid": ls.sid, "grants": grants,
+          "backend": ls.meta["backend"]})
+    final = ""
+    try:
+        final = agent_mod.run_agent(
+            ls, provider, req["task"], max_turns=int(req.get("max_turns") or
+                                                    agent_mod.DEFAULT_MAX_TURNS),
+            emit=lambda ev: emit({"ok": True, "event": "agent", **ev}),
+            should_stop=lambda: ls.sid in AGENT_CANCEL)
+    except SystemExit as e:
+        emit({"ok": True, "event": "agent", "type": "error", "text": str(e)})
+    finally:
+        AGENT_CANCEL.discard(ls.sid)
+        LIVE.pop(ls.sid, None)
+        sid, changes = ls.close()
+    m = load_meta(sid)
+    return {"sid": sid, "final": final, "changes": changes, "grants": m.get("grants"),
+            "usage": m.get("usage"), "exit_code": m.get("exit_code")}
+
+
+def _api_agent_cancel(req):
+    if req["sid"] not in LIVE:
+        raise SystemExit(f"error: no running agent session {req['sid']}")
+    AGENT_CANCEL.add(req["sid"])
+    return {"sid": req["sid"], "cancelling": True}
+
+
+def _api_transcript(req):
+    path = os.path.join(session_path(req["sid"]), "transcript.jsonl")
+    load_meta(req["sid"])
+    events = []
+    if os.path.isfile(path):
+        with open(path) as f:
+            events = [json.loads(line) for line in f]
+    return {"transcript": events}
+
+
 DAEMON_OPS = {
     "ping": lambda req: {"version": VERSION, "pid": os.getpid()},
     "run": _api_run,
@@ -1293,8 +1355,10 @@ DAEMON_OPS = {
     "commit": _api_commit,
     "rollback": _api_rollback,
     "sessions": lambda req: {"sessions": [load_meta(s) for s in list_sessions()]},
+    "agent_cancel": _api_agent_cancel,
+    "transcript": _api_transcript,
 }
-STREAMING_OPS = {"exec": _api_exec}
+STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent}
 
 
 def cmd_daemon(args):
@@ -1392,6 +1456,9 @@ def main(argv=None):
     ps.set_defaults(fn=cmd_shell)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import agent as agent_mod
+    agent_mod.add_agent_parser(sub, _add_exec_flags)
     sub.add_parser("doctor", help="environment diagnostics").set_defaults(fn=cmd_doctor)
 
     pd = sub.add_parser("daemon", help="resident broker: unix socket + policy enforcement")

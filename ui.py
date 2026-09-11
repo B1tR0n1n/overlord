@@ -15,6 +15,7 @@ the stack degrades to Georgia / Consolas so the UI works airgapped.
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 import overlord as core
 
@@ -268,161 +269,47 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <main class="dossier" id="detail" aria-live="polite"><div class="sheet">__DOSSIER__</div></main>
 </div></div>
 <script>
-const BOOT = __BOOT__;
-let SEL = BOOT.detail ? BOOT.detail.meta.id : null;
-
-const esc = s => String(s === null || s === undefined ? '' : s)
-  .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* One renderer. The server owns all markup (and therefore all escaping);
+   the client fetches rendered fragments and swaps them in. Anything not
+   server-rendered below is either static or set via textContent. */
+let SEL = __SEL__;
+const $ = id => document.getElementById(id);
 const j = (u, opt) => fetch(u, opt).then(r => r.json());
-const short = h => (h || '').slice(0, 12);
 
-function grantMarks(m) {
-  const g = m.grants || {};
-  let out = '';
-  if (g.jail) out += '<span class="stamp grant">jail</span>';
-  if (g.net === 'none') out += '<span class="stamp grant">net:none</span>';
-  if (g.timeout) out += '<span class="stamp grant">timeout ' + esc(g.timeout) + 's</span>';
-  if (g.merge_base) out += '<span class="stamp grant">merge-base</span>';
-  if (m.agent) out += '<span class="stamp grant">agent ' + esc(m.agent) + '</span>';
-  return out;
-}
-function marks(m) {
-  let out = `<span class="stamp ${m.status}">${esc(m.status)}</span>` + grantMarks(m);
-  if (m.timed_out) out += '<span class="stamp alarm">timed-out</span>';
-  return out;
-}
-
-async function loadList(pre) {
-  const d = pre || await j('/api/sessions');
-  document.getElementById('status').textContent =
-    d.backend + ' backend \\u00b7 ' + d.sessions.length + ' records';
-  const el = document.getElementById('list');
-  if (!d.sessions.length) {
-    el.innerHTML = '<div class="reg-empty">No records.</div>';
-    return;
-  }
-  const rev = d.sessions.slice().reverse();
-  el.innerHTML = rev.map((m, i) => {
-    const n = String(rev.length - i).padStart(2, '0');
-    return `<button type="button" class="reg-item ${m.id === SEL ? 'sel' : ''}"
-      onclick="select('${esc(m.id)}')" ${m.id === SEL ? 'aria-current="true"' : ''}>
-      <span class="reg-top"><span class="reg-idx">${n}</span>
-      <span class="reg-sid">${esc(m.id)}</span></span>
-      <div class="reg-tgt">${esc(m.target)}</div>
-      <div class="reg-marks">${marks(m)}</div></button>`;
-  }).join('');
+async function loadList() {
+  const d = await j('/api/view?sel=' + encodeURIComponent(SEL || ''));
+  $('status').innerHTML = d.status;
+  $('list').innerHTML = d.register;
 }
 
 async function select(sid) {
   SEL = sid;
-  renderDetail(await j('/api/session/' + sid));
+  const d = await j('/api/view/session/' + encodeURIComponent(sid));
+  $('detail').innerHTML = d.dossier;
   loadList();
-}
-
-function renderDetail(d) {
-  const m = d.meta, g = m.grants || {}, id = m.id;
-  const prov = {};
-  (d.provenance || []).forEach(r => { prov[r.path] = r; });
-
-  let h = `<section class="sec"><div class="sec-label">01 &mdash; Dossier</div>
-    <h1 class="sec-title">Session <span class="sid">${esc(id)}</span></h1>
-    <div class="rule"></div>
-    <div class="cmdline">${esc((m.cmd || []).join(' ')) || '&mdash;'}</div>
-    <div class="facts">
-      <div class="fact"><div class="fact-k">Target</div><div class="fact-v">${esc(m.target)}</div></div>
-      <div class="fact"><div class="fact-k">Backend</div><div class="fact-v">${esc(m.backend)}</div></div>
-      <div class="fact"><div class="fact-k">Exit</div><div class="fact-v">${m.exit_code ?? '\\u2026'}</div></div>
-      <div class="fact"><div class="fact-k">Opened</div><div class="fact-v ts">${esc(m.started)}</div></div>
-      <div class="fact"><div class="fact-k">Closed</div><div class="fact-v ts">${esc(m.finished) || '\\u2026'}</div></div>
-    </div>
-    <div class="grants"><span class="grants-l">Grants</span>${grantMarks(m) ||
-      '<span class="stamp">unscoped</span>'}${m.timed_out ?
-      '<span class="stamp alarm">timed-out</span>' : ''}</div>
-  </section>`;
-
-  const ch = d.changes || [];
-  h += `<section class="sec"><div class="sec-label">02 &mdash; Manifest</div>
-    <h2 class="sec-title">${ch.length} line item${ch.length === 1 ? '' : 's'} held in escrow</h2>
-    <div class="rule"></div>`;
-  if (ch.length) {
-    h += `<table class="manifest"><thead><tr>
-      <th style="width:130px">Disposition</th><th>Path &amp; attribution</th>
-      <th style="width:210px">Integrity</th></tr></thead><tbody>` +
-      ch.map(([k, p]) => {
-        const r = prov[p] || {}, c = r.caused_by;
-        const glyph = {added:'+', modified:'~', deleted:'\\u2212', 'replaced-dir':'\\u00b1'}[k] || '\\u00b7';
-        return `<tr class="k-${esc(k)}">
-          <td class="mk k-${esc(k)}"><span class="g">${glyph}</span>${esc(k)}</td>
-          <td><div class="mpath">${esc(p)}</div>${c ? `<div class="cause">
-            <span class="arrow">\\u21b3</span>turn <b>${esc(c.turn)}</b> \\u00b7
-            <b>${esc(c.tool)}</b>${c.summary ? ' \\u00b7 ' + esc(c.summary) : ''}
-            <span class="cid">${esc(c.tool_call_id)}</span></div>` : ''}</td>
-          <td class="hash">${short(r.before_sha256) || '\\u00b7'}<span class="to">\\u2192</span>${short(r.after_sha256) || '\\u00b7'}</td>
-        </tr>`;
-      }).join('') + '</tbody></table>';
-  } else {
-    h += '<div class="empty">Nothing was written. The tree is as it was.</div>';
-  }
-  h += '</section>';
-
-  if (m.status === 'pending') {
-    h += `<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>
-      <h2 class="sec-title">Nothing has touched the tree yet</h2>
-      <div class="rule"></div>
-      <div class="disposition">
-        <p class="disp-note">Committing replays this manifest onto the real tree, after
-          verifying it has not drifted since the snapshot. Voiding discards the overlay
-          and leaves the target byte-identical.</p>
-        <div class="acts">
-          <button class="btn btn-commit" onclick="commit('${esc(id)}')">Commit</button>
-          <button class="btn btn-void" onclick="rollback('${esc(id)}')">Void</button>
-          <label class="opt"><input type="checkbox" id="merge"> merge</label>
-          <label class="opt"><input type="checkbox" id="force"> force</label>
-        </div>
-        <div id="conflicts"></div>
-      </div></section>`;
-  } else if (m.status === 'committed') {
-    const mg = (m.merged_paths || []).length;
-    h += `<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>
-      <h2 class="sec-title">Sealed &mdash; replayed onto the tree</h2>
-      <div class="rule"></div>
-      <div class="facts">
-        <div class="fact"><div class="fact-k">Committed</div><div class="fact-v">${esc(m.committed)}</div></div>
-        ${m.forced ? '<div class="fact"><div class="fact-k">Override</div><div class="fact-v">forced past drift</div></div>' : ''}
-        ${mg ? '<div class="fact"><div class="fact-k">Merged</div><div class="fact-v">' + mg + ' path(s)</div></div>' : ''}
-      </div></section>`;
-  }
-  document.getElementById('detail').innerHTML = '<div class="sheet">' + h + '</div>';
 }
 
 async function commit(sid) {
   const body = JSON.stringify({
-    merge: !!(document.getElementById('merge') || {}).checked,
-    force: !!(document.getElementById('force') || {}).checked,
+    merge: !!($('merge') || {}).checked,
+    force: !!($('force') || {}).checked,
   });
-  const r = await j('/api/session/' + sid + '/commit', { method: 'POST', body });
-  const box = document.getElementById('conflicts');
-  if (r.error) {
-    box.innerHTML = `<div class="refusal"><b>Refused</b>
-      <span class="why">${esc(r.error)}</span></div>`;
-    return;
-  }
-  if (!r.committed) {
-    box.innerHTML = `<div class="refusal"><b>Target drifted &mdash; refusing</b>
-      <div class="why">` + r.conflicts.map(([why, p]) =>
-        `${esc(why)} \\u00b7 ${esc(p)}`).join('<br>') + `</div>
-      <div class="hint">Retry with merge (needs &mdash;merge-base), or force past it deliberately.</div>
-    </div>`;
-    return;
-  }
-  select(sid);
+  const r = await j('/api/session/' + encodeURIComponent(sid) + '/commit',
+                    { method: 'POST', body });
+  if (r.committed) return select(sid);
+  const box = $('conflicts');
+  if (r.conflicts_html) { box.innerHTML = r.conflicts_html; return; }
+  box.innerHTML = '<div class="refusal"><b>Refused</b><span class="why"></span></div>';
+  box.querySelector('.why').textContent = r.error || 'unknown error';
 }
 
 async function rollback(sid) {
-  await j('/api/session/' + sid + '/rollback', { method: 'POST', body: '{}' });
+  await j('/api/session/' + encodeURIComponent(sid) + '/rollback',
+          { method: 'POST', body: '{}' });
   SEL = null;
-  document.getElementById('detail').innerHTML =
-    '<div class="sheet"><section class="sec"><div class="sec-label">01 &mdash; Dossier</div>' +
+  $('detail').innerHTML =
+    '<div class="sheet"><section class="sec">' +
+    '<div class="sec-label">01 &mdash; Dossier</div>' +
     '<h1 class="sec-title">Voided</h1><div class="rule"></div>' +
     '<div class="empty">The overlay was discarded. The target is byte-identical.</div>' +
     '</section></div>';
@@ -430,9 +317,8 @@ async function rollback(sid) {
 }
 
 async function savePolicy() {
-  const el = document.getElementById('polmsg');
-  const r = await j('/api/policy', {
-    method: 'PUT', body: document.getElementById('policy').value });
+  const el = $('polmsg');
+  const r = await j('/api/policy', { method: 'PUT', body: $('policy').value });
   el.textContent = r.error ? ('rejected: ' + r.error) : 'sealed';
   el.className = 'polmsg ' + (r.error ? 'err' : 'ok');
   setTimeout(() => { el.textContent = ''; el.className = 'polmsg'; }, 3000);
@@ -441,12 +327,12 @@ async function savePolicy() {
 // keyboard: the register is operable without a mouse
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
-  if (e.key !== 'j' && e.key !== 'k' && e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  if (!['j', 'k', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
   const items = [...document.querySelectorAll('.reg-item')];
   if (!items.length) return;
   const cur = items.findIndex(el => el.classList.contains('sel'));
   const step = (e.key === 'j' || e.key === 'ArrowDown') ? 1 : -1;
-  const next = items[Math.min(items.length - 1, Math.max(0, (cur < 0 ? 0 : cur + step)))];
+  const next = items[Math.min(items.length - 1, Math.max(0, cur < 0 ? 0 : cur + step))];
   if (next) { next.click(); next.focus(); e.preventDefault(); }
 });
 
@@ -604,6 +490,16 @@ def _render_dossier(payload):
     return "".join(h)
 
 
+def _render_refusal(result):
+    """Drift refusal, rendered here so the client never builds markup."""
+    rows = "<br>".join(f'{_esc(why)} &middot; {_esc(path)}'
+                       for why, path in result.get("conflicts") or [])
+    return ('<div class="refusal"><b>Target drifted &mdash; refusing</b>'
+            f'<div class="why">{rows}</div>'
+            '<div class="hint">Retry with merge (needs &mdash;merge-base), '
+            'or force past it deliberately.</div></div>')
+
+
 def _session_payload(sid):
     meta = core.load_meta(sid)
     upper = os.path.join(core.session_path(sid), "upper")
@@ -618,7 +514,7 @@ def _session_payload(sid):
     return {"meta": meta, "changes": changes, "provenance": provenance}
 
 
-def _build_page(status, register_html, dossier_html, policy_text, boot):
+def _build_page(status, register_html, dossier_html, policy_text, sel):
     """Token substitution, not str.format — the CSS and JS are full of braces."""
     page = SHELL
     for token, value in (("__CSS__", CSS),
@@ -626,7 +522,7 @@ def _build_page(status, register_html, dossier_html, policy_text, boot):
                          ("__REGISTER__", register_html),
                          ("__DOSSIER__", dossier_html),
                          ("__POLICY__", policy_text),
-                         ("__BOOT__", boot)):
+                         ("__SEL__", sel)):
         page = page.replace(token, value)
     return page
 
@@ -647,27 +543,41 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _views(self, sel):
+        """Server-rendered fragments: register + status line."""
+        metas = [core.load_meta(s) for s in core.list_sessions()]
+        backend = core.detect_backend() or "none"
+        return {"status": f"{_esc(backend)} backend &middot; {len(metas)} records",
+                "register": _render_register(metas, sel)}
+
     def do_GET(self):
         try:
+            parsed = urlparse(self.path)
+            path, query = parsed.path, parse_qs(parsed.query)
+            if path == "/api/view":
+                self._send(self._views((query.get("sel") or [None])[0] or None))
+                return
+            if path.startswith("/api/view/session/"):
+                sid = path.rsplit("/", 1)[-1]
+                self._send({"dossier": '<div class="sheet">'
+                            + _render_dossier(_session_payload(sid)) + "</div>"})
+                return
             if self.path == "/":
                 metas = [core.load_meta(s) for s in core.list_sessions()]
-                backend = core.detect_backend() or "none"
-                boot = {"backend": backend, "sessions": metas, "detail": None}
                 pending = [m for m in metas if m.get("status") == "pending"]
-                sel = None
-                if pending:
-                    sel = pending[-1]["id"]
-                    boot["detail"] = _session_payload(sel)
+                sel = pending[-1]["id"] if pending else None
                 policy_text = ""
                 if os.path.isfile(core.POLICY_FILE):
                     with open(core.POLICY_FILE) as f:
                         policy_text = f.read()
+                views = self._views(sel)
                 page = _build_page(
-                    status=f"{_esc(backend)} backend &middot; {len(metas)} records",
-                    register_html=_render_register(metas, sel),
-                    dossier_html=_render_dossier(boot["detail"]),
+                    status=views["status"],
+                    register_html=views["register"],
+                    dossier_html=_render_dossier(
+                        _session_payload(sel) if sel else None),
                     policy_text=_esc(policy_text),
-                    boot=json.dumps(boot),
+                    sel=json.dumps(sel),
                 )
                 self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8")
             elif self.path == "/api/sessions":
@@ -696,8 +606,11 @@ class Handler(BaseHTTPRequestHandler):
                 sid, action = parts[2], parts[3]
                 req = self._body()
                 if action == "commit":
-                    self._send(core.commit_session(
-                        sid, merge=bool(req.get("merge")), force=bool(req.get("force"))))
+                    result = core.commit_session(
+                        sid, merge=bool(req.get("merge")), force=bool(req.get("force")))
+                    if not result.get("committed"):
+                        result["conflicts_html"] = _render_refusal(result)
+                    self._send(result)
                 elif action == "rollback":
                     self._send({"target": core.rollback_session(sid)})
                 else:

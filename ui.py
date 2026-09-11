@@ -14,7 +14,6 @@ the stack degrades to Georgia / Consolas so the UI works airgapped.
 
 import json
 import os
-import re
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -359,13 +358,9 @@ setInterval(() => loadList(), 2500);
 
 # Session ids are minted as %Y%m%d-%H%M%S plus six hex. Anything else never
 # reaches the filesystem: these arrive in a URL path segment.
-SID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
-
-
 def _sid(raw):
-    if not SID_RE.match(raw or ""):
-        raise SystemExit(f"error: not a session id: {raw!r}")
-    return raw
+    """Boundary check; core.validate_session_id is the one definition of a valid id."""
+    return core.validate_session_id(raw or "")
 
 
 def _esc(s):
@@ -530,10 +525,11 @@ def _render_refusal(result):
 
 
 def _session_payload(sid):
+    sid = core.validate_session_id(sid)
     meta = core.load_meta(sid)
-    upper = os.path.join(core.session_path(sid), "upper")
+    upper = core.session_file(sid, "upper")
     changes = core.compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
-    prov_path = os.path.join(core.session_path(sid), "provenance.jsonl")
+    prov_path = core.session_file(sid, core.PROVENANCE_FILE)
     provenance = []
     if os.path.isfile(prov_path):
         with open(prov_path) as f:
@@ -679,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(_session_payload(_sid(parsed.path.rsplit("/", 1)[-1])))
             else:
                 self._send({"error": "not found"}, 404)
-        except SystemExit as e:
+        except (core.OverlordError, SystemExit) as e:
             self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 500)
@@ -704,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send({"error": "unknown action"}, 404)
             else:
                 self._send({"error": "not found"}, 404)
-        except SystemExit as e:
+        except (core.OverlordError, SystemExit) as e:
             self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 500)

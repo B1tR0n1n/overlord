@@ -99,12 +99,12 @@ def load_key(provider):
     if os.path.isfile(path):
         mode = os.stat(path).st_mode & 0o777
         if mode & 0o077:
-            raise SystemExit(f"error: {path} is mode {mode:03o}; chmod 600 it")
+            raise ov.OverlordError(f"error: {path} is mode {mode:03o}; chmod 600 it")
         with open(path) as f:
             key = json.load(f).get(provider)
         if key:
             return key
-    raise SystemExit(f"error: no API key for {provider}: set {env} or add it to {path}")
+    raise ov.OverlordError(f"error: no API key for {provider}: set {env} or add it to {path}")
 
 
 def save_key(provider, key):
@@ -143,9 +143,9 @@ def _post(url, headers, body, timeout=600):
             return json.load(r)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:2000]
-        raise SystemExit(f"error: provider HTTP {e.code}: {detail}")
+        raise ov.OverlordError(f"error: provider HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
-        raise SystemExit(f"error: provider unreachable: {e.reason}")
+        raise ov.OverlordError(f"error: provider unreachable: {e.reason}")
 
 
 class AnthropicProvider:
@@ -269,12 +269,12 @@ def make_provider(provider, model=None, key=None):
     if provider == "scripted":      # tests: OVERLORD_AGENT_SCRIPT=<json file of replies>
         path = os.environ.get("OVERLORD_AGENT_SCRIPT")
         if not path:
-            raise SystemExit("error: scripted provider needs OVERLORD_AGENT_SCRIPT")
+            raise ov.OverlordError("error: scripted provider needs OVERLORD_AGENT_SCRIPT")
         with open(path) as f:
             p = ScriptedProvider(json.load(f))
         p.model = model or "scripted"
         return p
-    raise SystemExit(f"error: unknown provider: {provider}")
+    raise ov.OverlordError(f"error: unknown provider: {provider}")
 
 
 # ---------------------------------------------------------------- tools → session
@@ -300,7 +300,7 @@ class ToolRunner:
             return f"error: unknown tool {name}", 1
         try:
             return fn(inp, label)
-        except SystemExit as e:
+        except (ov.OverlordError, SystemExit) as e:
             return f"error: {e}", 1
 
     def t_list_dir(self, inp, label):
@@ -433,7 +433,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         record({"type": "done", "reason": "max_turns", "turn": max_turns,
                 "usage": live.meta["usage"]})
         return final
-    except SystemExit as e:
+    except (ov.OverlordError, SystemExit) as e:
         record({"type": "error", "text": str(e)})
         raise
     finally:

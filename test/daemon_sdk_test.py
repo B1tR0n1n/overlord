@@ -119,7 +119,7 @@ try:
                 ov._call(op, sid=bad)
                 fail(f"daemon op {op!r} accepted session id {bad!r}")
             except OverlordError as e:
-                if "not a session id" not in str(e):
+                if "invalid session id" not in str(e):
                     fail(f"{op} {bad!r}: wrong refusal: {e}")
     ok("daemon refuses traversal in session ids")
 

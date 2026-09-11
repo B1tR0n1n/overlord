@@ -21,19 +21,35 @@ echo "red team vs: $OVERLORD"
 
 TARGET="$WORK/target"
 FAILED=0
-hold() { echo "  HELD:     $1"; }
-breach() { echo "  BREACH:   $1"; FAILED=1; }
+hold() {
+    local msg="$1"
+    echo "  HELD:     $msg"
+    return 0
+}
+breach() {
+    local msg="$1"
+    echo "  BREACH:   $msg"
+    FAILED=1
+    return 0
+}
 
-reset_target() { rm -rf "$TARGET"; mkdir -p "$TARGET"; echo secret > "$TARGET/data.txt"; }
+reset_target() {
+    rm -rf "$TARGET"
+    mkdir -p "$TARGET"
+    echo secret > "$TARGET/data.txt"
+    return 0
+}
 
 # attack runner: executes CMD inside a jailed session, echoes its stdout, rolls back
 attack() {
+    local cmd="$1"
+    local out sid
     reset_target
-    local OUT SID
-    OUT=$($OVERLORD run --jail -t "$TARGET" -- bash -c "$1" 2>/dev/null)
-    SID=$(grep -oP 'session \K\S+' <<< "$OUT" | head -1)
-    [ -n "$SID" ] && $OVERLORD rollback "$SID" > /dev/null 2>&1
-    echo "$OUT"
+    out=$($OVERLORD run --jail -t "$TARGET" -- bash -c "$cmd" 2>/dev/null)
+    sid=$(grep -oP 'session \K\S+' <<< "$out" | head -1)
+    [[ -n "$sid" ]] && $OVERLORD rollback "$sid" > /dev/null 2>&1
+    echo "$out"
+    return 0
 }
 
 # --- A1: symlink escape — absolute symlink out of the target
@@ -43,13 +59,13 @@ rm -f "$CANARY"
 ln -s "$HOME" "$TARGET/evil"
 OUT=$($OVERLORD run --jail -t "$TARGET" -- bash -c \
   "echo pwned > evil/.overlord-redteam-canary-$$ 2>/dev/null && echo WROTE || echo DENIED" 2>/dev/null)
-SID=$(grep -oP 'session \K\S+' <<< "$OUT" | head -1); [ -n "$SID" ] && $OVERLORD rollback "$SID" > /dev/null
-if [ -e "$CANARY" ]; then breach "A1 symlink escape reached real \$HOME"; rm -f "$CANARY"
+SID=$(grep -oP 'session \K\S+' <<< "$OUT" | head -1); [[ -n "$SID" ]] && $OVERLORD rollback "$SID" > /dev/null
+if [[ -e "$CANARY" ]]; then breach "A1 symlink escape reached real \$HOME"; rm -f "$CANARY"
 else hold "A1 symlink escape (absolute link resolves inside jail)"; fi
 
 # --- A2: dotdot traversal — climb out of the target
 OUT=$(attack 'echo pwned > ../../escape.txt 2>/dev/null; echo x > /escape.txt 2>/dev/null; echo done')
-if [ -e "$WORK/escape.txt" ] || [ -e /escape.txt ]; then breach "A2 traversal reached real fs"
+if [[ -e "$WORK/escape.txt" ]] || [[ -e /escape.txt ]]; then breach "A2 traversal reached real fs"
 else hold "A2 dotdot traversal (lands in throwaway tmpfs root)"; fi
 
 # --- A3: session-record tampering — the engine's own books must be out of reach
@@ -57,11 +73,13 @@ OUT=$(attack 'ls /.overlord/manifest.json 2>/dev/null && echo BOOKS-VISIBLE || e
 if grep -q BOOKS-VISIBLE <<< "$OUT"; then breach "A3 session records (manifest/meta) reachable from inside the jail"
 else hold "A3 session records sealed"; fi
 
-# --- A4: host sysctl write
-HOST_BEFORE=$(hostname)
+# --- A4: host sysctl write — the write may land in the jail's private UTS
+# namespace (it does when overlord itself runs as root); what must never
+# happen is the host's own hostname changing
+HOST_BEFORE="$(cat /proc/sys/kernel/hostname)"
 OUT=$(attack 'echo owned > /proc/sys/kernel/hostname 2>/dev/null && echo WROTE || echo DENIED')
-if [ "$(hostname)" != "$HOST_BEFORE" ]; then breach "A4 host sysctl writable (host hostname changed)"
-elif grep -q WROTE <<< "$OUT"; then hold "A4 host sysctls contained (write landed in private UTS ns)"
+if [[ "$(cat /proc/sys/kernel/hostname)" != "$HOST_BEFORE" ]]; then breach "A4 host sysctl reached host (hostname changed)"
+elif grep -q WROTE <<< "$OUT"; then hold "A4 host sysctls (write contained to private uts namespace)"
 else hold "A4 host sysctls read-only"; fi
 
 # --- A5: device node forgery
@@ -96,7 +114,7 @@ if grep -q REACHED <<< "$OUT"; then breach "A10 mount tricks reached real fs"
 else hold "A10 mount games contained to jail"; fi
 
 echo
-if [ "$FAILED" -eq 0 ]; then
+if [[ "$FAILED" -eq 0 ]]; then
     echo "PASS: jail held against all attacks"
 else
     echo "FAIL: breaches found — fix before release"

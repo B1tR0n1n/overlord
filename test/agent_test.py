@@ -222,7 +222,7 @@ try:
     try:
         agent.load_key("openai")
         fail("world-readable key file accepted")
-    except SystemExit:
+    except (ov.OverlordError, SystemExit):
         pass
     ok("key handling")
 

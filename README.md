@@ -156,7 +156,7 @@ attach-race at process start.
 ```bash
 bash test/smoke.sh                # 25 core transactional + replay-safety assertions
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
-python3 test/daemon_sdk_test.py   # 16 daemon + SDK + policy + live-session assertions
+python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/ui_test.py           # 9 mission-control API + origin-guard assertions
 python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)

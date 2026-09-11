@@ -1042,8 +1042,7 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
     try:
         proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, **popen_kw)
     except OSError:
-        if cleanup:
-            cleanup()
+        _abort_launch(sid, lock, cleanup, parent_sock)
         raise
     finally:
         child_sock.close()
@@ -1056,22 +1055,33 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
         try:
             ebpf = start_ebpf(proc.pid, sdir)
         except Exception:
-            # the workload is already live and the recorder is not: kill the
-            # whole group and reap it, or a daemon would keep it running
-            # unrecorded after the caller has been told the session failed
-            try:
-                os.killpg(proc.pid, 9)
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            parent_sock.close()
-            if cleanup:
-                cleanup()
+            # the workload is already live and the recorder is not
+            _abort_launch(sid, lock, cleanup, parent_sock, proc)
             raise
     return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+
+
+def _abort_launch(sid, lock, cleanup, parent_sock, proc=None):
+    """A launch that fails after the session record exists must leave nothing:
+    not a running holder (a daemon would keep it alive, unrecorded, after the
+    caller was told the session failed), not an `open` orphan that blocks the
+    target for every later run, and not the target lock (held by the daemon
+    process until it dies). The session never happened."""
+    if proc is not None:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    parent_sock.close()
+    if cleanup:
+        cleanup()
+    _force_rmtree(session_path(sid))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
 
 
 def execute_session(target, cmd, backend, grants, trace=None, wait=False,

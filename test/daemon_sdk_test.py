@@ -123,6 +123,23 @@ try:
                     fail(f"{op} {bad!r}: wrong refusal: {e}")
     ok("daemon refuses traversal in session ids")
 
+    # --- a launch that fails inside the daemon must release the target ---
+    # (kill the holder, drop the session record, unlock) — the daemon process
+    # outlives the failure, so a leaked flock would block the target for good
+    import shutil as _sh
+    if _sh.which("bpftrace") is None:
+        try:
+            ov._call("run", target=target, cmd=["bash", "-c", "sleep 2"], trace="ebpf")
+            fail("ebpf run succeeded with no recorder available")
+        except OverlordError as e:
+            if "bpftrace" not in str(e):
+                fail(f"unexpected launch error: {e}")
+        s = ov.run(target, ["true"])          # must not be blocked or locked
+        s.rollback()
+        ok("failed launch releases the target (no orphan, no held lock)")
+    else:
+        print("  skip: failed-launch test (bpftrace present)")
+
     # 9. live session: many commands, one transaction, streamed output
     with open(os.path.join(OVERLORD_HOME, "policy.json"), "w") as f:
         json.dump({"default": {}}, f)

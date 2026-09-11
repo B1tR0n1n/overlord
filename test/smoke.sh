@@ -313,13 +313,20 @@ if $KERNEL_OK && ! command -v bpftrace > /dev/null; then
     reset_target
     BEACON="$WORK/beacon"; rm -f "$BEACON"
     HOLDERS_BEFORE=$(ps -eo cmd | grep -c '[u]nshare --map-root-user' || true)
+    RECORDS_BEFORE=$(ls "$OVERLORD_HOME/sessions" 2>/dev/null | wc -l)
     R=$($OVERLORD run --trace ebpf -t "$TARGET" -- bash -c "sleep 1; touch $BEACON" 2>&1) && fail "ebpf run succeeded without a recorder" || true
     grep -q bpftrace <<< "$R" || fail "ebpf preflight gave no useful error: $R"
     sleep 2
     [[ ! -e "$BEACON" ]] || fail "workload ran on after the recorder failed"
     HOLDERS_AFTER=$(ps -eo cmd | grep -c '[u]nshare --map-root-user' || true)
     [[ "$HOLDERS_AFTER" -le "$HOLDERS_BEFORE" ]] || fail "recorder failure leaked a holder process"
-    pass "recorder failure kills and reaps the workload"
+    # and the failed launch must not have left a session behind: the next
+    # plain run on the same target has to open without --stack
+    RECORDS_AFTER=$(ls "$OVERLORD_HOME/sessions" 2>/dev/null | wc -l)
+    [[ "$RECORDS_AFTER" -eq "$RECORDS_BEFORE" ]] || fail "failed launch left a session record"
+    OUT=$($OVERLORD run -t "$TARGET" -- true) || fail "failed launch left the target blocked"
+    $OVERLORD rollback "$(sid_of "$OUT")" > /dev/null
+    pass "recorder failure kills the workload and leaves no session"
 else
     echo "  skip: recorder-failure test (needs kernel backend and no bpftrace)"
 fi

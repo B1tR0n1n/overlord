@@ -528,7 +528,8 @@ def _session_payload(sid):
     sid = core.validate_session_id(sid)
     meta = core.load_meta(sid)
     upper = core.session_file(sid, "upper")
-    changes = core.compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
+    changes = (core.compute_diff(upper, meta["target"], meta.get("backend"))
+               if os.path.isdir(upper) else [])
     prov_path = core.session_file(sid, core.PROVENANCE_FILE)
     provenance = []
     if os.path.isfile(prov_path):

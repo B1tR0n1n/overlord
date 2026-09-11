@@ -329,11 +329,16 @@ def _fingerprint(path):
 WHITEOUT_PREFIX = ".wh."
 
 
-def is_whiteout(path):
+def is_whiteout(path, backend=None):
+    """Kernel overlayfs marks a delete with a 0:0 char device (or the
+    user.overlay.whiteout xattr under userxattr). The `.wh.` name prefix is
+    fuse-overlayfs's convention; on the kernel backend a file called
+    `.wh.foo` is a file called `.wh.foo`, and reading it as a whiteout would
+    delete the user's `foo` on commit."""
     st = os.lstat(path)
     if stat.S_ISCHR(st.st_mode) and st.st_rdev == 0:
         return True
-    if os.path.basename(path).startswith(WHITEOUT_PREFIX):
+    if backend != "kernel" and os.path.basename(path).startswith(WHITEOUT_PREFIX):
         return True
     for xa in ("user.overlay.whiteout", "user.fuseoverlayfs.whiteout"):
         try:
@@ -361,7 +366,7 @@ def is_opaque_dir(path):
     return False
 
 
-def compute_diff(upper, target):
+def compute_diff(upper, target, backend=None):
     """Classify upper-layer entries: sorted list of (kind, relpath).
 
     kinds: added, modified, deleted, replaced-dir. Added dirs get a '/' suffix.
@@ -381,7 +386,7 @@ def compute_diff(upper, target):
         for name in files:
             fpath = os.path.join(root, name)
             rel = os.path.relpath(fpath, upper)
-            if is_whiteout(fpath):
+            if is_whiteout(fpath, backend):
                 try:
                     changes.append(("deleted", _victim_rel(fpath, upper)))
                 except OverlordError:
@@ -637,7 +642,7 @@ def _remove_target(path):
         os.remove(path)
 
 
-def apply_upper(upper, target):
+def apply_upper(upper, target, backend=None):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
     for root, dirs, files in os.walk(upper):
@@ -657,7 +662,7 @@ def apply_upper(upper, target):
         dirs[:] = [d for d in dirs if d not in opaque]  # copied whole above
         for name in files:
             fpath = os.path.join(root, name)
-            if is_whiteout(fpath):
+            if is_whiteout(fpath, backend):
                 _remove_target(_safe_join(target, _victim_rel(fpath, upper)))
             else:
                 _copy_entry(fpath, _safe_join(target, os.path.relpath(fpath, upper)))
@@ -886,7 +891,8 @@ class LiveSession:
         return rc, bytes(out)
 
     def changes(self):
-        return compute_diff(os.path.join(self.sdir, "upper"), self.meta["target"])
+        return compute_diff(os.path.join(self.sdir, "upper"), self.meta["target"],
+                            self.meta.get("backend"))
 
     def close(self):
         """Tear the namespace down and finalize the session as pending.
@@ -920,7 +926,8 @@ def _finalize_session(sid, meta):
     """Compute diff + provenance, parse traces, mark pending. Idempotent."""
     sdir = session_path(sid)
     upper = os.path.join(sdir, "upper")
-    changes = compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
+    changes = (compute_diff(upper, meta["target"], meta.get("backend"))
+               if os.path.isdir(upper) else [])
     attribution = {}
     apath = os.path.join(sdir, "attribution.json")
     if os.path.isfile(apath):
@@ -1167,7 +1174,7 @@ def cmd_diff(args):
     upper = session_file(args.session, "upper")
     if not os.path.isdir(upper):
         raise OverlordError(f"error: session is {m.get('status')}; layers discarded")
-    changes = compute_diff(upper, m["target"])
+    changes = compute_diff(upper, m["target"], m.get("backend"))
     for kind, rel in changes:
         print(f"{kind:12s} {rel}")
     if not changes:
@@ -1217,7 +1224,7 @@ def commit_session(sid, merge=False, force=False):
     upper = os.path.join(sdir, "upper")
     with open(os.path.join(sdir, MANIFEST_FILE)) as f:
         manifest = json.load(f)
-    changes = compute_diff(upper, m["target"])
+    changes = compute_diff(upper, m["target"], m.get("backend"))
     bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
     if bad:  # would _remove_target(<tree root>); no --force for this one
         raise OverlordError("error: refusing to commit — whiteout entry names its own "
@@ -1229,7 +1236,7 @@ def commit_session(sid, merge=False, force=False):
     if conflicts and not force:
         return {"committed": False, "conflicts": conflicts, "merged": merged,
                 "target": m["target"]}
-    n = apply_upper(upper, m["target"])
+    n = apply_upper(upper, m["target"], m.get("backend"))
     m.update(status="committed", committed=_now(),
              forced=bool(conflicts), merged_paths=merged)
     save_meta(sid, m)
@@ -1522,7 +1529,8 @@ DAEMON_OPS = {
     "open": _api_open,
     "close": _api_close,
     "diff": lambda req: {"changes": compute_diff(
-        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"])},
+        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"],
+        load_meta(req["sid"]).get("backend"))},
     "log": _api_log,
     "commit": _api_commit,
     "rollback": _api_rollback,

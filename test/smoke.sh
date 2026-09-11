@@ -263,15 +263,25 @@ sid_of "command completed" > /dev/null && fail "sid_of returned success on a mis
 pass "sid_of refuses a missing id"
 
 # --- 21. a whiteout that names its own tree root can never reach apply_upper
+# (kernel overlayfs never names whiteouts .wh.*, so there `.wh.` is a plain file)
 reset_target
 OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'touch .wh.')
 SID=$(sid_of "$OUT")
-$OVERLORD diff "$SID" | grep -q 'invalid-whiteout' || fail "root-naming whiteout not recorded in diff"
-R=$($OVERLORD commit --force "$SID" 2>&1) && fail "commit --force accepted a root-naming whiteout" || true
-grep -q "names its own tree root" <<< "$R" || fail "wrong refusal for root-naming whiteout: $R"
-[[ -f "$TARGET/keep.txt" ]] || fail "target destroyed by root-naming whiteout"
-$OVERLORD rollback "$SID" > /dev/null || fail "root-naming whiteout wedged the session"
-pass "root-naming whiteout: refused, unforceable, target intact, rollback works"
+BACKEND=$(grep -o '"backend": "[a-z]*"' "$OVERLORD_HOME/sessions/$SID/meta.json" | cut -d'"' -f4)
+if [[ "$BACKEND" == "kernel" ]]; then
+    $OVERLORD diff "$SID" | grep -q 'added *\.wh\.$' || fail "kernel: .wh. not treated as a plain file"
+    $OVERLORD diff "$SID" | grep -q 'invalid-whiteout' && fail "kernel: plain file misread as whiteout" || true
+    $OVERLORD commit "$SID" > /dev/null || fail "kernel: commit of a file named .wh. failed"
+    [[ -f "$TARGET/.wh." && -f "$TARGET/keep.txt" ]] || fail "kernel: .wh. commit lost data"
+    pass "kernel: a file named .wh. is a file; target intact"
+else
+    $OVERLORD diff "$SID" | grep -q 'invalid-whiteout' || fail "root-naming whiteout not recorded in diff"
+    R=$($OVERLORD commit --force "$SID" 2>&1) && fail "commit --force accepted a root-naming whiteout" || true
+    grep -q "names its own tree root" <<< "$R" || fail "wrong refusal for root-naming whiteout: $R"
+    [[ -f "$TARGET/keep.txt" ]] || fail "target destroyed by root-naming whiteout"
+    $OVERLORD rollback "$SID" > /dev/null || fail "root-naming whiteout wedged the session"
+    pass "root-naming whiteout: refused, unforceable, target intact, rollback works"
+fi
 
 # --- 22. replay never writes through a symlink that drifted into the tree
 reset_target
@@ -329,6 +339,21 @@ if $KERNEL_OK && ! command -v bpftrace > /dev/null; then
     pass "recorder failure kills the workload and leaves no session"
 else
     echo "  skip: recorder-failure test (needs kernel backend and no bpftrace)"
+fi
+
+# --- 26. kernel: a file named .wh.<existing> must not delete <existing> on commit
+if $KERNEL_OK; then
+    reset_target
+    OUT=$($OVERLORD run --backend kernel -t "$TARGET" -- bash -c 'touch .wh.keep.txt')
+    SID=$(sid_of "$OUT")
+    $OVERLORD diff "$SID" | grep -q 'deleted *keep.txt' && fail ".wh.keep.txt misread as a whiteout of keep.txt" || true
+    $OVERLORD diff "$SID" | grep -q 'added *\.wh\.keep\.txt' || fail ".wh.keep.txt not recorded as an added file"
+    $OVERLORD commit "$SID" > /dev/null
+    [[ -f "$TARGET/keep.txt" ]] || fail "commit deleted keep.txt because of a .wh.-named file"
+    [[ -f "$TARGET/.wh.keep.txt" ]] || fail ".wh.keep.txt was not applied"
+    pass "kernel: .wh.<name> is a file, not a whiteout of <name>"
+else
+    echo "  skip: .wh.<name> test (kernel backend unavailable)"
 fi
 
 echo "PASS: all smoke assertions"

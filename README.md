@@ -51,6 +51,10 @@ overlord run --trace ebpf -t /srv/app -- <cmd>       # kernel-side recorder (roo
 overlord run --merge-base -t /srv/app -- <cmd>       # keep base copy for commit --merge
 overlord shell -t /srv/app                           # interactive transactional shell
 
+overlord agent -t /srv/app "add a Makefile with a test target"   # jailed by default
+overlord agent --net none -t /srv/app "<task>"       # ...and offline too
+overlord agent --no-jail -t /srv/app "<task>"        # opt out: tools reach the real fs
+
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
 overlord log <session>           # per-change sha256 before -> after, syscall count
@@ -153,7 +157,7 @@ attach-race at process start.
 bash test/smoke.sh                # 19 core transactional assertions
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
 python3 test/daemon_sdk_test.py   # 15 daemon + SDK + policy + live-session assertions
-python3 test/agent_test.py        # 9 agent loop, tool, and provenance assertions
+python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/ui_test.py           # 9 mission-control API + origin-guard assertions
 python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)
 ```

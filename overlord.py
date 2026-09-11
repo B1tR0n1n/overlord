@@ -29,7 +29,9 @@ Grants (the capability manifest, via flags or --manifest file):
 Backends:
   kernel  overlayfs in an unprivileged user namespace; overlay is mounted over
           the target's own path (or into the jail), so absolute-path writes
-          are contained. jail/net grants require this backend. On Ubuntu
+          INTO THE TARGET are contained. Paths outside it (/tmp, $HOME, /etc)
+          are the real filesystem unless --jail, which is why `agent` jails by
+          default. jail/net grants require this backend. On Ubuntu
           24.04+ install packaging/ (AppArmor profile grants userns to the
           overlord launcher only).
   fuse    fuse-overlayfs, no privileges. Cooperative containment: cwd is

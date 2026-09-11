@@ -3,12 +3,20 @@
 hands act inside a live transactional session.
 
     overlord agent -t <dir> [grants] [--provider anthropic|openai]
-                   [--model M] [--max-turns N] "<task>"
+                   [--model M] [--max-turns N] [--no-jail] "<task>"
 
 The model loop runs in the overlord process with network access to the
 provider API. Every tool it calls (list_dir / read_file / write_file / shell)
 executes through LiveSession.exec inside the overlay, jail, and netns the
-grants describe. Nothing the model does touches the real tree until commit.
+grants describe.
+
+The agent is jailed by default — `run` and `shell` are not. The overlay covers
+the target's path, not the filesystem, so an unjailed `shell` tool writing to
+/tmp or $HOME hits the real thing: outside the transaction, absent from the
+diff, no provenance, nothing to roll back, and the session still reports
+changes=0. Jailed, the model sees system dirs and the target and nothing else,
+and the guarantee holds: nothing it does touches anything until commit.
+--no-jail drops that and says so on stderr.
 
 Provenance is linked: after each tool call the upper layer is re-hashed, and
 any path whose content changed is attributed to that tool call. The record
@@ -446,6 +454,23 @@ def _summarize(tc):
 
 def cmd_agent(args):
     grants = ov.load_grants(args)
+    # The agent is jailed by default, unlike `run` and `shell`.
+    #
+    # Those take a command the operator typed; this takes commands a model
+    # chooses. Without the jail the overlay covers only the target's own path,
+    # so `bash -c "echo x > /tmp/f"` writes to the real /tmp: outside the
+    # transaction, absent from the diff, with no provenance and nothing to roll
+    # back — and the session still reports changes=0, which reads as "the agent
+    # did nothing" rather than "the agent went somewhere we are not recording".
+    # A reviewer cannot approve what was never shown to them, so the containment
+    # has to be the default and leaving it has to be deliberate.
+    if not args.no_jail:
+        grants["jail"] = True
+    else:
+        print("warning: --no-jail — the model's tools can write anywhere this "
+              "user can. Writes outside the target land on the real filesystem, "
+              "outside the transaction, and cannot be rolled back.",
+              file=sys.stderr)
     provider = make_provider(args.provider, args.model)
     live = ov.open_session(args.target, args.backend, grants, trace=args.trace,
                            wait=args.wait, stack=args.stack, capture=True,
@@ -484,6 +509,9 @@ def cmd_agent(args):
 def add_agent_parser(sub, add_exec_flags):
     pa = sub.add_parser("agent", help="run a model as an agent inside a live session")
     add_exec_flags(pa)
+    pa.add_argument("--no-jail", action="store_true",
+                    help="run the agent's tools unjailed — they can then write "
+                         "anywhere you can, outside the transaction and unrecorded")
     pa.add_argument("--provider", choices=["anthropic", "openai", "scripted"],
                     default="anthropic")
     pa.add_argument("--model", help=f"model id (defaults: {DEFAULT_MODELS})")

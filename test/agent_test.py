@@ -8,6 +8,7 @@ without touching the network."""
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 
@@ -224,6 +225,51 @@ try:
     except SystemExit:
         pass
     ok("key handling")
+
+    # --- 10. the CLI jails the agent by default -------------------------
+    #
+    # Not the same thing as test 2: that one grants jail explicitly. This
+    # drives the command line the way a user does, because the hole was in
+    # the default, not in the mechanism.
+    if kernel:
+        beacon = os.path.join(tempfile.mkdtemp(), "ESCAPED")
+        esc = [{"text": "probe", "tool_calls": [
+                   {"name": "shell", "input": {"command": f"echo out > {beacon}"}}]},
+               {"text": "done"}]
+
+        def agent_cli(extra):
+            home, tgt = tempfile.mkdtemp(), tempfile.mkdtemp()
+            open(os.path.join(tgt, "f.txt"), "w").write("x\n")
+            spath = os.path.join(home, "s.json")
+            with open(spath, "w") as f:
+                json.dump(esc, f)
+            e = os.environ.copy()
+            e["OVERLORD_HOME"], e["OVERLORD_AGENT_SCRIPT"] = home, spath
+            r = subprocess.run(
+                [sys.executable, os.path.join(HERE, "overlord.py"), "agent",
+                 *extra, "--provider", "scripted", "-t", tgt, "probe"],
+                env=e, capture_output=True, text=True)
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(tgt, ignore_errors=True)
+            return r
+
+        if os.path.exists(beacon):
+            os.remove(beacon)
+        agent_cli([])
+        if os.path.exists(beacon):
+            os.remove(beacon)
+            fail("agent wrote outside the target with no --jail flag: "
+                 "the CLI default is not jailed")
+
+        r = agent_cli(["--no-jail"])
+        escaped = os.path.exists(beacon)
+        if os.path.exists(beacon):
+            os.remove(beacon)
+        if not escaped:
+            fail("--no-jail did not actually drop the jail; the test proves nothing")
+        if "warning: --no-jail" not in r.stderr:
+            fail(f"--no-jail did not warn: {r.stderr[-200:]!r}")
+        ok("agent jails by default; --no-jail escapes and says so")
 
     print("PASS: agent" + (" (jail + net:none)" if kernel else " (no kernel backend: unjailed)"))
 finally:

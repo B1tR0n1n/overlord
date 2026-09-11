@@ -188,7 +188,17 @@ def new_session_id():
 
 
 def session_path(sid):
-    return os.path.join(SESSIONS_DIR, sid)
+    """The one place a session id becomes a filesystem path.
+
+    Ids arrive from outside — the daemon socket, the UI's URL path — so this
+    resolves the join and refuses anything that does not land exactly one
+    level inside SESSIONS_DIR: `..`, an absolute path, an empty id, a symlink
+    that points out. Every caller gets the resolved, checked path."""
+    base = os.path.realpath(SESSIONS_DIR)
+    resolved = os.path.realpath(os.path.join(base, str(sid)))
+    if not resolved.startswith(base + os.sep) or os.path.dirname(resolved) != base:
+        raise SystemExit(f"error: not a session id: {sid!r}")
+    return resolved
 
 
 def load_meta(sid):

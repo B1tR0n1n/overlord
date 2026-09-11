@@ -13,8 +13,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import overlord as core
 
-PALETTE = dict(bg="#0a0908", card="#151311", border="#2a2520",
-               text="#c8bda0", dim="#8a7f6e", gold="#c9a227")
+PALETTE = {"bg": "#0a0908", "card": "#151311", "border": "#2a2520",
+           "text": "#c8bda0", "dim": "#8a7f6e", "gold": "#c9a227"}
+NOT_FOUND = {"error": "not found"}
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>OVERLORD — mission control</title>
@@ -212,38 +213,49 @@ def _render_detail(payload):
         f'backend · exit={m.get("exit_code")} · {m.get("started")} → '
         f'{m.get("finished", "")}{grantline}</div>',
         "<h2>changes</h2>",
+        _render_changes(payload["changes"], prov),
+        _render_status(m),
     ]
-    if payload["changes"]:
-        rows = []
-        for k, p in payload["changes"]:
-            r = prov.get(p, {})
-            hb, ha = (r.get("before_sha256") or "")[:12], (r.get("after_sha256") or "")[:12]
-            rows.append(f'<tr><td class="k-{k}">{k}</td><td>{_esc(p)}</td>'
-                        f'<td class="hash">{hb or "·"} → {ha or "·"}</td></tr>')
-        html.append("<table>" + "".join(rows) + "</table>")
-    else:
-        html.append('<span class="dimtext">no changes recorded</span>')
-    if m.get("status") == "pending":
-        html.append(
+    return "".join(html)
+
+
+def _render_changes(changes, prov):
+    if not changes:
+        return '<span class="dimtext">no changes recorded</span>'
+    rows = []
+    for k, p in changes:
+        r = prov.get(p, {})
+        hb, ha = (r.get("before_sha256") or "")[:12], (r.get("after_sha256") or "")[:12]
+        rows.append(f'<tr><td class="k-{k}">{k}</td><td>{_esc(p)}</td>'
+                    f'<td class="hash">{hb or "·"} → {ha or "·"}</td></tr>')
+    return "<table>" + "".join(rows) + "</table>"
+
+
+def _render_status(m):
+    """Action buttons for a pending session; the receipt line for a committed one."""
+    status = m.get("status")
+    if status == "pending":
+        return (
             f'<div class="actions">'
             f'<button class="commit" onclick="commit(\'{m["id"]}\')">COMMIT</button>'
             f'<button class="rollback" onclick="rollback(\'{m["id"]}\')">ROLLBACK</button>'
             f'<label><input type="checkbox" id="merge"> merge</label>'
             f'<label><input type="checkbox" id="force"> force</label></div>'
             f'<div id="conflicts"></div>')
-    elif m.get("status") == "committed":
+    if status == "committed":
         merged = len(m.get("merged_paths") or [])
-        html.append(f'<div class="meta">committed {m.get("committed", "")}'
-                    f'{" (forced)" if m.get("forced") else ""}'
-                    f'{" · " + str(merged) + " merged" if merged else ""}</div>')
-    return "".join(html)
+        return (f'<div class="meta">committed {m.get("committed", "")}'
+                f'{" (forced)" if m.get("forced") else ""}'
+                f'{" · " + str(merged) + " merged" if merged else ""}</div>')
+    return ""
 
 
 def _session_payload(sid):
+    sid = core.validate_session_id(sid)
     meta = core.load_meta(sid)
-    upper = os.path.join(core.session_path(sid), "upper")
+    upper = core.session_file(sid, "upper")
     changes = core.compute_diff(upper, meta["target"]) if os.path.isdir(upper) else []
-    prov_path = os.path.join(core.session_path(sid), "provenance.jsonl")
+    prov_path = core.session_file(sid, core.PROVENANCE_FILE)
     provenance = []
     if os.path.isfile(prov_path):
         with open(prov_path) as f:
@@ -255,6 +267,8 @@ def _session_payload(sid):
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
+        # intentionally silent: the UI polls every 2.5s and the default
+        # per-request stderr log would drown the operator's terminal
         pass
 
     def _send(self, obj, code=200, raw=None, ctype="application/json"):
@@ -262,8 +276,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # JSON bodies carry error strings; forbid a browser from ever
+        # sniffing one of them into a document
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _error(self, exc, code):
+        """Every failure path renders through one place. OverlordError text is
+        composed by the engine and never contains request input verbatim
+        (session ids are rejected before they can be echoed)."""
+        if isinstance(exc, core.OverlordError):
+            self._send({"error": str(exc)}, code)
+        else:
+            self._send({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -303,19 +330,18 @@ class Handler(BaseHTTPRequestHandler):
                         text = f.read()
                 self._send({"text": text})
             elif self.path.startswith("/api/session/"):
-                self._send(_session_payload(self.path.rsplit("/", 1)[-1]))
+                sid = core.validate_session_id(self.path.rsplit("/", 1)[-1])
+                self._send(_session_payload(sid))
             else:
-                self._send({"error": "not found"}, 404)
-        except SystemExit as e:
-            self._send({"error": str(e)}, 400)
+                self._send(NOT_FOUND, 404)
         except Exception as e:
-            self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+            self._error(e, 400)
 
     def do_POST(self):
         try:
             parts = self.path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "session"]:
-                sid, action = parts[2], parts[3]
+                sid, action = core.validate_session_id(parts[2]), parts[3]
                 req = self._body()
                 if action == "commit":
                     self._send(core.commit_session(
@@ -325,11 +351,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send({"error": "unknown action"}, 404)
             else:
-                self._send({"error": "not found"}, 404)
-        except SystemExit as e:
-            self._send({"error": str(e)}, 400)
+                self._send(NOT_FOUND, 404)
         except Exception as e:
-            self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+            self._error(e, 400)
 
     def do_PUT(self):
         try:
@@ -342,14 +366,16 @@ class Handler(BaseHTTPRequestHandler):
                     f.write(text)
                 self._send({"saved": True})
             else:
-                self._send({"error": "not found"}, 404)
+                self._send(NOT_FOUND, 404)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 400)
 
 
 def serve(port=7777):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"OVERLORD mission control: http://127.0.0.1:{port}  (local only)")
+    # plain HTTP by design: the socket is bound to loopback only, so the
+    # traffic never leaves the machine; TLS here would guard nothing
+    print(f"OVERLORD mission control listening on 127.0.0.1:{port}  (loopback only)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

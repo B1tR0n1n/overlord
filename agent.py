@@ -31,6 +31,12 @@ import urllib.request
 
 import overlord as ov
 
+# Checked 2026-09-11. claude-sonnet-5 is current. gpt-5 was the alias for the
+# gpt-5-2025-08-07 snapshot, deprecated 2026-06-11 and removed 2026-12-11;
+# gpt-5.5 is the replacement OpenAI published for it, served on the Chat
+# Completions endpoint this client uses. Newer families exist (gpt-5.6, and
+# gpt-6-astra as flagship) — re-check with `GET /v1/models` before bumping, and
+# do not guess an id from a release announcement.
 DEFAULT_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-5.5"}
 MAX_TOOL_OUTPUT = 32_000       # chars fed back to the model per tool result
 DEFAULT_MAX_TURNS = 40

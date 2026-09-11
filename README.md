@@ -150,11 +150,21 @@ attach-race at process start.
 ## Test
 
 ```bash
-bash test/smoke.sh              # 19 core transactional assertions
-bash test/redteam.sh            # 10 jail escape attempts (kernel backend)
-python3 test/daemon_sdk_test.py # 8 daemon + SDK + policy assertions
-python3 test/ui_test.py         # 5 mission-control assertions
+bash test/smoke.sh                # 19 core transactional assertions
+bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
+python3 test/daemon_sdk_test.py   # 15 daemon + SDK + policy + live-session assertions
+python3 test/agent_test.py        # 9 agent loop, tool, and provenance assertions
+python3 test/ui_test.py           # 5 mission-control API assertions
+python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)
 ```
+
+`ui_test.py` drives the HTTP API; `ui_browser_test.py` loads the page in
+Chromium and asserts on the rendered DOM — console errors, the dossier
+swapping on a register click, attribution reaching the manifest, the drift
+refusal, keyboard navigation, and phone-width layout. The browser suite skips
+cleanly when Playwright or Chromium is absent, so it never blocks a bare
+checkout; it exists because an API-only UI test let a click-breaking
+ReferenceError ship undetected.
 
 Core suite (`smoke.sh`): isolation, diff completeness, provenance hashes,
 byte-identical rollback, exact-replay commit, commit finality, conflict refusal

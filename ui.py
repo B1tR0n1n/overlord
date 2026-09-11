@@ -14,6 +14,8 @@ the stack degrades to Georgia / Consolas so the UI works airgapped.
 
 import json
 import os
+import re
+import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -101,6 +103,11 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .sec-title .sid{font-family:var(--mono);font-size:16px;letter-spacing:1px;
   font-weight:400;color:var(--text)}
 .rule{width:60px;height:1px;background:var(--accent);margin:13px 0 22px}
+.rule.tight{margin:11px 0 0}
+.rule.head{margin:11px 0 14px}
+.manifest th.c-kind{width:130px}
+.manifest th.c-integrity{width:210px}
+#policy{margin-top:8px}
 
 .cmdline{font-family:var(--mono);font-size:12px;color:var(--text-bright);
   background:var(--bg2);border:1px solid var(--border);border-left:2px solid var(--accent);
@@ -234,7 +241,7 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OVERLORD — mission control</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0908'/%3E%3Crect x='4.5' y='4.5' width='23' height='23' fill='none' stroke='%232a2620'/%3E%3Crect x='10' y='10' width='12' height='12' fill='none' stroke='%23c9a227' stroke-width='2'/%3E%3Crect x='15' y='0' width='2' height='8' fill='%23c9a227'/%3E%3C/svg%3E">
-<style>__CSS__</style></head><body>
+<style nonce="__NONCE__">__CSS__</style></head><body>
 <div class="grid-bg"></div>
 <svg class="noise" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><filter id="fsd-noise">
 <feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="4" stitchTiles="stitch"/>
@@ -252,23 +259,23 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <nav class="register" aria-label="Session register">
     <div class="reg-head">
       <div class="sec-label">00 &mdash; Register</div>
-      <div class="rule" style="margin:11px 0 0"></div>
+      <div class="rule tight"></div>
     </div>
     <div class="reg-scroll" id="list">__REGISTER__</div>
     <div class="policy-wrap">
       <div class="sec-label">04 &mdash; Policy</div>
-      <div class="rule" style="margin:11px 0 14px"></div>
+      <div class="rule head"></div>
       <label for="policy" class="fact-k">broker ceiling &mdash; json</label>
-      <textarea id="policy" spellcheck="false" style="margin-top:8px">__POLICY__</textarea>
+      <textarea id="policy" spellcheck="false">__POLICY__</textarea>
       <div class="polrow">
-        <button class="btn btn-quiet" onclick="savePolicy()">Seal</button>
+        <button class="btn btn-quiet" id="seal">Seal</button>
         <span id="polmsg" class="polmsg"></span>
       </div>
     </div>
   </nav>
   <main class="dossier" id="detail" aria-live="polite"><div class="sheet">__DOSSIER__</div></main>
 </div></div>
-<script>
+<script nonce="__NONCE__">
 /* One renderer. The server owns all markup (and therefore all escaping);
    the client fetches rendered fragments and swaps them in. Anything not
    server-rendered below is either static or set via textContent. */
@@ -336,15 +343,37 @@ document.addEventListener('keydown', e => {
   if (next) { next.click(); next.focus(); e.preventDefault(); }
 });
 
+// Delegation: no inline handlers anywhere, so the CSP can forbid them outright.
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-select],[data-commit],[data-void],#seal');
+  if (!b) return;
+  if (b.id === 'seal') return savePolicy();
+  if (b.dataset.select !== undefined) return select(b.dataset.select);
+  if (b.dataset.commit !== undefined) return commit(b.dataset.commit);
+  if (b.dataset.void !== undefined) return rollback(b.dataset.void);
+});
+
 setInterval(() => loadList(), 2500);
 </script></body></html>"""
+
+
+# Session ids are minted as %Y%m%d-%H%M%S plus six hex. Anything else never
+# reaches the filesystem: these arrive in a URL path segment.
+SID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+
+
+def _sid(raw):
+    if not SID_RE.match(raw or ""):
+        raise SystemExit(f"error: not a session id: {raw!r}")
+    return raw
 
 
 def _esc(s):
     if s is None:
         return ""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
+            .replace(">", "&gt;").replace('"', "&quot;")
+            .replace("'", "&#39;"))
 
 
 GLYPH = {"added": "+", "modified": "~", "deleted": "\u2212", "replaced-dir": "\u00b1"}
@@ -385,7 +414,7 @@ def _render_register(metas, sel):
         cls = "reg-item sel" if m["id"] == sel else "reg-item"
         cur = ' aria-current="true"' if m["id"] == sel else ""
         rows.append(
-            f'<button type="button" class="{cls}" onclick="select(\'{_esc(m["id"])}\')"{cur}>'
+            f'<button type="button" class="{cls}" data-select="{_esc(m["id"])}"{cur}>'
             f'<span class="reg-top"><span class="reg-idx">{n}</span>'
             f'<span class="reg-sid">{_esc(m["id"])}</span></span>'
             f'<div class="reg-tgt">{_esc(m.get("target"))}</div>'
@@ -453,9 +482,9 @@ def _render_dossier(payload):
                 f'<td><div class="mpath">{_esc(p)}</div>{cause}</td>'
                 f'<td class="hash">{hb}<span class="to">&rarr;</span>{ha}</td></tr>')
         h.append('<table class="manifest"><thead><tr>'
-                 '<th style="width:130px">Disposition</th>'
+                 '<th class="c-kind">Disposition</th>'
                  '<th>Path &amp; attribution</th>'
-                 '<th style="width:210px">Integrity</th></tr></thead><tbody>'
+                 '<th class="c-integrity">Integrity</th></tr></thead><tbody>'
                  + "".join(rows) + '</tbody></table>')
     else:
         h.append('<div class="empty">Nothing was written. The tree is as it was.</div>')
@@ -469,8 +498,8 @@ def _render_dossier(payload):
             '<p class="disp-note">Committing replays this manifest onto the real tree, '
             'after verifying it has not drifted since the snapshot. Voiding discards the '
             'overlay and leaves the target byte-identical.</p><div class="acts">'
-            f'<button class="btn btn-commit" onclick="commit(\'{_esc(m["id"])}\')">Commit</button>'
-            f'<button class="btn btn-void" onclick="rollback(\'{_esc(m["id"])}\')">Void</button>'
+            f'<button class="btn btn-commit" data-commit="{_esc(m["id"])}">Commit</button>'
+            f'<button class="btn btn-void" data-void="{_esc(m["id"])}">Void</button>'
             '<label class="opt"><input type="checkbox" id="merge"> merge</label>'
             '<label class="opt"><input type="checkbox" id="force"> force</label></div>'
             '<div id="conflicts"></div></div></section>')
@@ -514,7 +543,7 @@ def _session_payload(sid):
     return {"meta": meta, "changes": changes, "provenance": provenance}
 
 
-def _build_page(status, register_html, dossier_html, policy_text, sel):
+def _build_page(status, register_html, dossier_html, policy_text, sel, nonce):
     """Token substitution, not str.format — the CSS and JS are full of braces."""
     page = SHELL
     for token, value in (("__CSS__", CSS),
@@ -522,7 +551,8 @@ def _build_page(status, register_html, dossier_html, policy_text, sel):
                          ("__REGISTER__", register_html),
                          ("__DOSSIER__", dossier_html),
                          ("__POLICY__", policy_text),
-                         ("__SEL__", sel)):
+                         ("__SEL__", sel),
+                         ("__NONCE__", nonce)):
         page = page.replace(token, value)
     return page
 
@@ -531,11 +561,61 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, obj, code=200, raw=None, ctype="application/json"):
+    # --- browser-facing hardening -------------------------------------
+    #
+    # This server binds loopback and has no auth, which is not the same as
+    # being unreachable: any page the user happens to be visiting can send it
+    # a cross-origin request, and a simple request needs no CORS preflight to
+    # arrive. Without the checks below, a drive-by page could POST a commit
+    # and apply an agent's pending changes to the real tree — the one thing
+    # the whole design exists to keep under human control. So:
+    #   * Host must be loopback, which is what stops DNS rebinding turning
+    #     an attacker's domain into a same-origin path to this port;
+    #   * a cross-origin state-changing request is refused outright.
+
+    def _own_origins(self):
+        port = self.server.server_address[1]
+        return {f"http://127.0.0.1:{port}", f"http://localhost:{port}",
+                f"http://[::1]:{port}"}
+
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").strip()
+        port = self.server.server_address[1]
+        return host in {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+
+    def _origin_ok(self):
+        """State-changing requests must not come from another origin."""
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != "null" and origin not in self._own_origins():
+            return False
+        site = self.headers.get("Sec-Fetch-Site")
+        return site in (None, "same-origin", "none")
+
+    def _guard(self, state_changing):
+        if not self._host_ok():
+            self._send({"error": "bad host header"}, 421)
+            return False
+        if state_changing and not self._origin_ok():
+            self._send({"error": "cross-origin request refused"}, 403)
+            return False
+        return True
+
+    def _send(self, obj, code=200, raw=None, ctype="application/json", nonce=None):
         body = raw if raw is not None else json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        if nonce:
+            # Nothing loads off-origin; the two inline blocks carry the nonce,
+            # so injected markup cannot execute even if escaping were wrong.
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; "
+                             f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+                             "img-src data:; connect-src 'self'; "
+                             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -552,13 +632,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if not self._guard(state_changing=False):
+                return
             parsed = urlparse(self.path)
             path, query = parsed.path, parse_qs(parsed.query)
             if path == "/api/view":
                 self._send(self._views((query.get("sel") or [None])[0] or None))
                 return
             if path.startswith("/api/view/session/"):
-                sid = path.rsplit("/", 1)[-1]
+                sid = _sid(path.rsplit("/", 1)[-1])
                 self._send({"dossier": '<div class="sheet">'
                             + _render_dossier(_session_payload(sid)) + "</div>"})
                 return
@@ -571,6 +653,7 @@ class Handler(BaseHTTPRequestHandler):
                     with open(core.POLICY_FILE) as f:
                         policy_text = f.read()
                 views = self._views(sel)
+                nonce = secrets.token_urlsafe(16)
                 page = _build_page(
                     status=views["status"],
                     register_html=views["register"],
@@ -578,8 +661,10 @@ class Handler(BaseHTTPRequestHandler):
                         _session_payload(sel) if sel else None),
                     policy_text=_esc(policy_text),
                     sel=json.dumps(sel),
+                    nonce=nonce,
                 )
-                self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8")
+                self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8",
+                           nonce=nonce)
             elif self.path == "/api/sessions":
                 metas = [core.load_meta(s) for s in core.list_sessions()]
                 self._send({"backend": core.detect_backend() or "none",
@@ -591,7 +676,7 @@ class Handler(BaseHTTPRequestHandler):
                         text = f.read()
                 self._send({"text": text})
             elif self.path.startswith("/api/session/"):
-                self._send(_session_payload(self.path.rsplit("/", 1)[-1]))
+                self._send(_session_payload(_sid(parsed.path.rsplit("/", 1)[-1])))
             else:
                 self._send({"error": "not found"}, 404)
         except SystemExit as e:
@@ -601,9 +686,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if not self._guard(state_changing=True):
+                return
             parts = self.path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "session"]:
-                sid, action = parts[2], parts[3]
+                sid, action = _sid(parts[2]), parts[3]
                 req = self._body()
                 if action == "commit":
                     result = core.commit_session(
@@ -624,6 +711,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         try:
+            if not self._guard(state_changing=True):
+                return
             if self.path == "/api/policy":
                 n = int(self.headers.get("Content-Length") or 0)
                 text = self.rfile.read(n).decode()

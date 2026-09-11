@@ -154,7 +154,7 @@ bash test/smoke.sh                # 19 core transactional assertions
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
 python3 test/daemon_sdk_test.py   # 15 daemon + SDK + policy + live-session assertions
 python3 test/agent_test.py        # 9 agent loop, tool, and provenance assertions
-python3 test/ui_test.py           # 5 mission-control API assertions
+python3 test/ui_test.py           # 9 mission-control API + origin-guard assertions
 python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)
 ```
 

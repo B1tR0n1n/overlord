@@ -95,6 +95,73 @@ try:
             fail(f"wrong invalid-policy status: {e.code}")
     ok("policy editor + validation")
 
+    # --- a cross-origin page must not be able to apply an agent's changes ---
+    run2 = subprocess.run(
+        [sys.executable, os.path.join(HERE, "overlord.py"), "run", "-t", target,
+         "--", "bash", "-c", "echo v3 > f.txt"],
+        env=env, capture_output=True, text=True)
+    sid2 = next((w for w in run2.stdout.split() if w.startswith("2")), None) or fail("no session")
+
+    def raw(path, data=None, method=None, headers=None):
+        r = urllib.request.Request(BASE + path, data=data.encode() if data else None,
+                                   method=method, headers=headers or {})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.read().decode()
+
+    for hdrs in ({"Origin": "https://evil.example"},
+                 {"Origin": "http://127.0.0.1:1"},
+                 {"Sec-Fetch-Site": "cross-site"}):
+        try:
+            raw(f"/api/session/{sid2}/commit", data="{}", method="POST", headers=hdrs)
+            fail(f"cross-origin commit accepted with {hdrs}")
+        except urllib.error.HTTPError as e:
+            if e.code != 403:
+                fail(f"cross-origin commit: expected 403, got {e.code} for {hdrs}")
+    if open(os.path.join(target, "f.txt")).read() != "v2\n":
+        fail("a cross-origin request changed the target")
+
+    try:
+        raw("/api/policy", data='{"default": {}}', method="PUT",
+            headers={"Origin": "https://evil.example"})
+        fail("cross-origin policy write accepted")
+    except urllib.error.HTTPError as e:
+        if e.code != 403:
+            fail(f"cross-origin policy write: expected 403, got {e.code}")
+    ok("cross-origin state changes refused")
+
+    # --- DNS rebinding: a non-loopback Host must not be served ---
+    try:
+        raw("/api/sessions", headers={"Host": "attacker.example"})
+        fail("non-loopback Host served")
+    except urllib.error.HTTPError as e:
+        if e.code != 421:
+            fail(f"rebinding guard: expected 421, got {e.code}")
+    ok("non-loopback Host refused")
+
+    # --- session ids are validated before they reach the filesystem ---
+    for probe in ("..", "....//", "%2e%2e", "not-a-sid"):
+        try:
+            req(f"/api/session/{probe}")
+            fail(f"malformed session id accepted: {probe!r}")
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                fail(f"session id {probe!r}: expected 400, got {e.code}")
+    ok("malformed session ids rejected")
+
+    # --- the same-origin path still works, and the page carries a CSP ---
+    with urllib.request.urlopen(urllib.request.Request(
+            BASE + "/", headers={"Origin": BASE}), timeout=10) as resp:
+        csp = resp.headers.get("Content-Security-Policy") or ""
+        if "script-src 'nonce-" not in csp or "default-src 'none'" not in csp:
+            fail(f"page missing a nonce-based CSP: {csp!r}")
+        if resp.headers.get("X-Content-Type-Options") != "nosniff":
+            fail("page missing nosniff")
+    res = json.loads(raw(f"/api/session/{sid2}/rollback", data="{}", method="POST",
+                         headers={"Origin": BASE}))
+    if not res.get("target"):
+        fail(f"same-origin rollback broke: {res}")
+    ok("same-origin requests still work; CSP + nosniff present")
+
     print("PASS: mission control")
 finally:
     server.terminate()

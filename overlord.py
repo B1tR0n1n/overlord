@@ -54,6 +54,29 @@ LOCKS_DIR = os.path.join(OVERLORD_HOME, "locks")
 EBPF_SCRIPT = "/usr/local/lib/overlord/provenance.bt"
 TIMEOUT_RC = 124
 
+# session record file names
+META_FILE = "meta.json"
+MANIFEST_FILE = "manifest.json"
+PROVENANCE_FILE = "provenance.jsonl"
+SYSCALLS_FILE = "syscalls.jsonl"
+RAW_TRACE_FILE = "raw.strace"
+OUTPUT_FILE = "output.log"
+TS_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+
+# session ids are minted by new_session_id(); anything else is rejected before
+# it can be joined onto a path (ids arrive from argv, the daemon socket, the UI)
+_SESSION_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
+class OverlordError(Exception):
+    """A user-facing failure. The CLI prints it and exits 1; the daemon and UI
+    turn it into an error response. Library code raises this, never SystemExit,
+    so embedding callers keep control of the process."""
+
+
+def _now():
+    return time.strftime(TS_FORMAT)
+
 # ---------------------------------------------------------------- backends
 
 
@@ -78,7 +101,7 @@ def detect_backend():
 
 def _check_mount_path(path, name):
     if ":" in path or "," in path:
-        raise SystemExit(
+        raise OverlordError(
             f"error: {name} path contains ':' or ',' — unsupported in overlay mount options: {path}"
         )
 
@@ -137,7 +160,10 @@ def prepare_kernel(target, sdir, cmd, grants):
     if grants.get("net") == "none":
         argv.append("--net")
     if grants.get("jail"):
-        argv += ["--pid", "--fork"]
+        # private pid, uts and ipc namespaces: a jailed process must not see
+        # host processes, nor reach host-wide kernel state such as the
+        # hostname (red team finding A4 when overlord itself runs as root)
+        argv += ["--pid", "--fork", "--uts", "--ipc"]
         os.makedirs(os.path.join(sdir, "jail"), exist_ok=True)
         inner = _jail_script(target, opts, sdir, cmd,
                              bind_trace=grants.get("_bind_trace", False))
@@ -153,7 +179,7 @@ def prepare_fuse(target, sdir, cmd, grants):
     """Returns (argv, cwd, cleanup) for the fuse backend."""
     for grant in ("jail", "net"):
         if grants.get(grant) and grants[grant] != "host":
-            raise SystemExit(
+            raise OverlordError(
                 f"error: --{grant} requires the kernel backend "
                 "(install packaging/apparmor profile)"
             )
@@ -166,7 +192,7 @@ def prepare_fuse(target, sdir, cmd, grants):
         ["fuse-overlayfs", "-o", opts, merged], capture_output=True, text=True
     )
     if mnt.returncode != 0:
-        raise SystemExit(f"error: fuse-overlayfs mount failed: {mnt.stderr.strip()}")
+        raise OverlordError(f"error: fuse-overlayfs mount failed: {mnt.stderr.strip()}")
 
     def cleanup():
         subprocess.run(["fusermount3", "-u", merged], capture_output=True)
@@ -183,20 +209,46 @@ def new_session_id():
     return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 
+def validate_session_id(sid):
+    """Return sid if it has the minted shape; otherwise refuse. This is the one
+    gate between externally supplied ids and the filesystem, so the message
+    deliberately does not echo the rejected value."""
+    if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+        raise OverlordError("error: invalid session id")
+    return sid
+
+
 def session_path(sid):
-    return os.path.join(SESSIONS_DIR, sid)
+    return os.path.join(SESSIONS_DIR, validate_session_id(sid))
+
+
+def session_file(sid, name):
+    """Path of a record file (meta, manifest, ...) inside a validated session."""
+    return os.path.join(session_path(sid), name)
+
+
+def _safe_join(base, rel):
+    """Join rel onto base, refusing any result that escapes base. Relative
+    paths here come from walking an overlay upper layer that an untrusted
+    process wrote to, so a crafted name must never resolve outside the tree
+    it is being replayed into."""
+    base = os.path.abspath(base)
+    path = os.path.normpath(os.path.join(base, rel))
+    if path != base and not path.startswith(base + os.sep):
+        raise OverlordError(f"error: path escapes its tree: {rel}")
+    return path
 
 
 def load_meta(sid):
-    path = os.path.join(session_path(sid), "meta.json")
+    path = session_file(sid, META_FILE)
     if not os.path.isfile(path):
-        raise SystemExit(f"error: no such session: {sid}")
+        raise OverlordError(f"error: no such session: {sid}")
     with open(path) as f:
         return json.load(f)
 
 
 def save_meta(sid, meta):
-    with open(os.path.join(session_path(sid), "meta.json"), "w") as f:
+    with open(session_file(sid, META_FILE), "w") as f:
         json.dump(meta, f, indent=2)
 
 
@@ -205,7 +257,8 @@ def list_sessions():
         return []
     return sorted(
         d for d in os.listdir(SESSIONS_DIR)
-        if os.path.isfile(os.path.join(SESSIONS_DIR, d, "meta.json"))
+        if _SESSION_ID_RE.match(d)
+        and os.path.isfile(os.path.join(SESSIONS_DIR, d, META_FILE))
     )
 
 
@@ -226,7 +279,7 @@ def acquire_target_lock(target, wait):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
     except BlockingIOError:
-        raise SystemExit(
+        raise OverlordError(
             f"error: another session is executing against {target} (use --wait to queue)"
         )
     return fd
@@ -296,25 +349,34 @@ def compute_diff(upper, target):
     """
     changes = []
     for root, dirs, files in os.walk(upper):
-        for d in list(dirs):
+        opaque = []
+        for d in dirs:
             dpath = os.path.join(root, d)
             rel = os.path.relpath(dpath, upper)
             if is_opaque_dir(dpath):
                 changes.append(("replaced-dir", rel))
-                dirs.remove(d)
-            elif not os.path.isdir(os.path.join(target, rel)):
+                opaque.append(d)
+            elif not os.path.isdir(_safe_join(target, rel)):
                 changes.append(("added", rel + "/"))
+        dirs[:] = [d for d in dirs if d not in opaque]  # don't descend replaced dirs
         for name in files:
             fpath = os.path.join(root, name)
             rel = os.path.relpath(fpath, upper)
             if is_whiteout(fpath):
-                victim = os.path.relpath(whiteout_victim(fpath), upper)
-                changes.append(("deleted", victim))
-            elif os.path.lexists(os.path.join(target, rel)):
+                changes.append(("deleted", _victim_rel(fpath, upper)))
+            elif os.path.lexists(_safe_join(target, rel)):
                 changes.append(("modified", rel))
             else:
                 changes.append(("added", rel))
     return sorted(changes, key=lambda c: c[1])
+
+
+def _victim_rel(whiteout_path, upper):
+    """Relative path a whiteout entry deletes, proven to stay inside the tree
+    (a file literally named '.wh...' would otherwise name the parent dir)."""
+    victim = os.path.relpath(whiteout_victim(whiteout_path), upper)
+    _safe_join(upper, victim)
+    return victim
 
 
 # ---------------------------------------------------------------- conflicts
@@ -324,27 +386,46 @@ def find_conflicts(changes, manifest, target):
     """Paths where the real tree drifted after the snapshot. List of (reason, rel)."""
     conflicts = []
     for kind, rel in changes:
-        tpath = os.path.join(target, rel.rstrip("/"))
         if kind == "added":
-            if rel.endswith("/"):
-                continue  # mkdir -p semantics: pre-existing dir is benign
-            if rel in manifest or os.path.lexists(tpath):
-                conflicts.append(("created-externally", rel))
+            conflicts.extend(_added_conflicts(rel, manifest, target))
         elif kind in ("modified", "deleted"):
-            if rel not in manifest:
-                conflicts.append(("appeared-after-snapshot", rel))
-            elif not os.path.lexists(tpath):
-                conflicts.append(("deleted-externally", rel))
-            elif _fingerprint(tpath) != manifest[rel]:
-                conflicts.append(("modified-externally", rel))
+            conflicts.extend(_touched_conflicts(rel, manifest, target))
         elif kind == "replaced-dir":
-            prefix = rel + os.sep
-            for mrel, fp in manifest.items():
-                if mrel.startswith(prefix):
-                    mpath = os.path.join(target, mrel)
-                    if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
-                        conflicts.append(("modified-externally", mrel))
+            conflicts.extend(_replaced_dir_conflicts(rel, manifest, target))
     return conflicts
+
+
+def _added_conflicts(rel, manifest, target):
+    if rel.endswith("/"):
+        return []  # mkdir -p semantics: pre-existing dir is benign
+    if rel in manifest or os.path.lexists(_safe_join(target, rel)):
+        return [("created-externally", rel)]
+    return []
+
+
+def _touched_conflicts(rel, manifest, target):
+    """A file the session modified or deleted must still be as snapshotted."""
+    if rel not in manifest:
+        return [("appeared-after-snapshot", rel)]
+    tpath = _safe_join(target, rel)
+    if not os.path.lexists(tpath):
+        return [("deleted-externally", rel)]
+    if _fingerprint(tpath) != manifest[rel]:
+        return [("modified-externally", rel)]
+    return []
+
+
+def _replaced_dir_conflicts(rel, manifest, target):
+    """Every snapshotted file under a wholesale-replaced dir must be intact."""
+    prefix = rel + os.sep
+    found = []
+    for mrel, fp in manifest.items():
+        if not mrel.startswith(prefix):
+            continue
+        mpath = _safe_join(target, mrel)
+        if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
+            found.append(("modified-externally", mrel))
+    return found
 
 
 def try_merge(conflicts, sdir, target):
@@ -354,22 +435,24 @@ def try_merge(conflicts, sdir, target):
     base_dir = os.path.join(sdir, "base")
     upper = os.path.join(sdir, "upper")
     if not os.path.isdir(base_dir):
-        raise SystemExit(
+        raise OverlordError(
             "error: --merge needs a base copy — session was not run with --merge-base"
         )
     resolved, unresolved = [], []
     for reason, rel in conflicts:
-        ours = os.path.join(upper, rel)       # session's version
-        base = os.path.join(base_dir, rel)    # common ancestor
-        theirs = os.path.join(target, rel)    # external version
+        ours = _safe_join(upper, rel)       # session's version
+        base = _safe_join(base_dir, rel)    # common ancestor
+        theirs = _safe_join(target, rel)    # external version
         if reason != "modified-externally" or not all(
             os.path.isfile(p) and not os.path.islink(p) for p in (ours, base, theirs)
         ):
             unresolved.append((reason, rel))
             continue
+        # all three operands are validated regular files inside their trees;
+        # git receives them as positional args after "--", never as options
         r = subprocess.run(
             ["git", "merge-file", "-p", "-L", "session", "-L", "base", "-L",
-             "external", ours, base, theirs],
+             "external", "--", ours, base, theirs],
             capture_output=True,
         )
         if r.returncode == 0:
@@ -399,17 +482,17 @@ def _sha256(path):
 
 def build_provenance(changes, upper, target):
     """Transaction-level flight record: hashes before (lower) and after (upper)."""
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    ts = _now()
     records = []
     for kind, rel in changes:
         rec = {"ts": ts, "kind": kind, "path": rel}
         clean = rel.rstrip("/")
         if kind in ("modified", "deleted"):
-            tpath = os.path.join(target, clean)
+            tpath = _safe_join(target, clean)
             if os.path.lexists(tpath):
                 rec["before_sha256"] = _sha256(tpath)
         if kind in ("added", "modified") and not rel.endswith("/"):
-            upath = os.path.join(upper, clean)
+            upath = _safe_join(upper, clean)
             rec["after_sha256"] = _sha256(upath)
             rec["after_size"] = os.lstat(upath).st_size
         records.append(rec)
@@ -455,11 +538,11 @@ def start_ebpf(pid, sdir):
         os.path.dirname(os.path.realpath(__file__)), "packaging", "ebpf", "provenance.bt"
     )
     if not os.path.isfile(script):
-        raise SystemExit("error: ebpf recorder script not found")
+        raise OverlordError("error: ebpf recorder script not found")
     argv = ["bpftrace", "-o", os.path.join(sdir, "ebpf.log"), script, str(pid)]
     if os.geteuid() != 0:
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
-            raise SystemExit(
+            raise OverlordError(
                 "error: --trace ebpf needs root (or passwordless sudo for bpftrace)"
             )
         argv = ["sudo", "-n"] + argv
@@ -512,27 +595,26 @@ def apply_upper(upper, target):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
     for root, dirs, files in os.walk(upper):
-        for d in list(dirs):
+        opaque = []
+        for d in dirs:
             dpath = os.path.join(root, d)
-            rel = os.path.relpath(dpath, upper)
-            tpath = os.path.join(target, rel)
+            tpath = _safe_join(target, os.path.relpath(dpath, upper))
             if is_opaque_dir(dpath):
                 _remove_target(tpath)
                 shutil.copytree(dpath, tpath, symlinks=True)
-                dirs.remove(d)
+                opaque.append(d)
                 applied += 1
             elif not os.path.isdir(tpath):
                 _remove_target(tpath)
                 os.makedirs(tpath, exist_ok=True)
                 applied += 1
+        dirs[:] = [d for d in dirs if d not in opaque]  # copied whole above
         for name in files:
             fpath = os.path.join(root, name)
-            rel = os.path.relpath(fpath, upper)
             if is_whiteout(fpath):
-                victim = os.path.relpath(whiteout_victim(fpath), upper)
-                _remove_target(os.path.join(target, victim))
+                _remove_target(_safe_join(target, _victim_rel(fpath, upper)))
             else:
-                _copy_entry(fpath, os.path.join(target, rel))
+                _copy_entry(fpath, _safe_join(target, os.path.relpath(fpath, upper)))
             applied += 1
     return applied
 
@@ -549,7 +631,7 @@ def load_grants(args):
             declared = json.load(f)
         unknown = set(declared) - set(grants)
         if unknown:
-            raise SystemExit(f"error: unknown manifest keys: {', '.join(sorted(unknown))}")
+            raise OverlordError(f"error: unknown manifest keys: {', '.join(sorted(unknown))}")
         grants.update(declared)
     if getattr(args, "net", None):
         grants["net"] = args.net
@@ -567,17 +649,17 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
     """Core transactional run. Returns (sid, exit_code, changes)."""
     target = os.path.realpath(target)
     if not os.path.isdir(target):
-        raise SystemExit(f"error: target is not a directory: {target}")
+        raise OverlordError(f"error: target is not a directory: {target}")
     backend = backend or detect_backend()
     if backend is None:
-        raise SystemExit(
+        raise OverlordError(
             "error: no overlay backend available.\n"
             "  kernel: userns capability grants restricted (install packaging/)\n"
             "  fuse:   install fuse-overlayfs (sudo apt install fuse-overlayfs)"
         )
     pending = pending_sessions_for(target)
     if pending and not stack:
-        raise SystemExit(
+        raise OverlordError(
             f"error: {len(pending)} pending session(s) already exist for {target}: "
             f"{', '.join(pending)}\ncommit or roll back first, or pass --stack"
         )
@@ -589,7 +671,7 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
         os.makedirs(os.path.join(sdir, d))
 
     manifest = snapshot_manifest(target)
-    with open(os.path.join(sdir, "manifest.json"), "w") as f:
+    with open(os.path.join(sdir, MANIFEST_FILE), "w") as f:
         json.dump(manifest, f)
     if grants.get("merge_base"):
         subprocess.run(
@@ -598,38 +680,63 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
         )
 
     grants = dict(grants)
-    raw_trace = os.path.join(sdir, "raw.strace")
+    raw_trace = None
     if trace == "strace":
-        if not shutil.which("strace"):
-            raise SystemExit("error: --trace requires strace (sudo apt install strace)")
-        if grants.get("jail"):
-            # red team finding A3: never expose session records to the jail —
-            # strace gets an isolated trace/ subdir bound at /.overlord
-            grants["_bind_trace"] = True
-            os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
-            raw_trace = os.path.join(sdir, "trace", "raw.strace")
-            strace_out = "/.overlord/raw.strace"
-        else:
-            strace_out = raw_trace
-        cmd = ["strace", "-f", "-qq", "-ttt", "-e",
-               "trace=%file,%process,%network", "-o", strace_out] + cmd
+        cmd, raw_trace = _wrap_strace(cmd, sdir, grants)
 
     meta = {
         "id": sid, "target": target, "cmd": cmd, "backend": backend,
         "grants": {k: v for k, v in grants.items() if not k.startswith("_")},
         "trace": trace,
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "running",
+        "started": _now(), "status": "running",
     }
     save_meta(sid, meta)
 
+    try:
+        rc, timed_out = _run_wrapped(backend, target, sdir, cmd, grants, trace, capture)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    if timed_out:
+        meta["timed_out"] = True
+
+    changes = _record_session(sdir, target, raw_trace)
+    meta.update(exit_code=rc, status="pending", finished=_now())
+    save_meta(sid, meta)
+    return sid, rc, changes
+
+
+def _wrap_strace(cmd, sdir, grants):
+    """Prefix cmd with strace. Returns (cmd, path where the raw log lands)."""
+    if not shutil.which("strace"):
+        raise OverlordError("error: --trace requires strace (sudo apt install strace)")
+    raw_trace = os.path.join(sdir, RAW_TRACE_FILE)
+    if grants.get("jail"):
+        # red team finding A3: never expose session records to the jail —
+        # strace gets an isolated trace/ subdir bound at /.overlord
+        grants["_bind_trace"] = True
+        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
+        raw_trace = os.path.join(sdir, "trace", RAW_TRACE_FILE)
+        strace_out = "/.overlord/" + RAW_TRACE_FILE
+    else:
+        strace_out = raw_trace
+    cmd = ["strace", "-f", "-qq", "-ttt", "-e",
+           "trace=%file,%process,%network", "-o", strace_out] + cmd
+    return cmd, raw_trace
+
+
+def _run_wrapped(backend, target, sdir, cmd, grants, trace, capture):
+    """Launch the command inside the backend's overlay and wait for it.
+    Returns (exit_code, timed_out). Always releases backend resources."""
     argv, cwd, cleanup = PREPARE[backend](target, sdir, cmd, grants)
     ebpf = None
     outfile = None
     popen_kw = {}
     if capture:
-        outfile = open(os.path.join(sdir, "output.log"), "wb")
+        outfile = open(os.path.join(sdir, OUTPUT_FILE), "wb")
         popen_kw = {"stdout": outfile, "stderr": subprocess.STDOUT,
                     "stdin": subprocess.DEVNULL}
+    timed_out = False
     try:
         proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, **popen_kw)
         if trace == "ebpf":
@@ -639,8 +746,7 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, 9)
             proc.wait()
-            rc = TIMEOUT_RC
-            meta["timed_out"] = True
+            rc, timed_out = TIMEOUT_RC, True
     finally:
         if cleanup:
             cleanup()
@@ -648,23 +754,21 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
             ebpf.terminate()
         if outfile:
             outfile.close()
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
+    return rc, timed_out
 
+
+def _record_session(sdir, target, raw_trace):
+    """Write the flight record (provenance + parsed syscalls). Returns changes."""
     upper = os.path.join(sdir, "upper")
     changes = compute_diff(upper, target)
-    with open(os.path.join(sdir, "provenance.jsonl"), "w") as f:
+    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
         for rec in build_provenance(changes, upper, target):
             f.write(json.dumps(rec) + "\n")
-    if trace == "strace" and os.path.isfile(raw_trace):
-        with open(os.path.join(sdir, "syscalls.jsonl"), "w") as f:
+    if raw_trace and os.path.isfile(raw_trace):
+        with open(os.path.join(sdir, SYSCALLS_FILE), "w") as f:
             for ev in parse_strace(raw_trace):
                 f.write(json.dumps(ev) + "\n")
-
-    meta.update(exit_code=rc, status="pending",
-                finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
-    save_meta(sid, meta)
-    return sid, rc, changes
+    return changes
 
 
 # ---------------------------------------------------------------- commands
@@ -704,29 +808,32 @@ def cmd_shell(args):
     return rc
 
 
+def _session_row(sid, m):
+    g = m.get("grants", {})
+    tags = "".join(
+        f" [{t}]" for t, on in
+        (("jail", g.get("jail")), ("net:none", g.get("net") == "none"),
+         ("timed-out", m.get("timed_out"))) if on
+    )
+    return (f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
+            f"{m.get('target', '')}  :: {shlex.join(m.get('cmd', []))}")
+
+
 def cmd_sessions(args):
     rows = list_sessions()
-    if not rows:
+    if rows:
+        for sid in rows:
+            print(_session_row(sid, load_meta(sid)))
+    else:
         print("no sessions")
-        return 0
-    for sid in rows:
-        m = load_meta(sid)
-        g = m.get("grants", {})
-        tags = "".join(
-            f" [{t}]" for t, on in
-            (("jail", g.get("jail")), ("net:none", g.get("net") == "none"),
-             ("timed-out", m.get("timed_out"))) if on
-        )
-        print(f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
-              f"{m.get('target', '')}  :: {shlex.join(m.get('cmd', []))}")
     return 0
 
 
 def cmd_diff(args):
     m = load_meta(args.session)
-    upper = os.path.join(session_path(args.session), "upper")
+    upper = session_file(args.session, "upper")
     if not os.path.isdir(upper):
-        raise SystemExit(f"error: session is {m.get('status')}; layers discarded")
+        raise OverlordError(f"error: session is {m.get('status')}; layers discarded")
     changes = compute_diff(upper, m["target"])
     for kind, rel in changes:
         print(f"{kind:12s} {rel}")
@@ -736,20 +843,19 @@ def cmd_diff(args):
 
 
 def cmd_log(args):
-    sdir = session_path(args.session)
     load_meta(args.session)
-    prov = os.path.join(sdir, "provenance.jsonl")
-    if not os.path.isfile(prov):
+    prov = session_file(args.session, PROVENANCE_FILE)
+    if os.path.isfile(prov):
+        with open(prov) as f:
+            for line in f:
+                rec = json.loads(line)
+                before = (rec.get("before_sha256") or "-")[:12]
+                after = (rec.get("after_sha256") or "-")[:12]
+                print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
+    else:
         print("no provenance recorded")
-        return 0
-    with open(prov) as f:
-        for line in f:
-            rec = json.loads(line)
-            before = (rec.get("before_sha256") or "-")[:12]
-            after = (rec.get("after_sha256") or "-")[:12]
-            print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
-    for name, label in (("syscalls.jsonl", "syscall trace"), ("ebpf.log", "ebpf trace")):
-        p = os.path.join(sdir, name)
+    for name, label in ((SYSCALLS_FILE, "syscall trace"), ("ebpf.log", "ebpf trace")):
+        p = session_file(args.session, name)
         if os.path.isfile(p):
             with open(p, errors="replace") as f:
                 n = sum(1 for _ in f)
@@ -761,10 +867,10 @@ def commit_session(sid, merge=False, force=False):
     """Core commit. Returns a result dict; never prints."""
     m = load_meta(sid)
     if m.get("status") != "pending":
-        raise SystemExit(f"error: session is {m.get('status')}, not pending")
+        raise OverlordError(f"error: session is {m.get('status')}, not pending")
     sdir = session_path(sid)
     upper = os.path.join(sdir, "upper")
-    with open(os.path.join(sdir, "manifest.json")) as f:
+    with open(os.path.join(sdir, MANIFEST_FILE)) as f:
         manifest = json.load(f)
     changes = compute_diff(upper, m["target"])
     conflicts = find_conflicts(changes, manifest, m["target"])
@@ -775,10 +881,10 @@ def commit_session(sid, merge=False, force=False):
         return {"committed": False, "conflicts": conflicts, "merged": merged,
                 "target": m["target"]}
     n = apply_upper(upper, m["target"])
-    m.update(status="committed", committed=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    m.update(status="committed", committed=_now(),
              forced=bool(conflicts), merged_paths=merged)
     save_meta(sid, m)
-    for sub in ("upper", "work", "merged", "base", "jail", "trace", "manifest.json", "raw.strace"):
+    for sub in ("upper", "work", "merged", "base", "jail", "trace", MANIFEST_FILE, RAW_TRACE_FILE):
         try:
             _force_rmtree(os.path.join(sdir, sub))
         except OSError:
@@ -790,7 +896,7 @@ def rollback_session(sid):
     """Core rollback. Returns the untouched target path."""
     m = load_meta(sid)
     if m.get("status") == "committed":
-        raise SystemExit("error: session already committed; nothing to roll back")
+        raise OverlordError("error: session already committed; nothing to roll back")
     _force_rmtree(session_path(sid))
     return m["target"]
 
@@ -887,7 +993,7 @@ def resolve_policy(target, requested):
         return dict(requested), None
     rule = _policy_rule(policy, target)
     if rule is None:
-        raise SystemExit(f"error: policy refuses target: {target}")
+        raise OverlordError(f"error: policy refuses target: {target}")
     eff = dict(requested)
     if rule.get("jail"):
         eff["jail"] = True
@@ -909,7 +1015,7 @@ def _api_run(req):
         trace=req.get("trace"), wait=bool(req.get("wait")),
         stack=bool(req.get("stack")), capture=True,
     )
-    out_path = os.path.join(session_path(sid), "output.log")
+    out_path = session_file(sid, OUTPUT_FILE)
     tail = ""
     if os.path.isfile(out_path):
         with open(out_path, errors="replace") as f:
@@ -924,14 +1030,14 @@ def _api_commit(req):
     if policy is not None and req.get("force"):
         rule = _policy_rule(policy, m["target"]) or {}
         if not rule.get("allow_force", False):
-            raise SystemExit("error: policy forbids --force commits on this target")
+            raise OverlordError("error: policy forbids --force commits on this target")
     return commit_session(req["sid"], merge=bool(req.get("merge")),
                           force=bool(req.get("force")))
 
 
 def _api_log(req):
-    prov = os.path.join(session_path(req["sid"]), "provenance.jsonl")
     load_meta(req["sid"])
+    prov = session_file(req["sid"], PROVENANCE_FILE)
     records = []
     if os.path.isfile(prov):
         with open(prov) as f:
@@ -943,7 +1049,7 @@ DAEMON_OPS = {
     "ping": lambda req: {"version": VERSION, "pid": os.getpid()},
     "run": _api_run,
     "diff": lambda req: {"changes": compute_diff(
-        os.path.join(session_path(req["sid"]), "upper"), load_meta(req["sid"])["target"])},
+        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"])},
     "log": _api_log,
     "commit": _api_commit,
     "rollback": lambda req: {"target": rollback_session(req["sid"])},
@@ -968,7 +1074,7 @@ def cmd_daemon(args):
                     if op not in DAEMON_OPS:
                         raise ValueError(f"unknown op: {op}")
                     resp = {"ok": True, **DAEMON_OPS[op](req)}
-                except SystemExit as e:
+                except OverlordError as e:
                     resp = {"ok": False, "error": str(e)}
                 except Exception as e:  # daemon must survive any request
                     resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -1063,7 +1169,11 @@ def main(argv=None):
         if not args.cmd:
             p.error("run requires a command after --")
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except OverlordError as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

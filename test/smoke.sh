@@ -27,19 +27,31 @@ reset_target() {
     echo original > "$TARGET/sub/nested.txt"
 }
 
-fail() { echo "FAIL: $1" >&2; exit 1; }
-pass() { echo "  ok: $1"; }
-sid_of() { grep -oP 'session \K\S+' <<< "$1" | head -1; }
+fail() {
+    local msg="$1"
+    echo "FAIL: $msg" >&2
+    exit 1
+}
+pass() {
+    local msg="$1"
+    echo "  ok: $msg"
+    return 0
+}
+sid_of() {
+    local out="$1"
+    grep -oP 'session \K\S+' <<< "$out" | head -1
+    return 0
+}
 
 reset_target
 
 # --- 1. transactional run: mutations must NOT hit the target
 OUT=$($OVERLORD run -t "$TARGET" -- bash -c \
   'echo changed > edit.txt; rm doomed.txt; echo new > created.txt; echo n2 > sub/also.txt')
-SID=$(sid_of "$OUT"); [ -n "$SID" ] || fail "no session id"
+SID=$(sid_of "$OUT"); [[ -n "$SID" ]] || fail "no session id"
 grep -q original "$TARGET/edit.txt"  || fail "target mutated before commit (edit)"
-[ -f "$TARGET/doomed.txt" ]          || fail "target mutated before commit (delete)"
-[ ! -f "$TARGET/created.txt" ]       || fail "target mutated before commit (create)"
+[[ -f "$TARGET/doomed.txt" ]]          || fail "target mutated before commit (delete)"
+[[ ! -f "$TARGET/created.txt" ]]       || fail "target mutated before commit (create)"
 pass "isolation"
 
 # --- 2. diff completeness
@@ -58,7 +70,7 @@ pass "provenance"
 
 # --- 4. rollback leaves target byte-identical
 $OVERLORD rollback "$SID" > /dev/null
-grep -q original "$TARGET/edit.txt" && [ -f "$TARGET/doomed.txt" ] && [ ! -f "$TARGET/created.txt" ] \
+grep -q original "$TARGET/edit.txt" && [[ -f "$TARGET/doomed.txt" ]] && [[ ! -f "$TARGET/created.txt" ]] \
   || fail "rollback not clean"
 pass "rollback"
 
@@ -67,7 +79,7 @@ OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'echo changed > edit.txt; rm doomed.
 SID=$(sid_of "$OUT")
 $OVERLORD commit "$SID" > /dev/null
 grep -q changed "$TARGET/edit.txt"        || fail "commit missed modify"
-[ ! -f "$TARGET/doomed.txt" ]             || fail "commit missed delete"
+[[ ! -f "$TARGET/doomed.txt" ]]             || fail "commit missed delete"
 grep -q new "$TARGET/created.txt"         || fail "commit missed create"
 grep -q original "$TARGET/keep.txt"       || fail "commit damaged untouched file"
 grep -q original "$TARGET/sub/nested.txt" || fail "commit damaged nested file"
@@ -100,9 +112,9 @@ pass "conflict on create"
 # --- 9. shell (non-interactive stdin drive)
 reset_target
 OUT=$(echo 'echo fromshell > shellfile.txt' | $OVERLORD shell -t "$TARGET" 2>/dev/null) || true
-SID=$(sid_of "$OUT"); [ -n "$SID" ] || fail "shell produced no session"
+SID=$(sid_of "$OUT"); [[ -n "$SID" ]] || fail "shell produced no session"
 $OVERLORD diff "$SID" | grep -q 'added.*shellfile.txt' || fail "shell session missed write"
-[ ! -f "$TARGET/shellfile.txt" ] || fail "shell wrote through to target"
+[[ ! -f "$TARGET/shellfile.txt" ]] || fail "shell wrote through to target"
 $OVERLORD rollback "$SID" > /dev/null
 pass "shell"
 
@@ -111,7 +123,7 @@ if command -v strace > /dev/null; then
     reset_target
     OUT=$($OVERLORD run --trace -t "$TARGET" -- bash -c 'echo traced > t.txt')
     SID=$(sid_of "$OUT")
-    [ -s "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" ] || fail "trace produced no syscall log"
+    [[ -s "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" ]] || fail "trace produced no syscall log"
     grep -q '"write": true' "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" || fail "trace missed write syscalls"
     $OVERLORD rollback "$SID" > /dev/null
     pass "syscall trace"
@@ -124,7 +136,7 @@ if $OVERLORD doctor 2>/dev/null | grep -q 'kernel backend.*: available'; then
     reset_target
     OUT=$($OVERLORD run --backend kernel -t "$TARGET" -- bash -c "echo abs > $TARGET/abs.txt")
     SID=$(sid_of "$OUT")
-    [ ! -f "$TARGET/abs.txt" ] || fail "kernel backend leaked absolute-path write"
+    [[ ! -f "$TARGET/abs.txt" ]] || fail "kernel backend leaked absolute-path write"
     $OVERLORD diff "$SID" | grep -q 'added.*abs.txt' || fail "kernel backend lost absolute-path write"
     $OVERLORD rollback "$SID" > /dev/null
     pass "absolute-path containment (kernel)"
@@ -139,7 +151,7 @@ SID=$(sid_of "$OUT")
 mkdir -p "$OVERLORD_HOME/sessions/$SID/work/work"
 chmod 000 "$OVERLORD_HOME/sessions/$SID/work/work"
 $OVERLORD rollback "$SID" > /dev/null || fail "rollback died on mode-000 work dir"
-[ ! -d "$OVERLORD_HOME/sessions/$SID" ] || fail "session dir survived rollback"
+[[ ! -d "$OVERLORD_HOME/sessions/$SID" ]] || fail "session dir survived rollback"
 pass "mode-000 cleanup"
 
 # --- 13. timeout grant kills the process group
@@ -148,7 +160,7 @@ if OUT=$($OVERLORD run --timeout 1 -t "$TARGET" -- sleep 30 2>/dev/null); then
     fail "timeout did not produce nonzero exit"
 fi
 SID=$($OVERLORD sessions | grep timed-out | tail -1 | cut -d' ' -f1)
-[ -n "$SID" ] || fail "timed-out session not recorded"
+[[ -n "$SID" ]] || fail "timed-out session not recorded"
 $OVERLORD rollback "$SID" > /dev/null
 pass "timeout grant"
 
@@ -237,7 +249,7 @@ if $KERNEL_OK && command -v strace > /dev/null; then
     OUT=$($OVERLORD run --jail --trace -t "$TARGET" -- bash -c \
       'echo t > t.txt; ls /.overlord/manifest.json 2>/dev/null && echo BOOKS || echo SEALED')
     SID=$(sid_of "$OUT")
-    [ -s "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" ] || fail "jail+trace produced no syscall log"
+    [[ -s "$OVERLORD_HOME/sessions/$SID/syscalls.jsonl" ]] || fail "jail+trace produced no syscall log"
     grep -q BOOKS <<< "$OUT" && fail "session records visible in jail+trace mode" || true
     $OVERLORD rollback "$SID" > /dev/null
     pass "jail + trace (records sealed)"

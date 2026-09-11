@@ -235,11 +235,25 @@ def _safe_join(base, rel):
     """Join rel onto base, refusing any result that escapes base. Relative
     paths here come from walking an overlay upper layer that an untrusted
     process wrote to, so a crafted name must never resolve outside the tree
-    it is being replayed into."""
-    base = os.path.abspath(base)
-    path = os.path.normpath(os.path.join(base, rel))
-    if path != base and not path.startswith(base + os.sep):
+    it is being replayed into.
+
+    normpath alone stops lexical `..`, but not a symlink drifted into an
+    existing path component: if the target grew `dir -> /outside` after the
+    snapshot, replaying `dir/file` would write through it. So the deepest
+    component that already exists on disk is resolved with realpath and must
+    still sit inside base. This runs on the write path, so --force cannot
+    bypass it."""
+    base_abs = os.path.abspath(base)
+    path = os.path.normpath(os.path.join(base_abs, rel))
+    if path != base_abs and not path.startswith(base_abs + os.sep):
         raise OverlordError(f"error: path escapes its tree: {rel}")
+    real_base = os.path.realpath(base_abs)
+    probe = path
+    while probe != base_abs and not os.path.lexists(probe):
+        probe = os.path.dirname(probe)
+    real_probe = os.path.realpath(probe)
+    if real_probe != real_base and not real_probe.startswith(real_base + os.sep):
+        raise OverlordError(f"error: path escapes its tree via a symlink: {rel}")
     return path
 
 
@@ -368,7 +382,12 @@ def compute_diff(upper, target):
             fpath = os.path.join(root, name)
             rel = os.path.relpath(fpath, upper)
             if is_whiteout(fpath):
-                changes.append(("deleted", _victim_rel(fpath, upper)))
+                try:
+                    changes.append(("deleted", _victim_rel(fpath, upper)))
+                except OverlordError:
+                    # names its own tree root; recorded so diff/log show it,
+                    # refused by commit_session before anything is replayed
+                    changes.append(("invalid-whiteout", rel))
             elif os.path.lexists(_safe_join(target, rel)):
                 changes.append(("modified", rel))
             else:
@@ -380,6 +399,10 @@ def _victim_rel(whiteout_path, upper):
     """Relative path a whiteout entry deletes, proven to stay inside the tree
     (a file literally named '.wh...' would otherwise name the parent dir)."""
     victim = os.path.relpath(whiteout_victim(whiteout_path), upper)
+    if victim in ("", os.curdir) or victim.startswith(os.pardir + os.sep):
+        # a file literally named '.wh.' / '.wh..' resolves to the parent dir;
+        # left unchecked, apply_upper would _remove_target(<tree root>).
+        raise OverlordError(f"error: whiteout names its own tree: {whiteout_path}")
     _safe_join(upper, victim)
     return victim
 
@@ -397,13 +420,20 @@ def find_conflicts(changes, manifest, target):
             conflicts.extend(_touched_conflicts(rel, manifest, target))
         elif kind == "replaced-dir":
             conflicts.extend(_replaced_dir_conflicts(rel, manifest, target))
+        elif kind == "invalid-whiteout":
+            conflicts.append(("invalid-whiteout", rel))
     return conflicts
 
 
 def _added_conflicts(rel, manifest, target):
+    tpath = _safe_join(target, rel.rstrip("/"))
     if rel.endswith("/"):
-        return []  # mkdir -p semantics: pre-existing dir is benign
-    if rel in manifest or os.path.lexists(_safe_join(target, rel)):
+        # mkdir -p semantics: a pre-existing *directory* here is benign, but an
+        # external regular file or symlink is not — apply_upper would delete it.
+        if os.path.lexists(tpath) and not (os.path.isdir(tpath) and not os.path.islink(tpath)):
+            return [("created-externally", rel)]
+        return []
+    if rel in manifest or os.path.lexists(tpath):
         return [("created-externally", rel)]
     return []
 
@@ -421,7 +451,9 @@ def _touched_conflicts(rel, manifest, target):
 
 
 def _replaced_dir_conflicts(rel, manifest, target):
-    """Every snapshotted file under a wholesale-replaced dir must be intact."""
+    """A wholesale-replaced dir is removed and rewritten on commit, so nothing
+    live under it may be lost: every snapshotted file must be intact AND no
+    descendant may have appeared after the snapshot."""
     prefix = rel + os.sep
     found = []
     for mrel, fp in manifest.items():
@@ -430,6 +462,13 @@ def _replaced_dir_conflicts(rel, manifest, target):
         mpath = _safe_join(target, mrel)
         if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
             found.append(("modified-externally", mrel))
+    tdir = _safe_join(target, rel)
+    if os.path.isdir(tdir) and not os.path.islink(tdir):
+        for root, _dirs, files in os.walk(tdir):
+            for name in files:
+                drel = os.path.relpath(os.path.join(root, name), target)
+                if drel not in manifest:
+                    found.append(("appeared-after-snapshot", drel))
     return found
 
 
@@ -544,6 +583,8 @@ def start_ebpf(pid, sdir):
     )
     if not os.path.isfile(script):
         raise OverlordError("error: ebpf recorder script not found")
+    if not shutil.which("bpftrace"):
+        raise OverlordError("error: --trace ebpf needs bpftrace (sudo apt install bpftrace)")
     argv = ["bpftrace", "-o", os.path.join(sdir, "ebpf.log"), script, str(pid)]
     if os.geteuid() != 0:
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
@@ -1010,7 +1051,26 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
             outfile.close()
     meta["holder_pid"] = proc.pid
     save_meta(sid, meta)
-    ebpf = start_ebpf(proc.pid, sdir) if trace == "ebpf" else None
+    ebpf = None
+    if trace == "ebpf":
+        try:
+            ebpf = start_ebpf(proc.pid, sdir)
+        except Exception:
+            # the workload is already live and the recorder is not: kill the
+            # whole group and reap it, or a daemon would keep it running
+            # unrecorded after the caller has been told the session failed
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            parent_sock.close()
+            if cleanup:
+                cleanup()
+            raise
     return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
 
 
@@ -1148,6 +1208,10 @@ def commit_session(sid, merge=False, force=False):
     with open(os.path.join(sdir, MANIFEST_FILE)) as f:
         manifest = json.load(f)
     changes = compute_diff(upper, m["target"])
+    bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
+    if bad:  # would _remove_target(<tree root>); no --force for this one
+        raise OverlordError("error: refusing to commit — whiteout entry names its own "
+                            f"tree root: {', '.join(bad)} (roll the session back)")
     conflicts = find_conflicts(changes, manifest, m["target"])
     merged = []
     if conflicts and merge:

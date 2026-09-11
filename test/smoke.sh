@@ -38,9 +38,10 @@ pass() {
     return 0
 }
 sid_of() {
-    local out="$1"
-    grep -oP 'session \K\S+' <<< "$out" | head -1
-    return 0
+    local out="$1" sid
+    sid=$(grep -oP 'session \K\S+' <<< "$out" | head -1)
+    [[ -n "$sid" ]] || return 1
+    printf '%s\n' "$sid"
 }
 
 reset_target
@@ -255,6 +256,72 @@ if $KERNEL_OK && command -v strace > /dev/null; then
     pass "jail + trace (records sealed)"
 else
     echo "  skip: jail+trace combo"
+fi
+
+# --- 20. sid_of must not mask a missing session id (callers build paths from it)
+sid_of "command completed" > /dev/null && fail "sid_of returned success on a missing id" || true
+pass "sid_of refuses a missing id"
+
+# --- 21. a whiteout that names its own tree root can never reach apply_upper
+reset_target
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'touch .wh.')
+SID=$(sid_of "$OUT")
+$OVERLORD diff "$SID" | grep -q 'invalid-whiteout' || fail "root-naming whiteout not recorded in diff"
+R=$($OVERLORD commit --force "$SID" 2>&1) && fail "commit --force accepted a root-naming whiteout" || true
+grep -q "names its own tree root" <<< "$R" || fail "wrong refusal for root-naming whiteout: $R"
+[[ -f "$TARGET/keep.txt" ]] || fail "target destroyed by root-naming whiteout"
+$OVERLORD rollback "$SID" > /dev/null || fail "root-naming whiteout wedged the session"
+pass "root-naming whiteout: refused, unforceable, target intact, rollback works"
+
+# --- 22. replay never writes through a symlink that drifted into the tree
+reset_target
+OUTSIDE="$WORK/outside"; rm -rf "$OUTSIDE"; mkdir -p "$OUTSIDE"
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'echo payload > sub/file')
+SID=$(sid_of "$OUT")
+rm -rf "$TARGET/sub"; ln -s "$OUTSIDE" "$TARGET/sub"     # drift: sub now points out of the tree
+R=$($OVERLORD commit "$SID" 2>&1) && fail "commit wrote through a drifted symlink" || true
+grep -q "via a symlink" <<< "$R" || fail "symlink drift not named in refusal: $R"
+$OVERLORD commit --force "$SID" > /dev/null 2>&1 && fail "--force wrote through a drifted symlink" || true
+[[ ! -e "$OUTSIDE/file" ]] || fail "replay escaped the tree into $OUTSIDE"
+$OVERLORD rollback "$SID" > /dev/null
+pass "symlink drift: refused, unforceable, nothing written outside the tree"
+
+# --- 23. an added directory must not silently replace an external file
+reset_target
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'mkdir reports; echo r > reports/r.txt')
+SID=$(sid_of "$OUT")
+echo external > "$TARGET/reports"
+R=$($OVERLORD commit "$SID" 2>&1) && fail "added dir replaced an external file" || true
+grep -q "created-externally" <<< "$R" || fail "external file at added-dir path not reported: $R"
+grep -q external "$TARGET/reports" || fail "external file lost"
+$OVERLORD rollback "$SID" > /dev/null
+pass "added dir vs external file: refused, file intact"
+
+# --- 24. replacing a directory must not delete descendants that appeared after the snapshot
+reset_target
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'rm -rf sub; mkdir sub; echo fresh > sub/fresh')
+SID=$(sid_of "$OUT")
+echo new > "$TARGET/sub/new"
+R=$($OVERLORD commit "$SID" 2>&1) && fail "replaced dir deleted an external descendant" || true
+grep -q "appeared-after-snapshot" <<< "$R" || fail "external descendant not reported: $R"
+[[ -f "$TARGET/sub/new" ]] || fail "external descendant deleted"
+$OVERLORD rollback "$SID" > /dev/null
+pass "replaced dir vs external descendant: refused, file intact"
+
+# --- 25. a recorder that fails to start must take the workload down with it (kernel only)
+if $KERNEL_OK && ! command -v bpftrace > /dev/null; then
+    reset_target
+    BEACON="$WORK/beacon"; rm -f "$BEACON"
+    HOLDERS_BEFORE=$(ps -eo cmd | grep -c '[u]nshare --map-root-user' || true)
+    R=$($OVERLORD run --trace ebpf -t "$TARGET" -- bash -c "sleep 1; touch $BEACON" 2>&1) && fail "ebpf run succeeded without a recorder" || true
+    grep -q bpftrace <<< "$R" || fail "ebpf preflight gave no useful error: $R"
+    sleep 2
+    [[ ! -e "$BEACON" ]] || fail "workload ran on after the recorder failed"
+    HOLDERS_AFTER=$(ps -eo cmd | grep -c '[u]nshare --map-root-user' || true)
+    [[ "$HOLDERS_AFTER" -le "$HOLDERS_BEFORE" ]] || fail "recorder failure leaked a holder process"
+    pass "recorder failure kills and reaps the workload"
+else
+    echo "  skip: recorder-failure test (needs kernel backend and no bpftrace)"
 fi
 
 echo "PASS: all smoke assertions"

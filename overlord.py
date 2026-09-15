@@ -9,6 +9,8 @@
     overlord commit <session> [--merge] [--force]
     overlord rollback <session>
     overlord doctor
+    overlord agent -t <dir> [grants] [--provider anthropic|openai] "<task>"
+    overlord keys <provider> <key>
 
 A wrapped command runs against an overlay of the target directory. Every write
 lands in the session's upper layer; the real tree is untouched until an
@@ -27,7 +29,9 @@ Grants (the capability manifest, via flags or --manifest file):
 Backends:
   kernel  overlayfs in an unprivileged user namespace; overlay is mounted over
           the target's own path (or into the jail), so absolute-path writes
-          are contained. jail/net grants require this backend. On Ubuntu
+          INTO THE TARGET are contained. Paths outside it (/tmp, $HOME, /etc)
+          are the real filesystem unless --jail, which is why `agent` jails by
+          default. jail/net grants require this backend. On Ubuntu
           24.04+ install packaging/ (AppArmor profile grants userns to the
           overlord launcher only).
   fuse    fuse-overlayfs, no privileges. Cooperative containment: cwd is
@@ -231,11 +235,25 @@ def _safe_join(base, rel):
     """Join rel onto base, refusing any result that escapes base. Relative
     paths here come from walking an overlay upper layer that an untrusted
     process wrote to, so a crafted name must never resolve outside the tree
-    it is being replayed into."""
-    base = os.path.abspath(base)
-    path = os.path.normpath(os.path.join(base, rel))
-    if path != base and not path.startswith(base + os.sep):
+    it is being replayed into.
+
+    normpath alone stops lexical `..`, but not a symlink drifted into an
+    existing path component: if the target grew `dir -> /outside` after the
+    snapshot, replaying `dir/file` would write through it. So the deepest
+    component that already exists on disk is resolved with realpath and must
+    still sit inside base. This runs on the write path, so --force cannot
+    bypass it."""
+    base_abs = os.path.abspath(base)
+    path = os.path.normpath(os.path.join(base_abs, rel))
+    if path != base_abs and not path.startswith(base_abs + os.sep):
         raise OverlordError(f"error: path escapes its tree: {rel}")
+    real_base = os.path.realpath(base_abs)
+    probe = path
+    while probe != base_abs and not os.path.lexists(probe):
+        probe = os.path.dirname(probe)
+    real_probe = os.path.realpath(probe)
+    if real_probe != real_base and not real_probe.startswith(real_base + os.sep):
+        raise OverlordError(f"error: path escapes its tree via a symlink: {rel}")
     return path
 
 
@@ -244,7 +262,8 @@ def load_meta(sid):
     if not os.path.isfile(path):
         raise OverlordError(f"error: no such session: {sid}")
     with open(path) as f:
-        return json.load(f)
+        meta = json.load(f)
+    return reconcile_session(sid, meta)
 
 
 def save_meta(sid, meta):
@@ -266,7 +285,7 @@ def pending_sessions_for(target):
     hits = []
     for sid in list_sessions():
         m = load_meta(sid)
-        if m.get("status") == "pending" and m.get("target") == target:
+        if m.get("status") in ("pending", "open") and m.get("target") == target:
             hits.append(sid)
     return hits
 
@@ -310,11 +329,16 @@ def _fingerprint(path):
 WHITEOUT_PREFIX = ".wh."
 
 
-def is_whiteout(path):
+def is_whiteout(path, backend=None):
+    """Kernel overlayfs marks a delete with a 0:0 char device (or the
+    user.overlay.whiteout xattr under userxattr). The `.wh.` name prefix is
+    fuse-overlayfs's convention; on the kernel backend a file called
+    `.wh.foo` is a file called `.wh.foo`, and reading it as a whiteout would
+    delete the user's `foo` on commit."""
     st = os.lstat(path)
     if stat.S_ISCHR(st.st_mode) and st.st_rdev == 0:
         return True
-    if os.path.basename(path).startswith(WHITEOUT_PREFIX):
+    if backend != "kernel" and os.path.basename(path).startswith(WHITEOUT_PREFIX):
         return True
     for xa in ("user.overlay.whiteout", "user.fuseoverlayfs.whiteout"):
         try:
@@ -342,7 +366,7 @@ def is_opaque_dir(path):
     return False
 
 
-def compute_diff(upper, target):
+def compute_diff(upper, target, backend=None):
     """Classify upper-layer entries: sorted list of (kind, relpath).
 
     kinds: added, modified, deleted, replaced-dir. Added dirs get a '/' suffix.
@@ -362,8 +386,13 @@ def compute_diff(upper, target):
         for name in files:
             fpath = os.path.join(root, name)
             rel = os.path.relpath(fpath, upper)
-            if is_whiteout(fpath):
-                changes.append(("deleted", _victim_rel(fpath, upper)))
+            if is_whiteout(fpath, backend):
+                try:
+                    changes.append(("deleted", _victim_rel(fpath, upper)))
+                except OverlordError:
+                    # names its own tree root; recorded so diff/log show it,
+                    # refused by commit_session before anything is replayed
+                    changes.append(("invalid-whiteout", rel))
             elif os.path.lexists(_safe_join(target, rel)):
                 changes.append(("modified", rel))
             else:
@@ -375,6 +404,10 @@ def _victim_rel(whiteout_path, upper):
     """Relative path a whiteout entry deletes, proven to stay inside the tree
     (a file literally named '.wh...' would otherwise name the parent dir)."""
     victim = os.path.relpath(whiteout_victim(whiteout_path), upper)
+    if victim in ("", os.curdir) or victim.startswith(os.pardir + os.sep):
+        # a file literally named '.wh.' / '.wh..' resolves to the parent dir;
+        # left unchecked, apply_upper would _remove_target(<tree root>).
+        raise OverlordError(f"error: whiteout names its own tree: {whiteout_path}")
     _safe_join(upper, victim)
     return victim
 
@@ -392,13 +425,20 @@ def find_conflicts(changes, manifest, target):
             conflicts.extend(_touched_conflicts(rel, manifest, target))
         elif kind == "replaced-dir":
             conflicts.extend(_replaced_dir_conflicts(rel, manifest, target))
+        elif kind == "invalid-whiteout":
+            conflicts.append(("invalid-whiteout", rel))
     return conflicts
 
 
 def _added_conflicts(rel, manifest, target):
+    tpath = _safe_join(target, rel.rstrip("/"))
     if rel.endswith("/"):
-        return []  # mkdir -p semantics: pre-existing dir is benign
-    if rel in manifest or os.path.lexists(_safe_join(target, rel)):
+        # mkdir -p semantics: a pre-existing *directory* here is benign, but an
+        # external regular file or symlink is not — apply_upper would delete it.
+        if os.path.lexists(tpath) and not (os.path.isdir(tpath) and not os.path.islink(tpath)):
+            return [("created-externally", rel)]
+        return []
+    if rel in manifest or os.path.lexists(tpath):
         return [("created-externally", rel)]
     return []
 
@@ -416,7 +456,9 @@ def _touched_conflicts(rel, manifest, target):
 
 
 def _replaced_dir_conflicts(rel, manifest, target):
-    """Every snapshotted file under a wholesale-replaced dir must be intact."""
+    """A wholesale-replaced dir is removed and rewritten on commit, so nothing
+    live under it may be lost: every snapshotted file must be intact AND no
+    descendant may have appeared after the snapshot."""
     prefix = rel + os.sep
     found = []
     for mrel, fp in manifest.items():
@@ -425,6 +467,13 @@ def _replaced_dir_conflicts(rel, manifest, target):
         mpath = _safe_join(target, mrel)
         if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
             found.append(("modified-externally", mrel))
+    tdir = _safe_join(target, rel)
+    if os.path.isdir(tdir) and not os.path.islink(tdir):
+        for root, _dirs, files in os.walk(tdir):
+            for name in files:
+                drel = os.path.relpath(os.path.join(root, name), target)
+                if drel not in manifest:
+                    found.append(("appeared-after-snapshot", drel))
     return found
 
 
@@ -539,6 +588,8 @@ def start_ebpf(pid, sdir):
     )
     if not os.path.isfile(script):
         raise OverlordError("error: ebpf recorder script not found")
+    if not shutil.which("bpftrace"):
+        raise OverlordError("error: --trace ebpf needs bpftrace (sudo apt install bpftrace)")
     argv = ["bpftrace", "-o", os.path.join(sdir, "ebpf.log"), script, str(pid)]
     if os.geteuid() != 0:
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
@@ -591,7 +642,7 @@ def _remove_target(path):
         os.remove(path)
 
 
-def apply_upper(upper, target):
+def apply_upper(upper, target, backend=None):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
     for root, dirs, files in os.walk(upper):
@@ -611,7 +662,7 @@ def apply_upper(upper, target):
         dirs[:] = [d for d in dirs if d not in opaque]  # copied whole above
         for name in files:
             fpath = os.path.join(root, name)
-            if is_whiteout(fpath):
+            if is_whiteout(fpath, backend):
                 _remove_target(_safe_join(target, _victim_rel(fpath, upper)))
             else:
                 _copy_entry(fpath, _safe_join(target, os.path.relpath(fpath, upper)))
@@ -644,9 +695,296 @@ def load_grants(args):
     return grants
 
 
-def execute_session(target, cmd, backend, grants, trace=None, wait=False,
-                    stack=False, capture=False):
-    """Core transactional run. Returns (sid, exit_code, changes)."""
+# ---------------------------------------------------------------- live sessions
+#
+# A live session keeps the overlay mounted (and the jail/netns alive) for as
+# long as its holder process runs, so N commands can execute inside one
+# transaction. The holder is a tiny executor loop (python, inline source —
+# nothing from the session dir is exposed to the jail) that speaks JSON lines
+# over an inherited socketpair: run / kill / close. It exits on EOF, so a
+# dead opener always tears the namespace down; the session dir is then
+# reconciled to "pending" by whoever loads it next.
+
+_EXECUTOR_SRC = r"""
+import base64, json, os, signal, socket, subprocess, sys, threading
+sock = socket.socket(fileno=int(sys.argv[1]))
+rf = sock.makefile("rb")
+wl = threading.Lock()
+procs = {}
+def send(o):
+    with wl:
+        sock.sendall((json.dumps(o) + "\n").encode())
+def run(req):
+    rid, cmd = req["id"], req["cmd"]
+    cwd = os.path.join(os.getcwd(), req["cwd"]) if req.get("cwd") else None
+    kw = {}
+    if req.get("capture", True):
+        kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True, **kw)
+    except OSError as e:
+        send({"id": rid, "exit": 127, "error": str(e)}); return
+    procs[rid] = p
+    if p.stdout is not None:
+        while True:
+            chunk = p.stdout.read1(65536)
+            if not chunk: break
+            send({"id": rid, "out": base64.b64encode(chunk).decode()})
+    rc = p.wait()
+    procs.pop(rid, None)
+    send({"id": rid, "exit": rc})
+def killall():
+    for p in list(procs.values()):
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except OSError: pass
+send({"ready": True, "pid": os.getpid()})
+for line in rf:
+    try: req = json.loads(line)
+    except ValueError: continue
+    if req.get("op") == "run":
+        threading.Thread(target=run, args=(req,), daemon=True).start()
+    elif req.get("op") == "kill":
+        p = procs.get(req.get("id"))
+        if p:
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except OSError: pass
+    elif req.get("op") == "close":
+        break
+killall()
+os._exit(0)
+"""
+
+
+class LiveSession:
+    """An open transaction: overlay mounted, holder alive, commands accepted."""
+
+    def __init__(self, sid, meta, proc, sock, lock, cleanup, ebpf, trace_inside):
+        import queue
+        import socket as _socket
+        import threading
+        self.sid, self.meta, self.proc = sid, meta, proc
+        self.sdir = session_path(sid)
+        self._sock, self._lock, self._cleanup, self._ebpf = sock, lock, cleanup, ebpf
+        self._trace_inside = trace_inside
+        self._q = {}
+        self._qlock = threading.Lock()
+        self._wlock = threading.Lock()
+        self._queue = queue
+        self.expired = False
+        self.closed = False
+        self._ready = threading.Event()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._deadline = None
+        t = meta["grants"].get("timeout")
+        if t:
+            self._deadline = threading.Timer(t, self._expire)
+            self._deadline.daemon = True
+            self._deadline.start()
+        if not self._ready.wait(30):
+            self._kill()
+            raise OverlordError("error: session holder did not start (backend failure?)")
+
+    # -- transport
+    def _read_loop(self):
+        rf = self._sock.makefile("rb")
+        for line in rf:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("ready"):
+                self._ready.set()
+                continue
+            with self._qlock:
+                q = self._q.get(msg.get("id"))
+            if q:
+                q.put(msg)
+        # EOF: holder is gone — release every waiter
+        with self._qlock:
+            for q in self._q.values():
+                q.put({"exit": TIMEOUT_RC if self.expired else 137, "eof": True})
+
+    def _send(self, obj):
+        with self._wlock:
+            try:
+                self._sock.sendall((json.dumps(obj) + "\n").encode())
+            except OSError:
+                pass
+
+    def _kill(self):
+        try:
+            os.killpg(self.proc.pid, 9)
+        except OSError:
+            pass
+
+    def _expire(self):
+        self.expired = True
+        self.meta["timed_out"] = True
+        self._kill()
+
+    # -- api
+    def exec(self, cmd, timeout=None, capture=True, cwd=None, on_output=None,
+             label=None):
+        """Run one command inside the transaction. Returns (rc, output_bytes)."""
+        import threading
+        if self.closed or self.expired:
+            raise OverlordError("error: session is closed" if self.closed else
+                             "error: session expired (timeout grant)")
+        rid = uuid.uuid4().hex[:8]
+        q = self._queue.Queue()
+        with self._qlock:
+            self._q[rid] = q
+        real_cmd = list(cmd)
+        if self._trace_inside:
+            real_cmd = ["strace", "-f", "-qq", "-ttt", "-e",
+                        "trace=%file,%process,%network", "-o",
+                        f"{self._trace_inside}/raw.{rid}.strace"] + real_cmd
+        rec = {"id": rid, "cmd": list(cmd), "label": label,
+               "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        self.meta.setdefault("execs", []).append(rec)
+        if not self.meta.get("cmd"):
+            self.meta["cmd"] = list(cmd)
+        save_meta(self.sid, self.meta)
+        self._send({"op": "run", "id": rid, "cmd": real_cmd, "capture": capture,
+                    "cwd": cwd})
+        timer = None
+        timed_out = [False]
+        if timeout:
+            def _kill_exec():
+                timed_out[0] = True
+                self._send({"op": "kill", "id": rid})
+            timer = threading.Timer(timeout, _kill_exec)
+            timer.daemon = True
+            timer.start()
+        out = bytearray()
+        outlog = open(os.path.join(self.sdir, "output.log"), "ab") if capture else None
+        try:
+            while True:
+                msg = q.get()
+                if "out" in msg:
+                    import base64
+                    chunk = base64.b64decode(msg["out"])
+                    out += chunk
+                    if outlog:
+                        outlog.write(chunk)
+                        outlog.flush()
+                    if on_output:
+                        on_output(chunk)
+                if "exit" in msg:
+                    rc = msg["exit"]
+                    if msg.get("error") and outlog:
+                        outlog.write((msg["error"] + "\n").encode())
+                    break
+        finally:
+            if timer:
+                timer.cancel()
+            if outlog:
+                outlog.close()
+            with self._qlock:
+                self._q.pop(rid, None)
+        if timed_out[0] or (self.expired and rc in (137, TIMEOUT_RC)):
+            rc = TIMEOUT_RC
+            rec["timed_out"] = True
+        rec.update(exit_code=rc, finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        save_meta(self.sid, self.meta)
+        return rc, bytes(out)
+
+    def changes(self):
+        return compute_diff(os.path.join(self.sdir, "upper"), self.meta["target"],
+                            self.meta.get("backend"))
+
+    def close(self):
+        """Tear the namespace down and finalize the session as pending.
+        Returns (sid, changes)."""
+        if self.closed:
+            return self.sid, self.changes()
+        self.closed = True
+        if self._deadline:
+            self._deadline.cancel()
+        self._send({"op": "close"})
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._kill()
+            self.proc.wait()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._cleanup:
+            self._cleanup()
+        if self._ebpf:
+            self._ebpf.terminate()
+        fcntl.flock(self._lock, fcntl.LOCK_UN)
+        self._lock.close()
+        changes = _finalize_session(self.sid, self.meta)
+        return self.sid, changes
+
+
+def _finalize_session(sid, meta):
+    """Compute diff + provenance, parse traces, mark pending. Idempotent."""
+    sdir = session_path(sid)
+    upper = os.path.join(sdir, "upper")
+    changes = (compute_diff(upper, meta["target"], meta.get("backend"))
+               if os.path.isdir(upper) else [])
+    attribution = {}
+    apath = os.path.join(sdir, "attribution.json")
+    if os.path.isfile(apath):
+        with open(apath) as f:
+            attribution = json.load(f)
+    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
+        for rec in build_provenance(changes, upper, meta["target"]):
+            if rec["path"] in attribution:
+                rec["caused_by"] = attribution[rec["path"]]   # agent tool call
+            f.write(json.dumps(rec) + "\n")
+    tdir = os.path.join(sdir, "trace")
+    if meta.get("trace") == "strace" and os.path.isdir(tdir):
+        raws = sorted(p for p in os.listdir(tdir) if p.endswith(".strace"))
+        raw = os.path.join(sdir, RAW_TRACE_FILE)
+        with open(raw, "wb") as out:
+            for p in raws:
+                with open(os.path.join(tdir, p), "rb") as f:
+                    shutil.copyfileobj(f, out)
+        with open(os.path.join(sdir, SYSCALLS_FILE), "w") as f:
+            for ev in parse_strace(raw):
+                f.write(json.dumps(ev) + "\n")
+    execs = meta.get("execs") or []
+    rc = execs[-1].get("exit_code") if execs else None
+    if any(e.get("timed_out") for e in execs) or meta.get("timed_out"):
+        meta["timed_out"] = True
+        if rc is None or rc == 0:
+            rc = TIMEOUT_RC
+    meta.update(exit_code=rc, status="pending",
+                finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    meta.pop("holder_pid", None)
+    save_meta(sid, meta)
+    return changes
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def reconcile_session(sid, meta):
+    """An 'open' session whose holder is gone (opener crashed) becomes pending."""
+    if meta.get("status") == "open":
+        pid = meta.get("holder_pid")
+        if not pid or not _pid_alive(pid):
+            _finalize_session(sid, meta)
+    return meta
+
+
+def open_session(target, backend, grants, trace=None, wait=False, stack=False,
+                 capture=False, agent=None):
+    """Snapshot the target, mount the overlay, start the holder. Returns LiveSession."""
+    import socket
     target = os.path.realpath(target)
     if not os.path.isdir(target):
         raise OverlordError(f"error: target is not a directory: {target}")
@@ -680,95 +1018,91 @@ def execute_session(target, cmd, backend, grants, trace=None, wait=False,
         )
 
     grants = dict(grants)
-    raw_trace = None
+    trace_inside = None
     if trace == "strace":
-        cmd, raw_trace = _wrap_strace(cmd, sdir, grants)
+        if not shutil.which("strace"):
+            raise OverlordError("error: --trace requires strace (sudo apt install strace)")
+        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
+        if grants.get("jail"):
+            # red team finding A3: never expose session records to the jail —
+            # strace gets an isolated trace/ subdir bound at /.overlord
+            grants["_bind_trace"] = True
+            trace_inside = "/.overlord"
+        else:
+            trace_inside = os.path.join(sdir, "trace")
 
     meta = {
-        "id": sid, "target": target, "cmd": cmd, "backend": backend,
+        "id": sid, "target": target, "cmd": [], "execs": [], "backend": backend,
         "grants": {k: v for k, v in grants.items() if not k.startswith("_")},
-        "trace": trace,
-        "started": _now(), "status": "running",
+        "trace": trace, "agent": agent,
+        "started": _now(), "status": "open",
     }
-    save_meta(sid, meta)
 
-    try:
-        rc, timed_out = _run_wrapped(backend, target, sdir, cmd, grants, trace, capture)
-    finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
-    if timed_out:
-        meta["timed_out"] = True
-
-    changes = _record_session(sdir, target, raw_trace)
-    meta.update(exit_code=rc, status="pending", finished=_now())
-    save_meta(sid, meta)
-    return sid, rc, changes
-
-
-def _wrap_strace(cmd, sdir, grants):
-    """Prefix cmd with strace. Returns (cmd, path where the raw log lands)."""
-    if not shutil.which("strace"):
-        raise OverlordError("error: --trace requires strace (sudo apt install strace)")
-    raw_trace = os.path.join(sdir, RAW_TRACE_FILE)
-    if grants.get("jail"):
-        # red team finding A3: never expose session records to the jail —
-        # strace gets an isolated trace/ subdir bound at /.overlord
-        grants["_bind_trace"] = True
-        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
-        raw_trace = os.path.join(sdir, "trace", RAW_TRACE_FILE)
-        strace_out = "/.overlord/" + RAW_TRACE_FILE
-    else:
-        strace_out = raw_trace
-    cmd = ["strace", "-f", "-qq", "-ttt", "-e",
-           "trace=%file,%process,%network", "-o", strace_out] + cmd
-    return cmd, raw_trace
-
-
-def _run_wrapped(backend, target, sdir, cmd, grants, trace, capture):
-    """Launch the command inside the backend's overlay and wait for it.
-    Returns (exit_code, timed_out). Always releases backend resources."""
-    argv, cwd, cleanup = PREPARE[backend](target, sdir, cmd, grants)
-    ebpf = None
-    outfile = None
-    popen_kw = {}
+    parent_sock, child_sock = socket.socketpair()
+    py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
+    executor = [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
+    argv, cwd, cleanup = PREPARE[backend](target, sdir, executor, grants)
+    popen_kw = {"pass_fds": (child_sock.fileno(),)}
     if capture:
-        outfile = open(os.path.join(sdir, OUTPUT_FILE), "wb")
-        popen_kw = {"stdout": outfile, "stderr": subprocess.STDOUT,
-                    "stdin": subprocess.DEVNULL}
-    timed_out = False
+        outfile = open(os.path.join(sdir, "output.log"), "ab")
+        popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     try:
         proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, **popen_kw)
-        if trace == "ebpf":
-            ebpf = start_ebpf(proc.pid, sdir)
-        try:
-            rc = proc.wait(timeout=grants.get("timeout"))
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            proc.wait()
-            rc, timed_out = TIMEOUT_RC, True
+    except OSError:
+        _abort_launch(sid, lock, cleanup, parent_sock)
+        raise
     finally:
-        if cleanup:
-            cleanup()
-        if ebpf:
-            ebpf.terminate()
-        if outfile:
+        child_sock.close()
+        if capture:
             outfile.close()
-    return rc, timed_out
+    meta["holder_pid"] = proc.pid
+    save_meta(sid, meta)
+    ebpf = None
+    if trace == "ebpf":
+        try:
+            ebpf = start_ebpf(proc.pid, sdir)
+        except Exception:
+            # the workload is already live and the recorder is not
+            _abort_launch(sid, lock, cleanup, parent_sock, proc)
+            raise
+    return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
 
 
-def _record_session(sdir, target, raw_trace):
-    """Write the flight record (provenance + parsed syscalls). Returns changes."""
-    upper = os.path.join(sdir, "upper")
-    changes = compute_diff(upper, target)
-    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
-        for rec in build_provenance(changes, upper, target):
-            f.write(json.dumps(rec) + "\n")
-    if raw_trace and os.path.isfile(raw_trace):
-        with open(os.path.join(sdir, SYSCALLS_FILE), "w") as f:
-            for ev in parse_strace(raw_trace):
-                f.write(json.dumps(ev) + "\n")
-    return changes
+def _abort_launch(sid, lock, cleanup, parent_sock, proc=None):
+    """A launch that fails after the session record exists must leave nothing:
+    not a running holder (a daemon would keep it alive, unrecorded, after the
+    caller was told the session failed), not an `open` orphan that blocks the
+    target for every later run, and not the target lock (held by the daemon
+    process until it dies). The session never happened."""
+    if proc is not None:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    parent_sock.close()
+    if cleanup:
+        cleanup()
+    _force_rmtree(session_path(sid))
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    lock.close()
+
+
+def execute_session(target, cmd, backend, grants, trace=None, wait=False,
+                    stack=False, capture=False):
+    """One-shot transactional run (open, exec, close). Returns (sid, exit_code, changes)."""
+    live = open_session(target, backend, grants, trace=trace, wait=wait,
+                        stack=stack, capture=capture)
+    try:
+        rc, _ = live.exec(cmd, capture=capture)
+    finally:
+        sid, changes = live.close()
+    if live.expired:
+        rc = TIMEOUT_RC
+    return sid, rc, changes
 
 
 # ---------------------------------------------------------------- commands
@@ -815,17 +1149,23 @@ def _session_row(sid, m):
         (("jail", g.get("jail")), ("net:none", g.get("net") == "none"),
          ("timed-out", m.get("timed_out"))) if on
     )
+    execs = m.get("execs") or []
+    what = shlex.join(m.get("cmd") or [])
+    if len(execs) > 1:
+        what = f"{len(execs)} commands, first: {what}"
+    if m.get("agent"):
+        what = f"agent {m['agent']} — {what}"
     return (f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
-            f"{m.get('target', '')}  :: {shlex.join(m.get('cmd', []))}")
+            f"{m.get('target', '')}  :: {what}")
 
 
 def cmd_sessions(args):
     rows = list_sessions()
-    if rows:
-        for sid in rows:
-            print(_session_row(sid, load_meta(sid)))
-    else:
+    if not rows:
         print("no sessions")
+        return 0
+    for sid in rows:
+        print(_session_row(sid, load_meta(sid)))
     return 0
 
 
@@ -834,7 +1174,7 @@ def cmd_diff(args):
     upper = session_file(args.session, "upper")
     if not os.path.isdir(upper):
         raise OverlordError(f"error: session is {m.get('status')}; layers discarded")
-    changes = compute_diff(upper, m["target"])
+    changes = compute_diff(upper, m["target"], m.get("backend"))
     for kind, rel in changes:
         print(f"{kind:12s} {rel}")
     if not changes:
@@ -854,6 +1194,18 @@ def cmd_log(args):
                 print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
     else:
         print("no provenance recorded")
+        return 0
+    with open(prov) as f:
+        for line in f:
+            rec = json.loads(line)
+            before = (rec.get("before_sha256") or "-")[:12]
+            after = (rec.get("after_sha256") or "-")[:12]
+            print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
+            cause = rec.get("caused_by")
+            if cause:
+                print(f"{'':12s}   caused_by: turn {cause.get('turn')} "
+                      f"{cause.get('tool')}({cause.get('summary', '')}) "
+                      f"[{cause.get('tool_call_id')}]")
     for name, label in ((SYSCALLS_FILE, "syscall trace"), ("ebpf.log", "ebpf trace")):
         p = session_file(args.session, name)
         if os.path.isfile(p):
@@ -872,7 +1224,11 @@ def commit_session(sid, merge=False, force=False):
     upper = os.path.join(sdir, "upper")
     with open(os.path.join(sdir, MANIFEST_FILE)) as f:
         manifest = json.load(f)
-    changes = compute_diff(upper, m["target"])
+    changes = compute_diff(upper, m["target"], m.get("backend"))
+    bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
+    if bad:  # would _remove_target(<tree root>); no --force for this one
+        raise OverlordError("error: refusing to commit — whiteout entry names its own "
+                            f"tree root: {', '.join(bad)} (roll the session back)")
     conflicts = find_conflicts(changes, manifest, m["target"])
     merged = []
     if conflicts and merge:
@@ -880,7 +1236,7 @@ def commit_session(sid, merge=False, force=False):
     if conflicts and not force:
         return {"committed": False, "conflicts": conflicts, "merged": merged,
                 "target": m["target"]}
-    n = apply_upper(upper, m["target"])
+    n = apply_upper(upper, m["target"], m.get("backend"))
     m.update(status="committed", committed=_now(),
              forced=bool(conflicts), merged_paths=merged)
     save_meta(sid, m)
@@ -897,6 +1253,15 @@ def rollback_session(sid):
     m = load_meta(sid)
     if m.get("status") == "committed":
         raise OverlordError("error: session already committed; nothing to roll back")
+    if m.get("status") == "open" and m.get("holder_pid"):
+        try:
+            os.killpg(m["holder_pid"], 9)
+        except OSError:
+            pass
+        for _ in range(50):
+            if not _pid_alive(m["holder_pid"]):
+                break
+            time.sleep(0.1)
     _force_rmtree(session_path(sid))
     return m["target"]
 
@@ -1045,16 +1410,135 @@ def _api_log(req):
     return {"provenance": records}
 
 
+# live sessions brokered by this daemon process: sid -> LiveSession
+LIVE = {}
+LIVE_LOCK = None  # created lazily (threading) in cmd_daemon
+
+
+def _live(sid):
+    ls = LIVE.get(sid)
+    if ls is None:
+        raise OverlordError(f"error: session {sid} is not open in this daemon")
+    return ls
+
+
+def _api_open(req):
+    target = os.path.realpath(req["target"])
+    requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    requested.update(req.get("grants") or {})
+    grants, _rule = resolve_policy(target, requested)
+    ls = open_session(target, req.get("backend"), grants, trace=req.get("trace"),
+                      wait=bool(req.get("wait")), stack=bool(req.get("stack")),
+                      capture=True, agent=req.get("agent"))
+    LIVE[ls.sid] = ls
+    return {"sid": ls.sid, "grants": grants, "backend": ls.meta["backend"]}
+
+
+def _api_exec(req, emit):
+    """Streaming op: emits {"event":"out","data":...} lines, then the final result."""
+    ls = _live(req["sid"])
+    import base64
+    rc, out = ls.exec(list(req["cmd"]), timeout=req.get("timeout"), cwd=req.get("cwd"),
+                      label=req.get("label"),
+                      on_output=lambda chunk: emit(
+                          {"ok": True, "event": "out",
+                           "data": base64.b64encode(chunk).decode()}))
+    return {"exit_code": rc, "output": out.decode(errors="replace"),
+            "changes": ls.changes()}
+
+
+def _api_close(req):
+    ls = LIVE.pop(req["sid"], None)
+    if ls is None:
+        m = load_meta(req["sid"])  # may reconcile an orphan
+        return {"sid": req["sid"], "status": m.get("status"), "changes": []}
+    sid, changes = ls.close()
+    m = load_meta(sid)
+    out_path = os.path.join(session_path(sid), "output.log")
+    tail = ""
+    if os.path.isfile(out_path):
+        with open(out_path, errors="replace") as f:
+            tail = "".join(f.readlines()[-50:])
+    return {"sid": sid, "exit_code": m.get("exit_code"), "changes": changes,
+            "grants": m.get("grants"), "output_tail": tail}
+
+
+def _api_rollback(req):
+    ls = LIVE.pop(req["sid"], None)
+    if ls is not None:
+        ls.close()
+    return {"target": rollback_session(req["sid"])}
+
+
+AGENT_CANCEL = set()
+
+
+def _api_agent(req, emit):
+    """Streaming op: open a session, run the built-in agent, close it. Emits
+    transcript events as they happen; returns the sealed session."""
+    import agent as agent_mod
+    target = os.path.realpath(req["target"])
+    requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    requested.update(req.get("grants") or {})
+    grants, _rule = resolve_policy(target, requested)
+    provider = agent_mod.make_provider(req.get("provider", "anthropic"), req.get("model"))
+    ls = open_session(target, req.get("backend"), grants, trace=req.get("trace"),
+                      wait=bool(req.get("wait")), stack=bool(req.get("stack")),
+                      capture=True, agent=f"{provider.name}:{provider.model}")
+    LIVE[ls.sid] = ls
+    emit({"ok": True, "event": "session", "sid": ls.sid, "grants": grants,
+          "backend": ls.meta["backend"]})
+    final = ""
+    try:
+        final = agent_mod.run_agent(
+            ls, provider, req["task"], max_turns=int(req.get("max_turns") or
+                                                    agent_mod.DEFAULT_MAX_TURNS),
+            emit=lambda ev: emit({"ok": True, "event": "agent", **ev}),
+            should_stop=lambda: ls.sid in AGENT_CANCEL)
+    except SystemExit as e:
+        emit({"ok": True, "event": "agent", "type": "error", "text": str(e)})
+    finally:
+        AGENT_CANCEL.discard(ls.sid)
+        LIVE.pop(ls.sid, None)
+        sid, changes = ls.close()
+    m = load_meta(sid)
+    return {"sid": sid, "final": final, "changes": changes, "grants": m.get("grants"),
+            "usage": m.get("usage"), "exit_code": m.get("exit_code")}
+
+
+def _api_agent_cancel(req):
+    if req["sid"] not in LIVE:
+        raise OverlordError(f"error: no running agent session {req['sid']}")
+    AGENT_CANCEL.add(req["sid"])
+    return {"sid": req["sid"], "cancelling": True}
+
+
+def _api_transcript(req):
+    path = os.path.join(session_path(req["sid"]), "transcript.jsonl")
+    load_meta(req["sid"])
+    events = []
+    if os.path.isfile(path):
+        with open(path) as f:
+            events = [json.loads(line) for line in f]
+    return {"transcript": events}
+
+
 DAEMON_OPS = {
     "ping": lambda req: {"version": VERSION, "pid": os.getpid()},
     "run": _api_run,
+    "open": _api_open,
+    "close": _api_close,
     "diff": lambda req: {"changes": compute_diff(
-        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"])},
+        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"],
+        load_meta(req["sid"]).get("backend"))},
     "log": _api_log,
     "commit": _api_commit,
-    "rollback": lambda req: {"target": rollback_session(req["sid"])},
+    "rollback": _api_rollback,
     "sessions": lambda req: {"sessions": [load_meta(s) for s in list_sessions()]},
+    "agent_cancel": _api_agent_cancel,
+    "transcript": _api_transcript,
 }
+STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent}
 
 
 def cmd_daemon(args):
@@ -1067,14 +1551,21 @@ def cmd_daemon(args):
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
+            def emit(obj):
+                self.wfile.write((json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+
             for line in self.rfile:
                 try:
                     req = json.loads(line)
                     op = req.get("op")
-                    if op not in DAEMON_OPS:
+                    if op in STREAMING_OPS:
+                        resp = {"ok": True, **STREAMING_OPS[op](req, emit)}
+                    elif op in DAEMON_OPS:
+                        resp = {"ok": True, **DAEMON_OPS[op](req)}
+                    else:
                         raise ValueError(f"unknown op: {op}")
-                    resp = {"ok": True, **DAEMON_OPS[op](req)}
-                except OverlordError as e:
+                except (OverlordError, SystemExit) as e:
                     resp = {"ok": False, "error": str(e)}
                 except Exception as e:  # daemon must survive any request
                     resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -1093,6 +1584,12 @@ def cmd_daemon(args):
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            for ls in list(LIVE.values()):
+                try:
+                    ls.close()
+                except Exception:
+                    pass
     return 0
 
 
@@ -1139,6 +1636,9 @@ def main(argv=None):
     ps.set_defaults(fn=cmd_shell)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import agent as agent_mod
+    agent_mod.add_agent_parser(sub, _add_exec_flags)
     sub.add_parser("doctor", help="environment diagnostics").set_defaults(fn=cmd_doctor)
 
     pd = sub.add_parser("daemon", help="resident broker: unix socket + policy enforcement")

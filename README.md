@@ -51,6 +51,10 @@ overlord run --trace ebpf -t /srv/app -- <cmd>       # kernel-side recorder (roo
 overlord run --merge-base -t /srv/app -- <cmd>       # keep base copy for commit --merge
 overlord shell -t /srv/app                           # interactive transactional shell
 
+overlord agent -t /srv/app "add a Makefile with a test target"   # jailed by default
+overlord agent --net none -t /srv/app "<task>"       # ...and offline too
+overlord agent --no-jail -t /srv/app "<task>"        # opt out: tools reach the real fs
+
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
 overlord log <session>           # per-change sha256 before -> after, syscall count
@@ -95,11 +99,13 @@ overrides).
 overlord ui          # http://127.0.0.1:7777 — localhost only
 ```
 
-![OVERLORD mission control — pending session with per-file diff, before/after hashes, commit/rollback](assets/ui.png)
+![OVERLORD mission control — a pending session rendered as a dossier: grant envelope, manifest of changed paths with tool-call attribution and before/after hashes, commit or void](assets/ui.png)
 
-The review moment for human eyes: pending sessions with their grant badges,
-per-file changes with before → after hashes and provenance, one-click commit
-or rollback, and a live policy editor. Zero dependencies (stdlib http server),
+The review moment for human eyes, rendered as a document of record rather than
+a dashboard. The register indexes sessions; the dossier is the instrument a
+human signs: the grant envelope the session ran under, a manifest of every
+changed path with its before → after hashes and the tool call that caused it,
+and the disposition — commit or void. Zero dependencies (stdlib http server),
 server-rendered first paint, binds 127.0.0.1 only.
 
 ## Resident mode: daemon, policy, SDK
@@ -148,11 +154,21 @@ attach-race at process start.
 ## Test
 
 ```bash
-bash test/smoke.sh              # 19 core transactional assertions
-bash test/redteam.sh            # 10 jail escape attempts (kernel backend)
-python3 test/daemon_sdk_test.py # 8 daemon + SDK + policy assertions
-python3 test/ui_test.py         # 5 mission-control assertions
+bash test/smoke.sh                # 26 core transactional + replay-safety assertions
+bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
+python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
+python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
+python3 test/ui_test.py           # 9 mission-control API + origin-guard assertions
+python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)
 ```
+
+`ui_test.py` drives the HTTP API; `ui_browser_test.py` loads the page in
+Chromium and asserts on the rendered DOM — console errors, the dossier
+swapping on a register click, attribution reaching the manifest, the drift
+refusal, keyboard navigation, and phone-width layout. The browser suite skips
+cleanly when Playwright or Chromium is absent, so it never blocks a bare
+checkout; it exists because an API-only UI test let a click-breaking
+ReferenceError ship undetected.
 
 Core suite (`smoke.sh`): isolation, diff completeness, provenance hashes,
 byte-identical rollback, exact-replay commit, commit finality, conflict refusal

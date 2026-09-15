@@ -4,6 +4,14 @@ An agent hypervisor — the trust kernel for delegated computing.
 
 ![OVERLORD demo: rm -rf inside a transactional shell, then rollback — everything comes back](assets/demo.gif)
 
+Hand a program — or an AI agent — a fully writable copy of a directory. Let it
+run. Then review every change it made as a hashed, attributed manifest and
+**commit or roll back**, all or nothing. Transactional isolation, provenance,
+and arbitration for untrusted execution — in dependency-free Python, on the
+kernel's own primitives. It ships with a built-in agent (`overlord agent`) that
+runs a model with its hands jailed, so you can watch the whole loop happen
+inside the transaction and sign off on the diff.
+
 ## Thesis
 
 Computing is transitioning to a new operator: machine agents. The OS has no native
@@ -129,17 +137,27 @@ bind only when in use. Every future breach becomes a fix + regression test.
 
 ## Backends
 
+Two overlay backends, auto-detected, kernel preferred. `overlord doctor` names
+the active one — read it before you trust a session.
+
 | | containment | privileges |
 |---|---|---|
-| **kernel** | full — overlay is mounted over the target's own path inside a private mount namespace, so absolute-path writes into the target are contained | needs userns capability grants; on Ubuntu 24.04+ the shipped AppArmor profile provides exactly this, scoped to the overlord binary only |
-| **fuse** | cooperative — command runs with cwd inside the overlay; absolute-path writes to the real target are **not** intercepted | none |
+| **kernel** | full — the overlay is mounted over the target's own path in a private mount namespace, so even absolute-path writes into the target are captured; `--jail` makes the rest of the filesystem cease to exist for the process | unprivileged user namespaces; on Ubuntu 24.04+ the shipped AppArmor profile grants exactly that to the `overlord` binary alone, nothing else weakened |
+| **fuse** | cooperative — the overlay is the working directory, but absolute-path writes elsewhere are not intercepted | none |
 
-Auto-detected, kernel preferred. `overlord doctor` shows what's active.
+The design choice that matters: **the fuse backend refuses `--jail` and
+`--net` rather than pretending to honor them.** A degraded backend that
+silently ignored a containment grant would be worse than no grant at all — so
+it errors, and `doctor` tells you which backend is live before you rely on one.
+The strong guarantee is the kernel backend; the cooperative one is a clearly
+labelled fallback, never a disguise.
 
-**Containment scope:** without `--jail`, the transactional guarantee covers the
-target tree only — the command can still write elsewhere on the filesystem.
-With `--jail` (kernel backend), the rest of the filesystem does not exist for
-the process; add `--net none` to remove the network as well.
+**Threat model, one line.** OVERLORD makes a program's writes to a target tree
+transactional and reviewable, and — with `--jail --net none` on the kernel
+backend — confines the process to that tree with no network. It is *not* a
+defense against kernel exploits or a determined userns escape; it is the
+missing transaction, provenance, and scope layer between an agent harness and
+the OS, built on the kernel's own isolation rather than a new one.
 
 ## Provenance
 
@@ -200,3 +218,18 @@ grants are absent.
 - 2026-09-01 — v0.4: mission control web UI (`overlord ui`) — session review,
   per-file diff with hashes, one-click commit/rollback, policy editor;
   zero-dependency, server-rendered, localhost-only.
+
+  *(v0 → v0.4 landed in one build sprint on 2026-09-01.)*
+- 2026-09-10 → 09-11 — v0.5, two parts. **The agent** — `overlord agent` runs a
+  model (Anthropic / OpenAI, stdlib-only adapters) whose read/write/shell tools
+  execute *inside* the transaction, jailed and offline by default, with every
+  changed path linked back to the tool call that caused it; plus live sessions
+  (open/exec/close, streaming daemon ops, SDK `LiveSession`) and mission control
+  rebuilt as a document of record. **The hardening** — agent jailed by default
+  (an unjailed one had been writing outside the transaction); UI cross-origin /
+  CSRF refusal, CSP, and session-id path-injection guards; four replay-safety
+  fixes (root-naming and kernel `.wh.` whiteouts, drifted-symlink escape,
+  added-dir-over-file, post-snapshot descendants); clean teardown on a failed
+  launch; a Chromium DOM test suite.
+- 2026-09-15 — merged to `master`. SonarCloud quality gate green; 80 assertions
+  across six suites.

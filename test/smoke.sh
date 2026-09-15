@@ -39,8 +39,10 @@ pass() {
 }
 sid_of() {
     local out="$1"
-    grep -oP 'session \K\S+' <<< "$out" | head -1
-    return 0
+    local sid
+    sid=$(grep -oP 'session \K\d{8}-\d{6}-[0-9a-f]{6}(?=\s|$)' <<< "$out" | head -1) || true
+    [[ -n "$sid" ]] || return 1
+    printf '%s\n' "$sid"
 }
 
 reset_target

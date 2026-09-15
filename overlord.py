@@ -239,6 +239,31 @@ def _safe_join(base, rel):
     return path
 
 
+def _safe_replay_join(base, rel):
+    """Join a replay path and reject symlinks in every existing ancestor.
+
+    A lexical containment check alone is insufficient: an existing symlink in
+    the target can redirect a later copy or removal outside the target tree.
+    Inspect with lstat so validation itself never follows such a link. Replay
+    operations handle a symlink at the leaf by unlinking it, not traversing it.
+    """
+    path = _safe_join(base, rel)
+    current = os.path.abspath(base)
+    parts = [] if path == current else os.path.relpath(path, current).split(os.sep)
+    # The leaf may itself be a symlink that replay will unlink or replace
+    # without following. Only ancestors can redirect the operation.
+    for part in [None] + parts[:-1]:
+        if part is not None:
+            current = os.path.join(current, part)
+        try:
+            st = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            break
+        if stat.S_ISLNK(st.st_mode):
+            raise OverlordError(f"error: path escapes its tree: {rel}")
+    return path
+
+
 def load_meta(sid):
     path = session_file(sid, META_FILE)
     if not os.path.isfile(path):
@@ -375,6 +400,8 @@ def _victim_rel(whiteout_path, upper):
     """Relative path a whiteout entry deletes, proven to stay inside the tree
     (a file literally named '.wh...' would otherwise name the parent dir)."""
     victim = os.path.relpath(whiteout_victim(whiteout_path), upper)
+    if victim in ("", os.curdir):
+        raise OverlordError(f"error: path escapes its tree: {victim}")
     _safe_join(upper, victim)
     return victim
 
@@ -397,7 +424,12 @@ def find_conflicts(changes, manifest, target):
 
 def _added_conflicts(rel, manifest, target):
     if rel.endswith("/"):
-        return []  # mkdir -p semantics: pre-existing dir is benign
+        tpath = _safe_join(target, rel.rstrip("/"))
+        if os.path.lexists(tpath) and not (
+            os.path.isdir(tpath) and not os.path.islink(tpath)
+        ):
+            return [("created-externally", rel)]
+        return []  # mkdir -p semantics: a pre-existing directory is benign
     if rel in manifest or os.path.lexists(_safe_join(target, rel)):
         return [("created-externally", rel)]
     return []
@@ -416,7 +448,7 @@ def _touched_conflicts(rel, manifest, target):
 
 
 def _replaced_dir_conflicts(rel, manifest, target):
-    """Every snapshotted file under a wholesale-replaced dir must be intact."""
+    """Every entry under a wholesale-replaced dir must match the snapshot."""
     prefix = rel + os.sep
     found = []
     for mrel, fp in manifest.items():
@@ -425,6 +457,20 @@ def _replaced_dir_conflicts(rel, manifest, target):
         mpath = _safe_join(target, mrel)
         if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
             found.append(("modified-externally", mrel))
+    tpath = _safe_join(target, rel)
+    if os.path.lexists(tpath) and not (
+        os.path.isdir(tpath) and not os.path.islink(tpath)
+    ):
+        found.append(("modified-externally", rel))
+        return found
+    if not os.path.isdir(tpath):
+        return found
+    for root, dirs, files in os.walk(tpath, followlinks=False):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            entry = os.path.join(root, name)
+            mrel = os.path.relpath(entry, target)
+            if mrel not in manifest:
+                found.append(("appeared-after-snapshot", mrel))
     return found
 
 
@@ -554,6 +600,8 @@ def start_ebpf(pid, sdir):
 
 def _copy_entry(src, dst):
     st = os.lstat(src)
+    if os.path.islink(dst):
+        os.remove(dst)
     if stat.S_ISLNK(st.st_mode):
         if os.path.lexists(dst):
             os.remove(dst)
@@ -594,17 +642,33 @@ def _remove_target(path):
 def apply_upper(upper, target):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
+    entries = []
     for root, dirs, files in os.walk(upper):
+        opaque = [d for d in dirs if is_opaque_dir(os.path.join(root, d))]
+        entries.append((root, list(dirs), files))
+        dirs[:] = [d for d in dirs if d not in opaque]
+    # Validate every destination before mutating anything, so a symlink escape
+    # cannot leave a partially replayed target behind.
+    for root, dirs, files in entries:
+        for name in dirs:
+            _safe_replay_join(target, os.path.relpath(os.path.join(root, name), upper))
+        for name in files:
+            fpath = os.path.join(root, name)
+            rel = _victim_rel(fpath, upper) if is_whiteout(fpath) else os.path.relpath(
+                fpath, upper
+            )
+            _safe_replay_join(target, rel)
+    for root, dirs, files in entries:
         opaque = []
         for d in dirs:
             dpath = os.path.join(root, d)
-            tpath = _safe_join(target, os.path.relpath(dpath, upper))
+            tpath = _safe_replay_join(target, os.path.relpath(dpath, upper))
             if is_opaque_dir(dpath):
                 _remove_target(tpath)
                 shutil.copytree(dpath, tpath, symlinks=True)
                 opaque.append(d)
                 applied += 1
-            elif not os.path.isdir(tpath):
+            elif not (os.path.isdir(tpath) and not os.path.islink(tpath)):
                 _remove_target(tpath)
                 os.makedirs(tpath, exist_ok=True)
                 applied += 1
@@ -612,9 +676,12 @@ def apply_upper(upper, target):
         for name in files:
             fpath = os.path.join(root, name)
             if is_whiteout(fpath):
-                _remove_target(_safe_join(target, _victim_rel(fpath, upper)))
+                _remove_target(_safe_replay_join(target, _victim_rel(fpath, upper)))
             else:
-                _copy_entry(fpath, _safe_join(target, os.path.relpath(fpath, upper)))
+                _copy_entry(
+                    fpath,
+                    _safe_replay_join(target, os.path.relpath(fpath, upper)),
+                )
             applied += 1
     return applied
 

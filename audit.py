@@ -22,25 +22,61 @@ owner for work done on its behalf, else the OS user running the command.
 
 import getpass
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 
 import overlord as core
 
 AUDIT_FILE = os.path.join(core.OVERLORD_HOME, "audit.jsonl")
+# The chain's signing key. An unkeyed hash chain is tamper-EVIDENT only to
+# someone who did not also rewrite it: the owner of the file can recompute
+# every hash and forge a clean chain. Keying each link with a MAC means a
+# forger needs this key too, so a rewrite by anyone without it is caught.
+# The key is a local anchor: it defends against a reader who has the log but
+# not the key, and (with `audit checkpoint`) lets the head be witnessed
+# off-box so even the key holder cannot silently truncate or roll back.
+KEY_FILE = os.path.join(core.OVERLORD_HOME, "audit.key")
 GENESIS = "0" * 64
 _LOCK = threading.Lock()
 _STATE = {"seq": None, "hash": None, "size": None}
+
+
+def audit_key(create=True):
+    """The chain key (bytes), generated 0600 on first use. None if absent and
+    not creating, or if it cannot be written (then the chain falls back to a
+    bare hash and `verify` says the log is unsigned)."""
+    try:
+        with open(KEY_FILE) as f:
+            return bytes.fromhex(f.read().strip())
+    except (OSError, ValueError):
+        if not create:
+            return None
+    try:
+        os.makedirs(core.OVERLORD_HOME, exist_ok=True)
+        key = secrets.token_bytes(32)
+        fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key.hex())
+        return key
+    except OSError:
+        return None
 
 
 def _canon(entry):
     return json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _hash(prev, entry):
-    return hashlib.sha256((prev + "\n" + _canon(entry)).encode()).hexdigest()
+def _link(prev, entry, key):
+    """One chain link. A v2 entry is MAC'd with the key; a legacy entry (no
+    'v') keeps the bare sha256 so old logs still verify."""
+    msg = (prev + "\n" + _canon(entry)).encode()
+    if key is not None and entry.get("v") == 2:
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    return hashlib.sha256(msg).hexdigest()
 
 
 def _tail():
@@ -90,10 +126,13 @@ def record(action, **fields):
     try:
         os.makedirs(core.OVERLORD_HOME, exist_ok=True)
         with _LOCK:
+            key = audit_key()
             seq, prev = _tail()
             entry["seq"] = seq + 1
             entry["prev"] = prev
-            entry["hash"] = _hash(prev, entry)
+            if key is not None:
+                entry["v"] = 2
+            entry["hash"] = _link(prev, entry, key)
             with open(AUDIT_FILE, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 f.flush()
@@ -130,10 +169,14 @@ def entries(n=50, action=None, since=None):
 
 
 def verify():
-    """Walk the whole chain. {'ok', 'entries', 'broken_at', 'reason'}."""
+    """Walk the whole chain. {'ok', 'entries', 'broken_at', 'reason', 'keyed'}.
+    `keyed` is true when the newest entry is MAC-signed. A signed entry with
+    no key present, or an unsigned entry after signing has begun (a downgrade),
+    breaks the chain."""
     if not os.path.isfile(AUDIT_FILE):
-        return {"ok": True, "entries": 0, "broken_at": None, "reason": "no audit log yet"}
-    prev, n = GENESIS, 0
+        return {"ok": True, "entries": 0, "broken_at": None, "reason": "no audit log yet", "keyed": False}
+    key = audit_key(create=False)
+    prev, n, signed_started, last_signed = GENESIS, 0, False, False
     with open(AUDIT_FILE) as f:
         for lineno, line in enumerate(f, 1):
             if not line.strip():
@@ -141,18 +184,49 @@ def verify():
             try:
                 e = json.loads(line)
             except ValueError:
-                return {"ok": False, "entries": n, "broken_at": lineno, "reason": "unparseable line"}
+                return {"ok": False, "entries": n, "broken_at": lineno, "reason": "unparseable line", "keyed": last_signed}
             h = e.get("hash")
             body = {k: v for k, v in e.items() if k != "hash"}
             if e.get("seq") != n + 1:
                 return {"ok": False, "entries": n, "broken_at": lineno,
-                        "reason": f"sequence jumps to {e.get('seq')} (expected {n + 1})"}
+                        "reason": f"sequence jumps to {e.get('seq')} (expected {n + 1})", "keyed": last_signed}
             if e.get("prev") != prev:
-                return {"ok": False, "entries": n, "broken_at": lineno, "reason": "previous hash mismatch"}
-            if _hash(prev, body) != h:
-                return {"ok": False, "entries": n, "broken_at": lineno, "reason": "entry hash mismatch"}
-            prev, n = h, n + 1
-    return {"ok": True, "entries": n, "broken_at": None, "reason": None}
+                return {"ok": False, "entries": n, "broken_at": lineno, "reason": "previous hash mismatch", "keyed": last_signed}
+            signed = e.get("v") == 2
+            if signed:
+                if key is None:
+                    return {"ok": False, "entries": n, "broken_at": lineno,
+                            "reason": "entry is signed but the audit key is missing", "keyed": last_signed}
+                signed_started = True
+            elif signed_started:
+                return {"ok": False, "entries": n, "broken_at": lineno,
+                        "reason": "unsigned entry after signing began (downgrade)", "keyed": last_signed}
+            if _link(prev, body, key) != h:
+                return {"ok": False, "entries": n, "broken_at": lineno,
+                        "reason": "entry signature mismatch" if signed else "entry hash mismatch", "keyed": last_signed}
+            prev, n, last_signed = h, n + 1, signed
+    return {"ok": True, "entries": n, "broken_at": None, "reason": None, "keyed": last_signed}
+
+
+def head():
+    """The chain head to witness off-box: {seq, hash, keyed}. Empty at seq 0."""
+    seq, h = _tail()
+    return {"seq": seq, "hash": None if seq == 0 else h, "keyed": verify().get("keyed", False)}
+
+
+def check_pin(pinned):
+    """Does the live chain still carry the witnessed head? Catches a truncation
+    or rewrite at or below the pinned point even by the key holder. `pinned` is
+    a prior head(): {'seq', 'hash'}."""
+    want_seq, want_hash = pinned.get("seq"), pinned.get("hash")
+    if not want_seq or not want_hash:
+        return {"ok": True, "reason": "empty pin"}
+    for e in entries(n=0):
+        if e.get("seq") == want_seq:
+            if e.get("hash") == want_hash:
+                return {"ok": True, "reason": None}
+            return {"ok": False, "reason": f"entry {want_seq} was rewritten since the pin"}
+    return {"ok": False, "reason": f"entry {want_seq} is gone — the log was truncated below the pin"}
 
 
 # ---------------------------------------------------------------- cli
@@ -161,12 +235,42 @@ def verify():
 def cmd_audit(args):
     if args.audit_cmd == "verify":
         v = verify()
-        if v["ok"]:
-            print(f"audit chain intact: {v['entries']} entries")
-            return 0
-        print(f"AUDIT CHAIN BROKEN at line {v['broken_at']} ({v['reason']}); "
-              f"{v['entries']} entries verified before it")
-        return 1
+        if not v["ok"]:
+            print(f"AUDIT CHAIN BROKEN at line {v['broken_at']} ({v['reason']}); "
+                  f"{v['entries']} entries verified before it")
+            return 1
+        state = "signed" if v.get("keyed") else "UNSIGNED (no key — tamper-evident only to a reader without the log)"
+        print(f"audit chain intact: {v['entries']} entries, {state}")
+        pin = getattr(args, "pin", None)
+        if pin:
+            try:
+                with open(pin) as f:
+                    pinned = json.load(f)
+            except (OSError, ValueError) as e:
+                print(f"pin unreadable: {e}")
+                return 1
+            p = check_pin(pinned)
+            if not p["ok"]:
+                print(f"PIN MISMATCH: {p['reason']}")
+                return 1
+            print(f"pin ok: head still carries witnessed entry {pinned.get('seq')}")
+        return 0
+    if args.audit_cmd == "checkpoint":
+        h = head()
+        text = json.dumps(h)
+        dest = getattr(args, "file", None)
+        if dest:
+            with open(dest, "w") as f:
+                f.write(text + "\n")
+            print(f"checkpoint written: entry {h['seq']} → {dest} (store it off-box to witness the head)")
+        else:
+            print(text)
+        return 0
+    if args.audit_cmd == "key":
+        k = audit_key(create=False)
+        print(f"audit key: {KEY_FILE}" + ("" if k else " (none yet — created on the first recorded act)"))
+        print("copy it off-box: a rewrite of the log needs this key, and off-box it survives a host compromise")
+        return 0
     rows = entries(args.n, args.action)
     if not rows:
         print("no audit entries")
@@ -190,7 +294,11 @@ def _short(v):
 def add_audit_parser(sub):
     pa = sub.add_parser("audit", help="the tamper-evident log of consequential acts")
     asub = pa.add_subparsers(dest="audit_cmd")
-    asub.add_parser("verify", help="walk the hash chain")
+    pv = asub.add_parser("verify", help="walk the signed chain; optionally check a witnessed head")
+    pv.add_argument("--pin", metavar="FILE", help="a prior `audit checkpoint` file to check the head against")
+    pc = asub.add_parser("checkpoint", help="print the chain head to witness off-box (or write it to a file)")
+    pc.add_argument("file", nargs="?", help="write the head here instead of stdout")
+    asub.add_parser("key", help="where the chain-signing key lives; copy it off-box")
     pa.add_argument("-n", type=int, default=50)
     pa.add_argument("--action", help="only actions with this prefix (session., auth., users. ...)")
     pa.add_argument("--json", action="store_true")

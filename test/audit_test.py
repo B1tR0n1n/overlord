@@ -101,7 +101,67 @@ try:
     out = cli("audit", "--action", "session.").stdout
     if s1 not in out or "session.commit " not in out:
         fail(f"audit listing:\n{out}")
-    ok("open, rewind, fork, commit, refused commit, rollback: chained, with actor and facts")
+    if not v.get("keyed") or "signed" not in cli("audit", "verify").stdout:
+        fail(f"chain is not signed: {v} / {cli('audit', 'verify').stdout!r}")
+    if oct(os.stat(audit.KEY_FILE).st_mode)[-3:] != "600":
+        fail("audit key is not mode 0600")
+    # the head can be witnessed off-box and a pin binds the live log to it
+    pin = os.path.join(HOME, "pin.json")
+    if cli("audit", "checkpoint", pin).returncode != 0:
+        fail("checkpoint failed")
+    with open(pin) as f:
+        h = json.load(f)
+    if h["seq"] != len(rows) or not h["hash"] or not h["keyed"]:
+        fail(f"checkpoint head: {h}")
+    if cli("audit", "verify", "--pin", pin).returncode != 0:
+        fail("verify --pin should pass against a fresh checkpoint")
+    if not audit.check_pin(h)["ok"] or audit.check_pin({"seq": 1, "hash": "deadbeef"})["ok"]:
+        fail("check_pin does not bind to the witnessed hash")
+    ok("open, rewind, fork, commit, refused commit, rollback: chained, signed, with actor and facts")
+
+    # 1b. keying is the anchor: a rewrite without the key is caught, a downgrade
+    #     to an unsigned entry is caught, and a truncation below a pin is caught
+    keyed_lines = open(audit.AUDIT_FILE).read().splitlines()
+    import hashlib as _h
+    def bare(entry):
+        b = {k: v for k, v in entry.items() if k != "hash"}
+        return _h.sha256((entry["prev"] + "\n" + json.dumps(b, sort_keys=True, separators=(",", ":"), ensure_ascii=False)).encode()).hexdigest()
+    # forge the last entry keeping its signed marker: the MAC will not match
+    forged = list(keyed_lines)
+    e = json.loads(forged[-1]); e["target"] = "/tmp/evil"; e["hash"] = bare(e)
+    forged[-1] = json.dumps(e, ensure_ascii=False)
+    open(audit.AUDIT_FILE, "w").write("\n".join(forged) + "\n")
+    audit._STATE.update(seq=None, hash=None, size=None)
+    vd = audit.verify()
+    if vd["ok"] or "signature mismatch" not in vd["reason"]:
+        fail(f"a keyless rewrite of a signed entry was not caught: {vd}")
+    # strip the signed marker to fake an unsigned entry: a downgrade after signing
+    forged = list(keyed_lines)
+    e = json.loads(forged[-1]); e.pop("v", None); e["target"] = "/tmp/evil"; e["hash"] = bare(e)
+    forged[-1] = json.dumps(e, ensure_ascii=False)
+    open(audit.AUDIT_FILE, "w").write("\n".join(forged) + "\n")
+    audit._STATE.update(seq=None, hash=None, size=None)
+    vd = audit.verify()
+    if vd["ok"] or "downgrade" not in vd["reason"]:
+        fail(f"a downgrade to an unsigned entry was not caught: {vd}")
+    # with the key deleted, a signed entry can no longer be validated at all
+    open(audit.AUDIT_FILE, "w").write("\n".join(keyed_lines) + "\n")
+    saved = open(audit.KEY_FILE).read(); os.unlink(audit.KEY_FILE)
+    audit._STATE.update(seq=None, hash=None, size=None)
+    vd = audit.verify()
+    if vd["ok"] or "key is missing" not in vd["reason"]:
+        fail(f"a signed chain with no key should not verify: {vd}")
+    open(audit.KEY_FILE, "w").write(saved); os.chmod(audit.KEY_FILE, 0o600)
+    # a truncation below the pin is caught even though the shortened chain is self-consistent
+    open(audit.AUDIT_FILE, "w").write("\n".join(keyed_lines[:2]) + "\n")
+    audit._STATE.update(seq=None, hash=None, size=None)
+    if audit.verify()["ok"] is not True:
+        fail("a clean prefix of a signed chain should still verify on its own")
+    if audit.check_pin(h)["ok"] or cli("audit", "verify", "--pin", pin).returncode != 1:
+        fail("a truncation below the pinned head was not caught")
+    open(audit.AUDIT_FILE, "w").write("\n".join(keyed_lines) + "\n")
+    audit._STATE.update(seq=None, hash=None, size=None)
+    ok("the chain is keyed: a keyless rewrite, a downgrade and a truncation below a witnessed pin are all caught")
 
     # 2. an altered line breaks the chain from that point on
     with open(audit.AUDIT_FILE) as f:

@@ -109,6 +109,9 @@ overlord export <session> -o review.ovl              # one signed file: record, 
 overlord import review.ovl -t /srv/app               # replay its changes here as a new pending session
 overlord cost                                        # what the models spent, by model / account / day
 overlord cost budget --day-usd 20 --month-usd 500    # lines no conversation crosses
+overlord audit verify                                # walk the signed chain
+overlord audit checkpoint pin.json                   # witness the head off-box
+overlord audit verify --pin pin.json                 # prove the live log still carries it
 overlord audit verify                                # the hash chain of every consequential act
 overlord gc --dry-run                                # what retention would prune
 
@@ -407,10 +410,29 @@ commit, refused commit, rollback, rewind, fork, review verdict, connector
 decision, memory acceptance, connector or policy or budget change, sign-in
 and failed sign-in, account change, budget stop, gc — from the CLI, the
 daemon and the web UI alike, since they share the engine. Each line carries
-the hash of the line before it; `overlord audit verify` walks the chain
-and names the first altered or missing line, `doctor` checks it, the
-workspace shows it to admins and viewers. The actor is the signed-in
-account, else the session's owner, else the OS user.
+a MAC over the line before it, keyed by `~/.overlord/audit.key` (mode 0600,
+made on first use). `overlord audit verify` walks the chain and names the
+first altered or missing line, `doctor` checks it, the workspace shows it to
+admins and viewers. The actor is the signed-in account, else the session's
+owner, else the OS user.
+
+The key is what makes the log an anchor rather than a self-consistent
+story. An unkeyed hash chain is tamper-evident only to someone who did not
+also rewrite it — the file's owner can recompute every hash. Keying each
+link means a forger needs the key too: a rewrite without it is caught, and
+so is a *downgrade* that strips the signatures to fake an unkeyed log.
+Verify says `signed` or `UNSIGNED` so a missing key never passes silently.
+
+Two honest limits follow. First, a local key defends against anyone who has
+the log but not the key; it does not, by itself, stop the key's holder.
+So copy it off-box (`overlord audit key` says where it is) and, for the
+holder-as-attacker case, **witness the head**: `overlord audit checkpoint`
+emits `{seq, hash}`, you store it somewhere the host cannot reach, and
+`overlord audit verify --pin <file>` proves the live log still carries that
+entry — catching a truncation or rewrite at or below it even by someone
+with the key. A remote witness (another host, a timestamp authority, a
+transparency log) is the same idea; the checkpoint token is what you feed
+it.
 
 ## Retention and deployment
 
@@ -1000,7 +1022,15 @@ grants are absent.
   Claude 5-family list prices. A `net=host` jail resolves names: the
   resolver behind a symlink out of `/etc` (WSL2, systemd-resolved) is bound
   at its real path, read-only. The fuse probe requires `/dev/fuse` and
-  `doctor` names the missing piece; suites SKIP without a backend. `--audit`
+  `doctor` names the missing piece; suites SKIP without a backend.
+- 2026-09-16 — v0.26: the audit chain is signed. Each link is a MAC keyed by
+  `~/.overlord/audit.key` (0600), so a rewrite or a downgrade to an unsigned
+  chain is caught, not just a partial edit; `verify` reports `signed` /
+  `UNSIGNED`. `audit checkpoint` emits the head and `audit verify --pin`
+  binds the live log to a witnessed head, catching a truncation or rewrite
+  even by the key holder when the pin is kept off-box. (Review verdicts were
+  already bound to a fingerprint of the exact diff; keying the log now covers
+  those records too.) `--audit`
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

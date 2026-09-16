@@ -2762,7 +2762,8 @@ def cmd_doctor(args):
                    "cert.pem present" if has_tls else "none (overlord tls selfsign, or bring your own)",
                    True))
     v = audit_mod.verify()
-    checks.append(("audit chain", f"intact, {v['entries']} entries" if v["ok"]
+    checks.append(("audit chain", (f"intact, {v['entries']} entries, "
+                                    + ("signed" if v.get("keyed") else "UNSIGNED")) if v["ok"]
                    else f"BROKEN at line {v['broken_at']}: {v['reason']}", v["ok"]))
     checks.append(("resource limits (memory / pids / cpu per session)", limits_backend(), True))
     du = retention_mod.usage()
@@ -2782,7 +2783,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.25.0"
+VERSION = "0.26.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 

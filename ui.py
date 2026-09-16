@@ -18,6 +18,7 @@ import re
 import secrets
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
@@ -916,6 +917,25 @@ f.addEventListener('submit', async ev => { ev.preventDefault(); e.textContent=''
 class _Server(ThreadingHTTPServer):
     tls = False
     hosts = set()
+    rate_limit = 0        # requests per minute per address; 0 = off
+    _buckets = {}
+    _bucket_lock = threading.Lock()
+
+    def over_limit(self, remote):
+        """A fixed one-minute window per address — enough to stop a runaway
+        script or a scraper without touching a browser polling a chat."""
+        if not self.rate_limit:
+            return False
+        now = int(time.time() // 60)
+        with self._bucket_lock:
+            win, n = self._buckets.get(remote, (now, 0))
+            if win != now:
+                win, n = now, 0
+            n += 1
+            self._buckets[remote] = (win, n)
+            if len(self._buckets) > 10000:
+                self._buckets = {k: v for k, v in self._buckets.items() if v[0] == now}
+        return n > self.rate_limit
 
     def handle_error(self, request, client_address):
         # a plain-HTTP probe at a TLS port, or a client that hung up: one
@@ -1032,6 +1052,9 @@ class Handler(BaseHTTPRequestHandler):
     def _guard(self, state_changing):
         if not self._host_ok():
             self._send({"error": "bad host header"}, 421)
+            return False
+        if getattr(self.server, "over_limit", None) and self.server.over_limit(self.client_address[0]):
+            self._send({"error": "too many requests; slow down"}, 429)
             return False
         if state_changing and not self._origin_ok():
             self._send({"error": "cross-origin request refused"}, 403)
@@ -1387,7 +1410,7 @@ LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 
 def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None,
-                log_json=False):
+                log_json=False, rate_limit=3000):
     """The listening server. Beyond loopback it insists on accounts and TLS:
     a workspace that can commit an agent's changes to a real tree is not
     something to leave on a LAN behind a Host check."""
@@ -1419,6 +1442,8 @@ def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=
     server.hosts = allowed
     server.tls = bool(tls_cert)
     server.log_json = bool(log_json)
+    server.rate_limit = max(0, int(rate_limit or 0))
+    server._buckets = {}
     if tls_cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1432,8 +1457,9 @@ def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=
     return server
 
 
-def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None, log_json=False):
-    server = make_server(port, bind, tls_cert, tls_key, hosts, log_json)
+def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None, log_json=False,
+          rate_limit=3000):
+    server = make_server(port, bind, tls_cert, tls_key, hosts, log_json, rate_limit)
     scheme = "https" if server.tls else "http"
     shown = bind if bind in LOOPBACK else (sorted(server.hosts) or [bind])[0].split(":")[0]
     who = ("accounts required" if auth.enabled() else "no accounts — local person is the operator")

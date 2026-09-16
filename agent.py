@@ -320,15 +320,45 @@ class Attribution:
 # ---------------------------------------------------------------- the loop
 
 
+COMPACT_AT = 0.75          # of the context window: compact after a call this large
+COMPACT_KEEP = 6           # recent messages carried across a compaction
+COMPACT_PROMPT = ("You are about to lose the older part of this conversation. Write a handover "
+                  "note for yourself to continue the task without it: the task; decisions made "
+                  "and why; every file created, changed or deleted, with paths; commands that "
+                  "matter (how tests run); what remains to be done; anything that bit you. Be "
+                  "specific and terse. Do not call tools; reply with the note only.")
+
+
+def _tail(messages, keep=COMPACT_KEEP):
+    """The last `keep` messages, trimmed so no tool result is orphaned."""
+    tail = messages[-keep:] if keep else []
+    while tail and tail[0]["role"] == "tool":
+        tail = tail[1:]
+    return tail
+
+
+def _apply_compaction(task, summary, messages, kept):
+    """The message list after a compaction: task + handover in one user
+    message, then the kept tail — the same shape on the live run and on
+    replay, which is why `kept` is written to the transcript."""
+    head = {"role": "user", "content": f"TASK: {task}\n\nCONTEXT (older turns compacted by "
+                                       f"OVERLORD; your own handover note):\n{summary}"}
+    return [head] + (messages[-kept:] if kept else [])
+
+
 def _restore_messages(events):
     """Rebuild the neutral message list from a transcript, exactly as the
     model saw it. A turn cut short by a rewind keeps only the tool calls
-    that still have results, so every provider's pairing rule holds."""
-    messages, turn = [], 0
+    that still have results, so every provider's pairing rule holds. A
+    compaction event replays the same cut the live run made."""
+    messages, turn, task = [], 0, ""
     for ev in events:
         t = ev.get("type")
         if t == "task":
-            messages.append({"role": "user", "content": ev.get("text", "")})
+            task = ev.get("text", "")
+            messages.append({"role": "user", "content": task})
+        elif t == "compaction":
+            messages = _apply_compaction(task, ev.get("summary", ""), messages, int(ev.get("kept") or 0))
         elif t == "assistant":
             turn = max(turn, ev.get("turn", 0))
             messages.append({"role": "assistant", "content": ev.get("text", ""),
@@ -506,6 +536,9 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                 live.meta["usage"]["usd"] = round((live.meta["usage"].get("usd") or 0) + usd, 6)
             cost_mod.ledger_append(live.sid, live.meta.get("owner"), model_name, reply.usage, usd)
             ov.save_meta(live.sid, live.meta)
+            limit = getattr(getattr(provider, "config", None), "context_limit", None) \
+                or _providers.ModelConfig.DEFAULT_CONTEXT
+            compact_due = reply.usage.get("in", 0) >= COMPACT_AT * limit
             messages.append({"role": "assistant", "content": reply.text,
                              "tool_calls": reply.tool_calls})
             if reply.text:
@@ -573,6 +606,9 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                     record({"type": "skill_use", "turn": turn, "name": name, "source": source,
                             "file": rel})
                 recorded_skill_uses = len(tools.skill_uses)
+            if compact_due:
+                messages = _compact(live, provider, system_prompt, messages, task, turn,
+                                    reply.usage.get("in", 0), record)
         record({"type": "done", "reason": "max_turns", "turn": start_turn + max_turns - 1,
                 "usage": live.meta["usage"]})
         return final
@@ -583,6 +619,31 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         transcript.close()
         if registry:
             registry.close()
+
+
+def _compact(live, provider, system_prompt, messages, task, turn, in_tokens, record):
+    """The model writes its own handover note; the older turns are dropped.
+    Recorded on the transcript (summary, what was kept) so a resume sees
+    the same conversation the model does; priced on the ledger."""
+    ask = messages + [{"role": "user", "content": COMPACT_PROMPT}]
+    reply = provider.complete(system_prompt, ask, tools=None)
+    summary = " ".join((reply.text or "").split()) or "(the model wrote no handover note)"
+    model_name = getattr(provider, "model", "") or ""
+    usd = cost_mod.cost_of(model_name, reply.usage)
+    live.meta["usage"]["in"] += reply.usage.get("in", 0)
+    live.meta["usage"]["out"] += reply.usage.get("out", 0)
+    if usd is not None:
+        live.meta["usage"]["usd"] = round((live.meta["usage"].get("usd") or 0) + usd, 6)
+    cost_mod.ledger_append(live.sid, live.meta.get("owner"), model_name, reply.usage, usd,
+                           kind="compaction")
+    kept = len(_tail(messages[1:]))          # the task itself rides in the head
+    new = _apply_compaction(task, summary, messages, kept)
+    record({"type": "compaction", "turn": turn, "before_tokens": in_tokens,
+            "messages_before": len(messages), "kept": kept, "summary": summary,
+            "usage": {"in": reply.usage.get("in", 0), "out": reply.usage.get("out", 0)}})
+    live.meta.setdefault("compactions", []).append({"turn": turn, "before_tokens": in_tokens})
+    ov.save_meta(live.sid, live.meta)
+    return new
 
 
 def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=None):
@@ -766,6 +827,9 @@ def _show(ev):
               f"(overlord memory accept <session> --id {ev['id']})")
     elif t == "skills":
         print(f"  ◇ skills offered: {', '.join(s['name'] for s in ev['offered'])}")
+    elif t == "compaction":
+        print(f"  ⌁ context compacted at turn {ev['turn']} ({ev['before_tokens']} tokens in the "
+              f"last call); {ev['kept']} recent message(s) kept, handover note on the transcript")
     elif t == "skill_use":
         print(f"  ◆ loaded skill {ev['name']} ({ev['source']}"
               + (f", {ev['file']}" if ev.get("file") != "SKILL.md" else "") + ")")

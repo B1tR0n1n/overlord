@@ -2334,7 +2334,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2713,7 +2713,7 @@ def cmd_ui(args):
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import ui
     return ui.serve(args.port, bind=args.bind, tls_cert=args.tls_cert, tls_key=args.tls_key,
-                    hosts=args.host, log_json=args.log_json)
+                    hosts=args.host, log_json=args.log_json, rate_limit=args.rate_limit)
 
 
 # ---------------------------------------------------------------- main
@@ -2771,6 +2771,8 @@ def main(argv=None):
     pu.add_argument("--host", action="append",
                     help="a hostname browsers will use (Host header allowlist); repeatable")
     pu.add_argument("--log-json", action="store_true", help="one JSON line per request on stderr")
+    pu.add_argument("--rate-limit", type=int, default=3000,
+                    help="requests per minute per address (0 = off)")
     pu.set_defaults(fn=cmd_ui)
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import auth as auth_mod

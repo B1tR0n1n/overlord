@@ -78,11 +78,13 @@ class ModelConfig:
     """Generation knobs. None means 'do not send' — every adapter applies only
     what is set, so a knob a model rejects is never on the wire by default."""
     FIELDS = ("max_tokens", "temperature", "top_p", "stop", "effort", "thinking",
-              "system_extra", "stream", "fallbacks", "timeout")
+              "system_extra", "stream", "fallbacks", "timeout", "context_limit")
+    DEFAULT_CONTEXT = 128_000     # tokens; compaction runs at 75% of this
 
     def __init__(self, max_tokens=None, temperature=None, top_p=None, stop=None,
                  effort=None, thinking=None, system_extra=None, stream=True,
-                 fallbacks=True, timeout=600):
+                 fallbacks=True, timeout=600, context_limit=None):
+        self.context_limit = int(context_limit) if context_limit else self.DEFAULT_CONTEXT
         self.max_tokens = int(max_tokens) if max_tokens else None
         self.temperature = float(temperature) if temperature not in (None, "") else None
         self.top_p = float(top_p) if top_p not in (None, "") else None
@@ -104,7 +106,7 @@ class ModelConfig:
                    top_p=d.get("top_p"), stop=stop, effort=d.get("effort"),
                    thinking=d.get("thinking"), system_extra=d.get("system_extra"),
                    stream=d.get("stream", True), fallbacks=d.get("fallbacks", True),
-                   timeout=d.get("timeout") or 600)
+                   timeout=d.get("timeout") or 600, context_limit=d.get("context_limit"))
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.FIELDS}

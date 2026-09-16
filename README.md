@@ -236,6 +236,11 @@ state / nonce / PKCE round-trip — the ID token's claims are checked, its
 signature is not (no RSA in the standard library), and the same identity
 is confirmed by `userinfo` directly from the provider.
 
+Logins outlive a restart of `overlord ui` (a mode-600 file keyed by the
+cookie's hash, never the cookie), and a per-address rate limit
+(`--rate-limit`, 3000 requests a minute by default) answers 429 to a
+runaway script.
+
 Beyond loopback the server refuses to start without both accounts and TLS
 (`--bind 0.0.0.0 --tls-cert … --tls-key …`; `overlord tls selfsign` makes a
 certificate with openssl for a private deployment). A `--host name`
@@ -264,6 +269,19 @@ skill with the `skill` tool when its description fits the task, so the text
 is not in the prompt until it is needed. A project skill shadows a machine
 skill of the same name entirely. Every load is a transcript event; the
 session records what it was offered. Two examples ship in `skills/`.
+
+## Long conversations
+
+A conversation's message list grows with every turn; without a rule it
+grows until the model refuses it. The rule: when a call has used three
+quarters of the context window (a generation setting, default 128k
+tokens), the agent writes a **handover note** — the task, decisions, every
+file touched, what remains, what bit it — the older turns are dropped, and
+the note plus the last few messages become the conversation. The cut is
+itself a transcript event (`compaction`: the note, what was kept, the
+tokens that triggered it), the note's call is on the ledger, and a resume
+rebuilds exactly the view the model had — nothing the model was told is
+lost from the record, only from its context.
 
 ## Cost
 
@@ -542,6 +560,7 @@ python3 test/cost_test.py         # 6 cost assertions: prices, ledger, policy / 
 python3 test/audit_test.py        # 5 audit assertions: chained acts, tamper detection, actors + healthz, gc, --log-json + doctor
 python3 test/skills_test.py       # 6 skills assertions: catalogue + shadowing, jailed / host loads, authored in-transaction, policy, CLI, workspace
 python3 test/sso_test.py          # 5 SSO assertions against a fake provider: config, PKCE round-trip, role mapping + domains, password refusal, audit
+python3 test/session_test.py      # 5 long-conversation assertions: compaction + record, exact resume replay, the window setting, durable logins, rate limit
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -698,3 +717,9 @@ grants are absent.
   groups claim or a default, allowed domains, SSO accounts without
   passwords; `overlord sso set|show|test|off`; a sign-in button; every
   sign-in, refusal and change audited. 174 assertions across eighteen suites.
+- 2026-09-16 — v0.16: long conversations. Context compaction: at three
+  quarters of a configurable window the agent writes a handover note,
+  older turns are dropped, the cut is a transcript event and a resume
+  replays it exactly; the note's call is on the ledger. Logins persist
+  across restarts (hashed at rest); a per-address rate limit. 179
+  assertions across nineteen suites.

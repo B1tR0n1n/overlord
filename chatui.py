@@ -44,9 +44,9 @@ DEFAULT_SETTINGS = {"provider": "anthropic", "model": "", "jail": True,
                     # generation knobs; blank means "do not send"
                     "gen": {"max_tokens": 16000, "temperature": "", "top_p": "", "stop": "",
                             "effort": "", "thinking": "", "system_extra": "",
-                            "stream": True, "fallbacks": True}}
+                            "stream": True, "fallbacks": True, "context_limit": ""}}
 GEN_KEYS = ("max_tokens", "temperature", "top_p", "stop", "effort", "thinking",
-            "system_extra", "stream", "fallbacks")
+            "system_extra", "stream", "fallbacks", "context_limit")
 PROVIDER_KEYS = ("model", "base_url", "headers", "azure_api_version")
 GLYPH = {"added": "+", "modified": "~", "deleted": "−", "replaced-dir": "±"}
 MAX_TAIL = 1200                   # chars of a tool's output shown in the stream
@@ -172,6 +172,14 @@ def save_settings(incoming):
         g["system_extra"] = str(g.get("system_extra") or "")
         g["stream"] = bool(g.get("stream", True))
         g["fallbacks"] = bool(g.get("fallbacks", True))
+        cl = g.get("context_limit")
+        if cl in (None, ""):
+            g["context_limit"] = ""
+        else:
+            try:
+                g["context_limit"] = max(8000, int(cl))
+            except (TypeError, ValueError):
+                raise core.OverlordError("error: context window must be a whole number of tokens or blank")
         s["gen"] = g
     if s.get("net") not in ("none", "host"):
         raise core.OverlordError("error: net must be none or host")
@@ -363,6 +371,10 @@ def _map_event(ev):
     if t == "skills":
         return {"type": "note", "text": "Skills offered: " + ", ".join(
             s["name"] for s in ev.get("offered") or [])}
+    if t == "compaction":
+        return {"type": "note", "text": f"Context compacted at step {ev.get('turn')}: the agent wrote a "
+                f"handover note and kept its last {ev.get('kept')} messages "
+                f"({ev.get('before_tokens')} tokens in the previous call)."}
     if t == "skill_use":
         return {"type": "note", "text": f"Loaded skill {ev.get('name')} ({ev.get('source')})"
                 + (f" — {ev.get('file')}" if ev.get("file") not in (None, "SKILL.md") else "")}
@@ -525,6 +537,9 @@ def messages_from_transcript(sid):
             elif t == "skills":
                 msgs.append({"type": "note", "text": "Skills offered: " + ", ".join(
                     s["name"] for s in ev.get("offered") or [])})
+            elif t == "compaction":
+                msgs.append({"type": "note", "text": f"Context compacted at step {ev.get('turn')}: the agent "
+                             f"wrote a handover note and kept its last {ev.get('kept')} messages."})
             elif t == "skill_use":
                 msgs.append({"type": "note", "text": f"Loaded skill {ev.get('name')} ({ev.get('source')})"
                              + (f" — {ev.get('file')}" if ev.get("file") not in (None, "SKILL.md") else "")})
@@ -999,6 +1014,9 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label class="toggle"><input type="checkbox" id="g-fallbacks"> Refusal fallbacks (Claude native)</label>
         <div class="desc">If Claude declines, the API retries on a fallback model in the same call.</div></div>
     </div>
+    <div class="field"><label>Context window (tokens)</label>
+      <input id="g-context" type="number" min="8000" step="1000" placeholder="128000">
+      <div class="desc">When a call uses three quarters of this, the agent writes a handover note and older turns are dropped; the note is on the transcript.</div></div>
     </details>
     <div class="field"><label>Working folder</label>
       <input id="s-workdir" type="text">
@@ -1385,6 +1403,7 @@ async function openSettings(msg){
   $('g-system').value = g.system_extra || '';
   $('g-stream').checked = g.stream !== false;
   $('g-fallbacks').checked = g.fallbacks !== false;
+  $('g-context').value = g.context_limit || '';
   fillProvider(SETTINGS.provider);
   renderConnectors();
   loadMemory();
@@ -1420,7 +1439,7 @@ async function saveSettings(){
       thinking:$('g-thinking').value, stop:$('g-stop').value,
       temperature:$('g-temperature').value.trim(), top_p:$('g-topp').value.trim(),
       system_extra:$('g-system').value, stream:$('g-stream').checked,
-      fallbacks:$('g-fallbacks').checked}};
+      fallbacks:$('g-fallbacks').checked, context_limit:$('g-context').value.trim()}};
   const key = $('s-key').value.trim(); if(key) body.key=key;
   const r = await j('/api/settings',{method:'PUT',body:JSON.stringify(body)});
   if(r.error){ $('setmsg').textContent=r.error; $('setmsg').className='act-msg bad'; return; }

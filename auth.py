@@ -62,8 +62,9 @@ LOGIN_LOCK = 60                  # ... lock the (address, name) pair this long
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 _SCRYPT = dict(n=2 ** 14, r=8, p=1, dklen=32)
 
+SESSIONS_FILE = os.path.join(core.OVERLORD_HOME, "sessions.json")
 _LOCK = threading.Lock()
-_SESSIONS = {}                   # cookie token -> {user, role, created}
+_SESSIONS = {}                   # sha256(cookie token) -> {user, role, created}
 _FAILS = {}                      # (remote, user) -> [timestamps]
 _LOCAL = threading.local()       # the principal of the request being served
 
@@ -236,9 +237,7 @@ def external_login(ident, role, issuer):
                 u["role"] = role
         _save(db)
     os.makedirs(os.path.join(USERS_DIR, ident), mode=0o700, exist_ok=True)
-    tok = secrets.token_urlsafe(32)
-    with _LOCK:
-        _SESSIONS[tok] = {"user": ident, "role": u["role"], "created": time.time()}
+    tok = _open_session(ident, u["role"])
     audit.record("auth.sso_login", actor=f"{ident}@sso", user=ident, role=u["role"],
                  provisioned=created or None, issuer=issuer)
     return tok, {"user": ident, "role": u["role"], "via": "sso"}
@@ -316,12 +315,56 @@ def revoke_token(prefix, owner=None):
 
 
 # ---------------------------------------------------------------- sessions
+#
+# Logins outlive a restart of `overlord ui`: the table is written to a
+# mode-600 file keyed by the cookie's hash, so the file never holds a
+# usable cookie. Loaded once at import; every change writes through.
+
+
+def _sid(tok):
+    return hashlib.sha256((tok or "").encode()).hexdigest()
+
+
+def _load_sessions():
+    try:
+        with open(SESSIONS_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    with _LOCK:
+        _SESSIONS.clear()
+        for k, s in (saved or {}).items():
+            if isinstance(s, dict) and now - float(s.get("created", 0)) <= SESSION_TTL:
+                _SESSIONS[k] = s
+
+
+def _save_sessions():
+    """Call with _LOCK held."""
+    try:
+        os.makedirs(core.OVERLORD_HOME, exist_ok=True)
+        tmp = SESSIONS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(_SESSIONS, f)
+        os.replace(tmp, SESSIONS_FILE)
+    except OSError:
+        pass
+
+
+def _open_session(name, role):
+    tok = secrets.token_urlsafe(32)
+    with _LOCK:
+        _SESSIONS[_sid(tok)] = {"user": name, "role": role, "created": time.time()}
+        _save_sessions()
+    return tok
 
 
 def _drop_sessions(name):
     with _LOCK:
         for tok in [t for t, s in _SESSIONS.items() if s["user"] == name]:
             del _SESSIONS[tok]
+        _save_sessions()
 
 
 def _locked(remote, name, now):
@@ -349,17 +392,18 @@ def login(name, password, remote="?"):
             _FAILS.setdefault((remote, name), []).append(now)
         audit.record("auth.login_failed", actor=f"{name or '?'}@{remote}", user=name, remote=remote)
         raise LoginFailed("error: wrong user or password")
-    tok = secrets.token_urlsafe(32)
     with _LOCK:
         _FAILS.pop((remote, name), None)
-        _SESSIONS[tok] = {"user": name, "role": u["role"], "created": now}
+    tok = _open_session(name, u["role"])
     audit.record("auth.login", actor=f"{name}@cookie", user=name, role=u["role"], remote=remote)
     return tok, {"user": name, "role": u["role"], "via": "cookie"}
 
 
 def logout(tok):
     with _LOCK:
-        s = _SESSIONS.pop(tok, None)
+        s = _SESSIONS.pop(_sid(tok), None)
+        if s:
+            _save_sessions()
     if s:
         audit.record("auth.logout", actor=f"{s['user']}@cookie", user=s["user"])
 
@@ -391,11 +435,12 @@ def authenticate(headers, remote="?"):
         return None
     now = time.time()
     with _LOCK:
-        s = _SESSIONS.get(tok)
+        s = _SESSIONS.get(_sid(tok))
         if not s:
             return None
         if now - s["created"] > SESSION_TTL:
-            del _SESSIONS[tok]
+            del _SESSIONS[_sid(tok)]
+            _save_sessions()
             return None
     u = _load()["users"].get(s["user"])
     if not u or u.get("disabled"):
@@ -609,3 +654,6 @@ def add_auth_parsers(sub):
     ps.add_argument("--out", default=os.path.join(core.OVERLORD_HOME, "tls"))
     ps.add_argument("--host", action="append", help="a name or address the cert covers")
     pt.set_defaults(fn=cmd_tls)
+
+
+_load_sessions()

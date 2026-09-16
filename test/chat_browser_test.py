@@ -167,6 +167,8 @@ try:
         page.locator("#s-models-note").get_by_text("models available").wait_for(timeout=8000)
         if not page.locator("#conn-section").count() or not page.locator("#c-add").count():
             fail("settings lacks the connectors section")
+        if not page.locator("#mem-section").count() or not page.locator("#m-user").count():
+            fail("settings lacks the memory section")
         if page.locator("#s-models option").count() != 1:
             fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()

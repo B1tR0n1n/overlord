@@ -100,6 +100,14 @@ what a brokered session may be granted; without a rule the daemon grants
 none. Every connector call is an event on the stream and a line in the
 transcript; the reviewer sees them under EXTERNAL ACTIONS.
 
+### Memory
+
+Put an `OVERLORD.md` at the root of a folder and every agent session there is
+told what it says (capped). Sessions that commit are journaled per folder and
+the next session is told about them. A note the agent proposes about the
+person arrives as a `memory_suggestion` event and is kept only when someone
+accepts it (`overlord memory accept <sid> --id <id>`).
+
 ### Savepoints from the SDK
 
 Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`

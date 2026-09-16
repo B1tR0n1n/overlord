@@ -631,12 +631,14 @@ class ScriptedProvider:
     name = "scripted"
 
     def __init__(self, script):
-        self.script, self.i, self.seen = list(script), 0, []
+        self.script, self.i, self.seen, self.systems, self.toolsets = list(script), 0, [], [], []
         self.model = "scripted"
         self.config = ModelConfig()
 
     def complete(self, system, messages, tools=None, on_delta=None):
         self.seen.append(json.loads(json.dumps(messages)))
+        self.systems.append(system)
+        self.toolsets.append([t["name"] for t in (tools or [])])
         if self.i >= len(self.script):
             return Reply("(script exhausted)", [], "end_turn", {"in": 0, "out": 0})
         step = self.script[self.i]

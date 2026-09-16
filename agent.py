@@ -42,6 +42,7 @@ import sys
 import time
 
 import overlord as ov
+import memory as memory_mod
 
 import providers as _providers_defaults  # noqa: E402
 DEFAULT_MODELS = _providers_defaults.DEFAULT_MODELS
@@ -84,6 +85,7 @@ TOOLS = [
                                      "timeout": {"type": "number",
                                                  "description": "seconds (default 300)"}},
                       "required": ["command"]}},
+    memory_mod.REMEMBER_TOOL,
 ]
 
 
@@ -186,6 +188,7 @@ class ToolRunner:
     def __init__(self, live):
         self.live = live
         self._cause = None
+        self.suggestions = []       # user-scope notes proposed this run
 
     def run(self, name, inp, label, cause=None):
         fn = getattr(self, f"t_{name}", None)
@@ -230,6 +233,26 @@ class ToolRunner:
         cmd = inp.get("command", "")
         timeout = float(inp.get("timeout") or 300)
         return self._exec(["bash", "-c", cmd], timeout, label)
+
+    def t_remember(self, inp, label):
+        """Project scope appends to OVERLORD.md inside the transaction (a
+        reviewed file change like any other); user scope only proposes."""
+        text = " ".join(str(inp.get("text") or "").split())
+        if not text:
+            return "error: nothing to remember", 1
+        if inp.get("scope") == "user":
+            sug = {"id": f"mem_{len(self.suggestions) + 1}", "text": text}
+            self.suggestions.append(sug)
+            return ("noted as a suggestion; the person decides whether it is kept "
+                    f"[{sug['id']}]"), 0
+        b64 = base64.b64encode(("- " + text + "\n").encode()).decode()
+        code = ("import base64,os,sys\n"
+                "p, line = sys.argv[1], base64.b64decode(sys.argv[2])\n"
+                "cur = open(p, 'rb').read() if os.path.exists(p) else b'# Project notes\\n\\n'\n"
+                "if cur and not cur.endswith(b'\\n'): cur += b'\\n'\n"
+                "open(p, 'wb').write(cur + line)\n"
+                "print('remembered in', p)\n")
+        return self._exec(["python3", "-c", code, memory_mod.PROJECT_FILE, b64], 30, label)
 
 
 # ---------------------------------------------------------------- provenance link
@@ -388,6 +411,11 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
 
     tools = ToolRunner(live)
     attribution = Attribution(live)
+    mem_text, mem_summary = memory_mod.build_context(live.meta["target"])
+    system_prompt = SYSTEM_PROMPT + mem_text
+    if mem_summary:
+        live.meta["memory"] = mem_summary
+        ov.save_meta(live.sid, live.meta)
     all_tools = list(TOOLS)
     if registry:
         try:
@@ -405,13 +433,14 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
     else:
         record({"type": "task", "text": task, "agent": live.meta["agent"]})
     final = ""
+    recorded_suggestions = 0
     try:
         for turn in range(start_turn, start_turn + max_turns):
             if should_stop and should_stop():
                 record({"type": "done", "reason": "cancelled", "turn": turn})
                 return final
             reply = provider.complete(
-                SYSTEM_PROMPT, messages, tools=all_tools,
+                system_prompt, messages, tools=all_tools,
                 on_delta=lambda t, _turn=turn: emit({"type": "assistant_delta",
                                                      "turn": _turn, "text": t}))
             live.meta["usage"]["in"] += reply.usage.get("in", 0)
@@ -475,6 +504,10 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                 record({"type": "tool_result", "turn": turn, "id": tc["id"],
                         "tool": tc["name"], "exit_code": rc, "output": out,
                         "touched": touched, "layer": live.current_layer})
+                for sug in tools.suggestions[recorded_suggestions:]:
+                    record({"type": "memory_suggestion", "turn": turn, "id": sug["id"],
+                            "text": sug["text"]})
+                recorded_suggestions = len(tools.suggestions)
         record({"type": "done", "reason": "max_turns", "turn": start_turn + max_turns - 1,
                 "usage": live.meta["usage"]})
         return final
@@ -661,6 +694,9 @@ def _show(ev):
     elif t == "connectors":
         print(f"  ⇄ connectors {', '.join(ev['servers'])} ({ev['approval']}): "
               f"{len(ev['tools'])} tool(s)")
+    elif t == "memory_suggestion":
+        print(f"  ✎ proposed for your memory [{ev['id']}]: {ev['text']}  "
+              f"(overlord memory accept <session> --id {ev['id']})")
     elif t == "approval_decision":
         print(f"    {ev['server']}.{ev['tool']}: {ev['decision']}")
     elif t == "done":

@@ -1941,6 +1941,14 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
             _force_rmtree(os.path.join(sdir, sub))
         except OSError:
             pass
+    if m.get("agent"):
+        # the folder's journal: what was done here, from the record, for the
+        # next conversation's memory
+        import memory as memory_mod
+        try:
+            memory_mod.journal_record(m)
+        except OSError:
+            pass
     return {"committed": True, "applied": len(changes), "merged": merged,
             "target": m["target"], "layers": selected, "dropped": dropped}
 
@@ -2277,7 +2285,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2743,6 +2751,8 @@ def main(argv=None):
     review_mod.add_review_parser(sub)
     import mcp as mcp_mod
     mcp_mod.add_mcp_parser(sub)
+    import memory as memory_mod
+    memory_mod.add_memory_parser(sub)
 
     psv = sub.add_parser("savepoints", help="the layer stack: one savepoint per writing command")
     psv.add_argument("session")

@@ -30,6 +30,7 @@ import overlord as core
 import agent as agent_mod
 import providers as prov
 import mcp as mcp_mod
+import memory as memory_mod
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -347,6 +348,9 @@ def _map_event(ev):
     if t == "connectors":
         return {"type": "note", "text": "Connectors: " + ", ".join(ev.get("servers") or [])
                 + f" ({ev.get('approval')} mode, {len(ev.get('tools') or [])} tools)"}
+    if t == "memory_suggestion":
+        return {"type": "memory_suggestion", "id": ev.get("id"), "text": ev.get("text", ""),
+                "accepted": False}
     if t == "approval_decision":
         return {"type": "approval_decision", "id": ev.get("id"), "decision": ev.get("decision"),
                 "server": ev.get("server"), "tool": ev.get("tool")}
@@ -497,6 +501,13 @@ def messages_from_transcript(sid):
             elif t == "connectors":
                 msgs.append({"type": "note", "text": "Connectors: " + ", ".join(ev.get("servers") or [])
                              + f" ({ev.get('approval')} mode)"})
+            elif t == "memory_suggestion":
+                msgs.append({"type": "memory_suggestion", "id": ev.get("id"),
+                             "text": ev.get("text", ""), "accepted": False})
+            elif t == "memory_accepted":
+                for m in msgs:
+                    if m.get("type") == "memory_suggestion" and m.get("id") == ev.get("id"):
+                        m["accepted"] = True
             elif t == "tool_result":
                 out = ev.get("output", "") or ""
                 if len(out) > MAX_TAIL:
@@ -825,6 +836,11 @@ button{font-family:inherit;cursor:pointer}
 .ap-acts{display:flex;gap:10px;align-items:center;margin-top:8px}
 .ap-acts .act{padding:8px 16px}
 .ap-res{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-top:6px}
+.memsug{max-width:760px;margin:0 auto 16px;border:1px solid var(--accent-dim);background:var(--bg3);padding:12px 16px}
+.memsug.done{border-color:var(--border);opacity:.85}
+.memview{background:var(--bg);border:1px solid var(--border);color:var(--dim);font-size:11px;
+  padding:9px 10px;max-height:160px;overflow:auto;white-space:pre-wrap;margin:0}
+.memview .jr{margin-bottom:6px}.memview .jr b{color:var(--text);font-weight:400}
 .conn-list{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
 .conn-item{display:flex;gap:10px;align-items:center;font-size:11px;border:1px solid var(--border);padding:7px 10px}
 .conn-item .cn{color:var(--bright)}.conn-item .cw{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -954,6 +970,17 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label>Max steps per message</label>
         <input id="s-maxturns" type="number" min="1" max="200"></div>
     </div>
+    <details class="adv" id="mem-section"><summary>Memory</summary>
+    <div class="desc">What the agent is told before your first message. Project notes live in OVERLORD.md inside the folder (the agent may add to them, inside the transaction, so you review the change). Your own notes live here and only you write them.</div>
+    <div class="field"><label>About you (~/.overlord/memory.md)</label>
+      <textarea id="m-user" rows="5" placeholder="Prefer pytest. Keep commit messages short. I work in UTC+1."></textarea></div>
+    <div class="ap-acts"><button class="act act-review" id="m-save">Save my notes</button>
+      <span class="act-msg" id="m-msg"></span></div>
+    <div class="field"><label>Project notes in the working folder</label>
+      <pre class="memview" id="m-project"></pre></div>
+    <div class="field"><label>Recent committed work here</label>
+      <div class="memview" id="m-journal"></div></div>
+    </details>
     <details class="adv" id="conn-section"><summary>Connectors (MCP)</summary>
     <div class="desc">Tools from MCP servers, offered to the agent next to the built-ins. They run on this machine, outside the sandbox and the transaction, so each conversation must be granted them and non-read-only actions ask you first.</div>
     <div class="field"><label>Approval for actions</label>
@@ -1062,6 +1089,14 @@ function renderMsg(m){
     if(card){ card.classList.add('done'); const a=card.querySelector('.ap-acts'); if(a) a.remove();
       card.appendChild(el('div','ap-res', m.decision)); }
     else if(m.decision && m.decision!=='read-only'){ s.appendChild(el('div','note', (m.server||'')+'.'+(m.tool||'')+': '+m.decision)); }
+  } else if(m.type==='memory_suggestion'){
+    const card = el('div','memsug'); card.dataset.id = m.id;
+    card.appendChild(el('div','ap-t','Proposed for your memory'));
+    card.appendChild(el('div','ap-w', m.text));
+    if(m.accepted){ card.classList.add('done'); card.appendChild(el('div','ap-res','saved')); }
+    else { const acts = el('div','ap-acts'); const b = el('button','act act-review','Save to my memory');
+      b.dataset.remember = m.id; acts.appendChild(b); card.appendChild(acts); }
+    s.appendChild(card);
   } else if(m.type==='note'){
     s.appendChild(el('div','note', m.text));
   } else if(m.type==='error'){
@@ -1187,6 +1222,13 @@ async function insAction(url, body){
 
 // inspector + review delegation
 document.addEventListener('click', async e=>{
+  const rm = e.target.closest('[data-remember]');
+  if(rm && SEL){ const card = rm.closest('.memsug');
+    const r = await j('/api/chats/'+encodeURIComponent(SEL)+'/remember',{method:'POST',
+      body:JSON.stringify({id:card.dataset.id})});
+    if(!r.error){ card.classList.add('done'); const a=card.querySelector('.ap-acts'); if(a) a.remove();
+      card.appendChild(el('div','ap-res','saved')); }
+    return; }
   const ap = e.target.closest('[data-approve]');
   if(ap && SEL){ const card = ap.closest('.approval');
     await j('/api/chats/'+encodeURIComponent(SEL)+'/approve',{method:'POST',
@@ -1242,6 +1284,7 @@ async function openSettings(msg){
   $('g-fallbacks').checked = g.fallbacks !== false;
   fillProvider(SETTINGS.provider);
   renderConnectors();
+  loadMemory();
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'
@@ -1273,6 +1316,22 @@ async function saveSettings(){
   if(!SEL) newChat();
 }
 
+async function loadMemory(){
+  const r = await j('/api/memory');
+  if(r.error) return;
+  $('m-user').value = r.user || '';
+  $('m-project').textContent = (r.project||'').trim() ? r.project : '(no OVERLORD.md in this folder yet)';
+  const jl = $('m-journal'); jl.innerHTML = '';
+  if(!(r.journal||[]).length){ jl.textContent = '(nothing committed here yet)'; return; }
+  r.journal.slice().reverse().forEach(e=>{ const d = el('div','jr');
+    const b = el('b', null, (e.ts||'').slice(0,10)+' — '+(e.task||'')); d.appendChild(b);
+    if(e.outcome){ d.appendChild(el('div', null, e.outcome.slice(0,200))); }
+    jl.appendChild(d); });
+}
+async function saveMemory(){
+  const r = await j('/api/memory',{method:'PUT',body:JSON.stringify({user:$('m-user').value})});
+  const m = $('m-msg'); m.textContent = r.error ? r.error : 'saved'; m.className = 'act-msg '+(r.error?'bad':'ok');
+}
 function renderConnectors(){
   const list = $('conn-list'); list.innerHTML='';
   $('c-approval').value = CONNECTORS.approval || 'ask';
@@ -1321,6 +1380,7 @@ $('s-models-refresh').addEventListener('click',()=>loadModels(true));
 $('c-transport').addEventListener('change',()=>{ const h=$('c-transport').value==='http';
   $('c-http').classList.toggle('hide',!h); $('c-stdio').classList.toggle('hide',h); });
 $('c-add').addEventListener('click',addConnector);
+$('m-save').addEventListener('click',saveMemory);
 $('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
   body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });
 $('togglerail').addEventListener('click',()=>$('app').classList.toggle('show-rail'));
@@ -1348,6 +1408,17 @@ def handle_get(handler, path, query):
         return True
     if path == "/api/connectors":
         handler._send(mcp_mod.public_config())
+        return True
+    if path == "/api/memory":
+        s = load_settings()
+        wd = (query.get("target") or [s["workdir"]])[0]
+        wd = os.path.realpath(os.path.expanduser(wd))
+        user_text, _u = memory_mod.user_memory()
+        proj_text, ptrunc = memory_mod.project_memory(wd) if os.path.isdir(wd) else ("", False)
+        handler._send({"user": user_text, "user_file": memory_mod.USER_FILE,
+                       "project": proj_text, "project_file": os.path.join(wd, memory_mod.PROJECT_FILE),
+                       "project_truncated": ptrunc,
+                       "journal": memory_mod.journal_entries(wd) if os.path.isdir(wd) else []})
         return True
     if path == "/api/models":
         handler._send(models_for((query.get("provider") or [None])[0] or None,
@@ -1396,6 +1467,10 @@ def handle_post(handler, parts, req):
         if action == "approve":
             handler._send(decide(sid, str(req.get("id") or ""), bool(req.get("allow"))))
             return True
+        if action == "remember":
+            core.load_meta(sid)
+            handler._send(memory_mod.accept_suggestion(sid, str(req.get("id") or "")))
+            return True
     if parts == ["api", "connectors"]:
         env = req.get("env") or {}
         headers = req.get("headers") or {}
@@ -1427,6 +1502,19 @@ def handle_post(handler, parts, req):
 
 
 def handle_put(handler, path, body_text):
+    if path == "/api/memory":
+        try:
+            incoming = json.loads(body_text or "{}")
+        except ValueError:
+            raise core.OverlordError("error: memory must be JSON")
+        text = incoming.get("user")
+        if not isinstance(text, str):
+            raise core.OverlordError("error: memory.user must be a string")
+        if len(text) > 200_000:
+            raise core.OverlordError("error: user memory is too large (200k chars)")
+        memory_mod.set_user_memory(text)
+        handler._send({"saved": True, "chars": len(text)})
+        return True
     if path == "/api/settings":
         try:
             incoming = json.loads(body_text or "{}")

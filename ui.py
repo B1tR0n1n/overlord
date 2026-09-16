@@ -1061,7 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._guard(state_changing=True):
                 return
-            if self.path == "/api/settings":
+            if self.path in ("/api/settings", "/api/memory"):
                 n = int(self.headers.get("Content-Length") or 0)
                 chatui.handle_put(self, self.path, self.rfile.read(n).decode())
                 return

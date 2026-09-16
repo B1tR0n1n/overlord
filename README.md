@@ -72,6 +72,9 @@ overlord mcp add github --command npx --arg -y --arg @modelcontextprotocol/serve
                  --env GITHUB_TOKEN=…                # register an MCP connector (stdio)
 overlord mcp add docs --url https://host/mcp --header 'Authorization: Bearer …'   # (http)
 overlord agent --connector github -t /srv/app "<task>"   # grant it; actions ask you first
+overlord memory show -t /srv/app                     # what the agent is told before message one
+overlord memory user --add "Prefers pytest."         # a note about you, across every folder
+overlord memory accept <session> --all               # keep the notes an agent proposed
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
@@ -160,6 +163,31 @@ Connectors are different from everything else here, and the design says so:
   HOME and LANG, never the whole process environment, so one connector's
   token is not another's. `overlord mcp test <name>` connects and lists its
   tools with their read-only status.
+
+## Memory
+
+What the agent knows before your first message, and how that is allowed to
+change (`memory.py`). Three sources, all injected into the system prompt,
+all capped, and the session records what the model was told:
+
+- **Project notes** — `OVERLORD.md` at the root of the working folder:
+  conventions, commands, things learned about this codebase. The agent may
+  extend it with the `remember` tool, **inside the transaction**: the note is
+  a file change in the diff with a savepoint and a cause, committed or
+  discarded with everything else. Memory is a file the person reviews.
+- **Your notes** — `~/.overlord/memory.md`, about you and your preferences,
+  across every folder. The agent cannot write it. `remember` with scope
+  `user` only *proposes* a note; you accept it (a Save button in the
+  workspace, `overlord memory accept` on the CLI) and the acceptance is
+  recorded in that session's transcript.
+- **The journal** — one line per committed agent session in a folder: the
+  task, what the model said it did, which files changed. Derived from the
+  engine's own records at commit time, never written by the model, so
+  "recent work in this folder" is always true. Rolled-back sessions and
+  plain command sessions leave no entry.
+
+Nothing outside a transaction changes without a human hand, which is the
+same rule as everywhere else in OVERLORD.
 
 ## Grants (the capability manifest)
 
@@ -284,6 +312,9 @@ byte-identical.
   profile when you switch. On the kernel backend the agent's hands are jailed
   and offline by default; the model still thinks on your machine with network,
   only its tools are confined.
+- **Memory** lives under Settings: your notes (editable), the folder's
+  project notes, and its journal of committed work; a note the agent proposes
+  about you shows in the chat with a Save button.
 - **Connectors** are granted per conversation from the welcome screen and
   configured under Settings; when the agent wants to run one that acts on the
   world, the chat pauses with an Allow / Deny card showing the exact input.
@@ -379,6 +410,7 @@ python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-c
 python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy assertions
 python3 test/providers_test.py    # 10 provider adapter assertions: wire shapes, streaming, knobs, listing (offline)
 python3 test/mcp_test.py          # 6 connector assertions: stdio + http transports, grants, approval gate, policy, workspace
+python3 test/memory_test.py       # 7 memory assertions: injection, caps, transactional remember, proposals, journal, CLI, workspace
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -497,3 +529,11 @@ grants are absent.
   approver is denied; every call and decision in the transcript and in the
   reviewer's dossier as an external action; `overlord mcp add|list|test|rm|
   approval`. 137 assertions across twelve suites.
+- 2026-09-16 — v0.11: memory. `memory.py`: project notes (OVERLORD.md in
+  the folder), the person's notes (~/.overlord/memory.md) and a per-folder
+  journal of committed agent sessions, injected into the system prompt with
+  caps and recorded on the session; a `remember` tool whose project scope is
+  a transactional, attributed file change and whose user scope only proposes
+  a note a person accepts; `overlord memory show|user|journal|accept`; a
+  Memory section in the workspace with proposal cards. 144 assertions across
+  thirteen suites.

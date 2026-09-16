@@ -132,6 +132,42 @@ try:
 
     ov.rollback_session(sid)
 
+    # 3b. names with the network: a resolver symlink that leaves /etc (WSL2,
+    #     systemd-resolved) is bound at its real path, read-only, only with net=host
+    # not under /tmp: the jail's /tmp is the session's own, like a real
+    # host's /run or /mnt/wsl this tree is one the jail does not bind
+    R = tempfile.mkdtemp(dir="/var/tmp" if os.path.isdir("/var/tmp") else None)
+    os.makedirs(os.path.join(R, "run"))
+    real = os.path.join(R, "run", "resolv.conf")
+    with open(real, "w") as f:
+        f.write("nameserver 9.9.9.9\n")
+    os.makedirs(os.path.join(R, "etc"))
+    link = os.path.join(R, "etc", "resolv.conf")
+    os.symlink(real, link)
+    os.environ["OVERLORD_RESOLV"] = link
+    try:
+        live = ov.open_session(target, "kernel", {"net": "host", "jail": True, "timeout": None, "merge_base": False},
+                               capture=True)
+        rc, out = live.exec(["cat", real])
+        wrc, _ = live.exec(["sh", "-c", f"echo x > {real}"])
+        sid_h, _ = live.close()
+        if rc != 0 or b"9.9.9.9" not in out:
+            fail(f"net=host jail cannot read the resolver behind a symlink out of /etc: {rc} {out[-200:]!r}")
+        if wrc == 0:
+            fail("the resolver bound into the jail is writable")
+        ov.rollback_session(sid_h)
+        live = ov.open_session(target, "kernel", {"net": "none", "jail": True, "timeout": None, "merge_base": False},
+                               capture=True)
+        rc, out = live.exec(["cat", real])
+        sid_n, _ = live.close()
+        ov.rollback_session(sid_n)
+        if rc == 0:
+            fail("net=none bound a resolver into the jail: nothing to resolve there")
+    finally:
+        del os.environ["OVERLORD_RESOLV"]
+        subprocess.run(["rm", "-rf", R])
+    ok("net=host: a resolver symlink out of /etc is bound at its real path, read-only; net=none binds none")
+
     # 4. A13: a session granted net=host shares the host's loopback; OVERLORD's
     # own UI must still refuse it — the launch token lives where the jail cannot see
     import threading

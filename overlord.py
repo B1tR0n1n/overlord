@@ -240,17 +240,33 @@ if spec.get("jail"):
     MS_REMOUNT, MS_NOEXEC = 32, 8
     LOCKED = {"nosuid": MS_NOSUID, "nodev": MS_NODEV, "noexec": MS_NOEXEC, "noatime": 1024,
               "nodiratime": 2048, "relatime": 1 << 21, "strictatime": 1 << 24}
-    binds = [os.path.join(J, d) for d in HOST_DIRS]
-    with open("/proc/self/mountinfo") as f:
-        for line in f:
-            r = line.split()
-            mp = r[4].replace("\\040", " ")
-            if not any(mp == b or mp.startswith(b + "/") for b in binds):
-                continue
-            flags = MS_REMOUNT | MS_BIND | MS_RDONLY
-            for opt in r[5].split(","):
-                flags |= LOCKED.get(opt, 0)
-            mount("none", mp, None, flags)
+    def remount_ro(binds):
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                r = line.split()
+                mp = r[4].replace("\\040", " ")
+                if not any(mp == b or mp.startswith(b + "/") for b in binds):
+                    continue
+                flags = MS_REMOUNT | MS_BIND | MS_RDONLY
+                for opt in r[5].split(","):
+                    flags |= LOCKED.get(opt, 0)
+                mount("none", mp, None, flags)
+    remount_ro([os.path.join(J, d) for d in HOST_DIRS])
+    # Names, when the network is granted. On WSL2 and systemd-resolved hosts
+    # /etc/resolv.conf is a symlink out of /etc (/mnt/wsl/resolv.conf,
+    # /run/systemd/resolve/stub-resolv.conf); those trees are not bound, so
+    # inside the jail the link dangled: a net=host command had a network and
+    # no DNS. The real file is bound at its real path, read-only, so the link
+    # in the bound /etc resolves. With net=none there is nothing to resolve.
+    if spec.get("net") == "host":
+        real = os.path.realpath(spec.get("resolv") or "/etc/resolv.conf")
+        top = real.lstrip("/").split("/", 1)[0]
+        if os.path.isfile(real) and top not in HOST_DIRS and top not in ("proc", "dev", "tmp"):
+            rel = real.lstrip("/")
+            os.makedirs(os.path.dirname(rel), exist_ok=True)
+            open(rel, "w").close()
+            mount(real, rel, None, MS_BIND)
+            remount_ro([os.path.join(J, rel)])
     for n in ("null", "zero", "full", "random", "urandom", "tty"):
         if os.path.exists("/dev/" + n):
             open("dev/" + n, "w").close()
@@ -1242,6 +1258,10 @@ class LiveSession:
         jail = bool(self.meta["grants"].get("jail"))
         spec = {"sdir": self.sdir, "target": target, "cmd": list(cmd), "cwd": cwd,
                 "jail": jail, "opts": overlay_opts(target, n, kernel=True),
+                "net": self.meta["grants"].get("net", "none"),
+                # the resolver file the jail is given names from; a test points
+                # it at a symlink chain of its own to prove the dangling case
+                "resolv": os.environ.get("OVERLORD_RESOLV") or "/etc/resolv.conf",
                 "trace_bind": jail and self._trace_inside == "/.overlord"}
         py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
         return [py, "-c", _ENTER_SRC, json.dumps(spec)], None

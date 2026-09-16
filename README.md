@@ -693,6 +693,13 @@ project path on purpose: the agent is told it works at that path so
 absolute paths in builds resolve. A finding is a gap between what the
 conditions block claims and what the probe shows, not the claim itself.
 
+Names with the network: a `net=host` jail gets DNS. On WSL2 and
+systemd-resolved hosts `/etc/resolv.conf` is a symlink out of `/etc`
+(`/mnt/wsl/resolv.conf`, `/run/systemd/resolve/stub-resolv.conf`), trees
+the jail does not bind, so the link dangled inside and a command had a
+network but no names. The real file is now bound at its real path,
+read-only, only when the network is granted; `net=none` binds nothing.
+
 ## Backends
 
 Two overlay backends, auto-detected, kernel preferred. `overlord doctor` names
@@ -981,7 +988,9 @@ grants are absent.
   endpoint; compatible servers and Azure keep chat completions. A usage
   meter in the rail shows the provider's own rate-limit headroom and spend
   against the daily and monthly budget lines; `month_usd` budget; current
-  Claude 5-family list prices. `--audit`
+  Claude 5-family list prices. A `net=host` jail resolves names: the
+  resolver behind a symlink out of `/etc` (WSL2, systemd-resolved) is bound
+  at its real path, read-only. `--audit`
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

@@ -108,6 +108,14 @@ the next session is told about them. A note the agent proposes about the
 person arrives as a `memory_suggestion` event and is kept only when someone
 accepts it (`overlord memory accept <sid> --id <id>`).
 
+### Scripts against the web API
+
+With accounts on, a script authenticates to `overlord ui` with a bearer
+token: `overlord users token <name> --name ci` prints it once; send
+`Authorization: Bearer ovl_…`. The token carries that account's role, so a
+CI job that should only read gets a viewer's token. `GET /api/me` says who
+the server thinks you are.
+
 ### Savepoints from the SDK
 
 Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`

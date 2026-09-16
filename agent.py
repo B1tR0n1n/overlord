@@ -99,21 +99,29 @@ def load_key(provider):
         raise ov.OverlordError(f"error: unknown provider: {provider}")
     if os.environ.get(env):
         return os.environ[env]
-    path = os.path.join(ov.OVERLORD_HOME, "keys.json")
-    if os.path.isfile(path):
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            raise ov.OverlordError(f"error: {path} is mode {mode:03o}; chmod 600 it")
-        with open(path) as f:
-            key = json.load(f).get(provider)
-        if key:
-            return key
-    raise ov.OverlordError(f"error: no API key for {provider}: set {env} or add it to {path}")
+    # the person's own key store first (accounts on), then the machine's
+    # shared one — an admin can provision a key for everyone
+    shared = os.path.join(ov.OVERLORD_HOME, "keys.json")
+    for path in dict.fromkeys((_keys_file(), shared)):
+        if os.path.isfile(path):
+            mode = os.stat(path).st_mode & 0o777
+            if mode & 0o077:
+                raise ov.OverlordError(f"error: {path} is mode {mode:03o}; chmod 600 it")
+            with open(path) as f:
+                key = json.load(f).get(provider)
+            if key:
+                return key
+    raise ov.OverlordError(f"error: no API key for {provider}: set {env} or add it to {shared}")
+
+
+def _keys_file():
+    import auth
+    return auth.user_path("keys.json", os.path.join(ov.OVERLORD_HOME, "keys.json"))
 
 
 def save_key(provider, key):
-    path = os.path.join(ov.OVERLORD_HOME, "keys.json")
-    os.makedirs(ov.OVERLORD_HOME, exist_ok=True)
+    path = _keys_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     keys = {}
     if os.path.isfile(path):
         with open(path) as f:
@@ -411,7 +419,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
 
     tools = ToolRunner(live)
     attribution = Attribution(live)
-    mem_text, mem_summary = memory_mod.build_context(live.meta["target"])
+    mem_text, mem_summary = memory_mod.build_context(live.meta["target"], live.meta.get("owner"))
     system_prompt = SYSTEM_PROMPT + mem_text
     if mem_summary:
         live.meta["memory"] = mem_summary

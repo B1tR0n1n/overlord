@@ -14,12 +14,16 @@ the stack degrades to Georgia / Consolas so the UI works airgapped.
 
 import json
 import os
+import re
 import secrets
+import ssl
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import overlord as core
 import chatui
+import auth
 
 # Field Systems Division tokens. Dark ground is foundational; gold is earned.
 PALETTE = dict(
@@ -345,7 +349,9 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    server-rendered below is either static or set via textContent. */
 let SEL = __SEL__;
 const $ = id => document.getElementById(id);
-const j = (u, opt) => fetch(u, opt).then(r => r.json());
+const j = (u, opt) => fetch(u, opt).then(r => {
+  if(r.status===401){ location.href='/login?next='+encodeURIComponent(location.pathname); return new Promise(()=>{}); }
+  return r.json(); });
 
 async function loadList() {
   const d = await j('/api/view?sel=' + encodeURIComponent(SEL || ''));
@@ -865,31 +871,128 @@ def _build_page(status, register_html, dossier_html, policy_text, sel, nonce):
     return page
 
 
+LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OVERLORD — sign in</title>
+<style nonce="__NONCE__">
+:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;
+background:#0a0908;color:#e8e2d4;font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif}
+.card{width:min(360px,92vw);padding:28px 28px 22px;border:1px solid #2a2620;background:#12100d}
+.name{font-weight:700;letter-spacing:.18em;color:#c9a227;font-size:13px}
+.sub{color:#8a8171;font-size:12px;margin-bottom:18px}
+label{display:block;font-size:12px;color:#8a8171;margin:10px 0 4px}
+input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #2a2620;background:#0a0908;
+color:#e8e2d4;font-size:15px}input:focus{outline:1px solid #c9a227}
+button{margin-top:16px;width:100%;padding:10px;background:#c9a227;color:#0a0908;border:0;
+font-weight:600;font-size:14px;cursor:pointer}.err{color:#d9534f;font-size:13px;min-height:18px;margin-top:8px}
+</style></head><body>
+<form class="card" id="f" autocomplete="on">
+  <div class="name">OVERLORD</div><div class="sub">sign in to the workspace</div>
+  <label for="u">user</label><input id="u" name="username" autocomplete="username" autofocus>
+  <label for="p">password</label><input id="p" name="password" type="password" autocomplete="current-password">
+  <button type="submit">Sign in</button>
+  <div class="err" id="e"></div>
+</form>
+<script nonce="__NONCE__">
+const f=document.getElementById('f'), e=document.getElementById('e');
+const q=new URLSearchParams(location.search); let next=q.get('next')||'/';
+if(!next.startsWith('/')||next.startsWith('//')||next.indexOf(String.fromCharCode(92))>=0) next='/';
+f.addEventListener('submit', async ev => { ev.preventDefault(); e.textContent='';
+  const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({user:document.getElementById('u').value,password:document.getElementById('p').value})});
+  const d = await r.json().catch(()=>({error:'sign-in failed'}));
+  if(r.ok){ location.href = next; } else { e.textContent = (d.error||'sign-in failed').replace(/^error: /,''); }
+});
+</script></body></html>"""
+
+
+class _Server(ThreadingHTTPServer):
+    tls = False
+    hosts = set()
+
+    def handle_error(self, request, client_address):
+        # a plain-HTTP probe at a TLS port, or a client that hung up: one
+        # quiet line, not a traceback per connection
+        import traceback
+        exc = traceback.format_exc().strip().splitlines()[-1]
+        if "SSL" not in exc and "Connection reset" not in exc:
+            print(f"ui: {client_address[0]}: {exc}", file=sys.stderr)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     # --- browser-facing hardening -------------------------------------
     #
-    # This server binds loopback and has no auth, which is not the same as
-    # being unreachable: any page the user happens to be visiting can send it
-    # a cross-origin request, and a simple request needs no CORS preflight to
-    # arrive. Without the checks below, a drive-by page could POST a commit
-    # and apply an agent's pending changes to the real tree — the one thing
-    # the whole design exists to keep under human control. So:
-    #   * Host must be loopback, which is what stops DNS rebinding turning
-    #     an attacker's domain into a same-origin path to this port;
-    #   * a cross-origin state-changing request is refused outright.
+    # Loopback with no accounts is not the same as unreachable: any page the
+    # user happens to be visiting can send this port a cross-origin request,
+    # and a simple request needs no CORS preflight to arrive. Without the
+    # checks below, a drive-by page could POST a commit and apply an agent's
+    # pending changes to the real tree — the one thing the whole design
+    # exists to keep under human control. So:
+    #   * Host must be one we serve (loopback, or the configured names),
+    #     which is what stops DNS rebinding turning an attacker's domain
+    #     into a same-origin path to this port;
+    #   * a cross-origin state-changing request is refused outright;
+    #   * with accounts on, every request identifies its principal (login
+    #     cookie — HttpOnly, SameSite=Strict — or a bearer token) before
+    #     anything else runs, and each route checks what that principal may
+    #     do. Beyond loopback the server only starts with accounts and TLS.
+
+    def setup(self):
+        super().setup()
+        self._dead = False
+        if self._tls():
+            try:
+                self.request.do_handshake()
+            except (ssl.SSLError, OSError):
+                self._dead = True
+
+    def handle(self):
+        if not self._dead:
+            super().handle()
+
+    def _tls(self):
+        # a bare ThreadingHTTPServer(Handler) (tests, embedders) is plain http
+        return bool(getattr(self.server, "tls", False))
+
+    def _allowed_hosts(self):
+        port = self.server.server_address[1]
+        return ({f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+                | set(getattr(self.server, "hosts", ())))
 
     def _own_origins(self):
-        port = self.server.server_address[1]
-        return {f"http://127.0.0.1:{port}", f"http://localhost:{port}",
-                f"http://[::1]:{port}"}
+        scheme = "https" if self._tls() else "http"
+        return {f"{scheme}://{h}" for h in self._allowed_hosts()}
 
     def _host_ok(self):
         host = (self.headers.get("Host") or "").strip()
-        port = self.server.server_address[1]
-        return host in {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        return host in self._allowed_hosts()
+
+    def _principal_ok(self, path):
+        """Accounts on: identify the caller, or send them to sign in."""
+        auth.set_current(None)
+        if not auth.enabled():
+            return True
+        p = auth.authenticate(self.headers, self.client_address[0])
+        if p is not None:
+            auth.set_current(p)
+            return True
+        if path in ("/login", "/api/login"):
+            return True
+        if path.startswith("/api/"):
+            self._send({"error": "login required", "login": "/login"}, 401)
+        else:
+            self._redirect("/login?next=" + quote(path, safe=""))
+        return False
+
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def _origin_ok(self):
         """State-changing requests must not come from another origin."""
@@ -906,9 +1009,16 @@ class Handler(BaseHTTPRequestHandler):
         if state_changing and not self._origin_ok():
             self._send({"error": "cross-origin request refused"}, 403)
             return False
-        return True
+        return self._principal_ok(urlparse(self.path).path)
 
-    def _send(self, obj, code=200, raw=None, ctype="application/json", nonce=None):
+    def _cookie_header(self, token, clear=False):
+        secure = "; Secure" if self._tls() else ""
+        if clear:
+            return f"{auth.COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}"
+        return (f"{auth.COOKIE}={token}; Path=/; Max-Age={auth.SESSION_TTL}; HttpOnly; "
+                f"SameSite=Strict{secure}")
+
+    def _send(self, obj, code=200, raw=None, ctype="application/json", nonce=None, cookie=None):
         body = raw if raw is not None else json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -916,6 +1026,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        if self._tls():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         if nonce:
             # Nothing loads off-origin; the two inline blocks carry the nonce,
             # so injected markup cannot execute even if escaping were wrong.
@@ -933,7 +1047,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _views(self, sel):
         """Server-rendered fragments: register + status line."""
-        metas = [core.load_meta(s) for s in core.list_sessions()]
+        metas = _visible_metas()
         backend = core.detect_backend() or "none"
         return {"status": f"{_esc(backend)} backend &middot; {len(metas)} records",
                 "register": _render_register(metas, sel)}
@@ -949,25 +1063,44 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(None, raw=chatui.chat_shell(nonce).encode(),
                            ctype="text/html; charset=utf-8", nonce=nonce)
                 return
+            if path == "/login":
+                if auth.current() or not auth.enabled():
+                    self._redirect("/")
+                    return
+                nonce = secrets.token_urlsafe(16)
+                self._send(None, raw=LOGIN_PAGE.replace("__NONCE__", nonce).encode(),
+                           ctype="text/html; charset=utf-8", nonce=nonce)
+                return
+            if path == "/api/me":
+                self._send(auth.me())
+                return
+            if path == "/api/users":
+                auth.require("admin")
+                self._send({"users": [{**u, "tokens": auth.tokens_for(u["name"])}
+                                      for u in auth.list_users()], "roles": list(auth.ROLES)})
+                return
             if chatui.handle_get(self, path, query):
                 return
             if path == "/api/view":
                 self._send(self._views((query.get("sel") or [None])[0] or None))
                 return
             if path == "/api/view/blame":
+                auth.require("read")
                 res = core.blame_path((query.get("path") or [""])[0])
                 self._send({"dossier": '<div class="sheet">' + _render_blame(res) + "</div>"})
                 return
             if path == "/api/blame":
+                auth.require("read")
                 self._send(core.blame_path((query.get("path") or [""])[0]))
                 return
             if path.startswith("/api/view/session/"):
                 sid = _sid(path.rsplit("/", 1)[-1])
+                auth.require("read", core.load_meta(sid))
                 self._send({"dossier": '<div class="sheet">'
                             + _render_dossier(_session_payload(sid)) + "</div>"})
                 return
             if path == "/console":
-                metas = [core.load_meta(s) for s in core.list_sessions()]
+                metas = _visible_metas()
                 pending = [m for m in metas if m.get("status") == "pending"]
                 sel = pending[-1]["id"] if pending else None
                 policy_text = ""
@@ -988,29 +1121,84 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8",
                            nonce=nonce)
             elif self.path == "/api/sessions":
-                metas = [core.load_meta(s) for s in core.list_sessions()]
                 self._send({"backend": core.detect_backend() or "none",
-                            "sessions": metas})
+                            "sessions": _visible_metas()})
             elif self.path == "/api/policy":
+                auth.require("read")
                 text = ""
                 if os.path.isfile(core.POLICY_FILE):
                     with open(core.POLICY_FILE) as f:
                         text = f.read()
                 self._send({"text": text})
             elif self.path.startswith("/api/session/"):
-                self._send(_session_payload(_sid(parsed.path.rsplit("/", 1)[-1])))
+                sid = _sid(parsed.path.rsplit("/", 1)[-1])
+                auth.require("read", core.load_meta(sid))
+                self._send(_session_payload(sid))
             else:
                 self._send({"error": "not found"}, 404)
+        except auth.Forbidden as e:
+            self._send({"error": str(e)}, 403)
         except (core.OverlordError, SystemExit) as e:
             self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def _users_post(self, parts, req):
+        if parts == ["api", "login"]:
+            if not auth.enabled():
+                raise core.OverlordError("error: no accounts; the UI is open on loopback")
+            tok, p = auth.login(req.get("user"), req.get("password"), self.client_address[0])
+            self._send({"ok": True, "auth": True, "user": p["user"], "role": p["role"]},
+                       cookie=self._cookie_header(tok))
+            return True
+        if parts == ["api", "logout"]:
+            tok = auth._cookie(self.headers)
+            if tok:
+                auth.logout(tok)
+            self._send({"ok": True}, cookie=self._cookie_header(None, clear=True))
+            return True
+        if parts == ["api", "users"]:
+            auth.require("admin")
+            u = auth.add_user(str(req.get("name") or ""), str(req.get("password") or ""),
+                              str(req.get("role") or "operator"))
+            self._send({"added": u})
+            return True
+        if len(parts) == 4 and parts[:2] == ["api", "users"]:
+            name, action = parts[2], parts[3]
+            me = auth.current()
+            if action in ("passwd", "token", "untoken") and me and me["user"] == name:
+                pass                  # one's own password and script tokens
+            else:
+                auth.require("admin")
+            if action == "remove":
+                auth.remove_user(name)
+                self._send({"removed": name})
+            elif action == "role":
+                auth.set_role(name, str(req.get("role") or ""))
+                self._send({"name": name, "role": req.get("role")})
+            elif action == "passwd":
+                auth.set_password(name, str(req.get("password") or ""))
+                self._send({"changed": name})
+            elif action == "token":
+                raw, tid = auth.create_token(name, str(req.get("label") or ""))
+                self._send({"token": raw, "id": tid})
+            elif action == "untoken":
+                auth.revoke_token(str(req.get("id") or ""), owner=name)
+                self._send({"revoked": req.get("id")})
+            else:
+                raise core.OverlordError("error: unknown users action")
+            return True
+        return False
 
     def do_POST(self):
         try:
             if not self._guard(state_changing=True):
                 return
             parts = self.path.strip("/").split("/")
+            if parts[:2] in (["api", "login"], ["api", "logout"], ["api", "users"]):
+                if not self._users_post(parts, self._body()):
+                    self._send({"error": "not found"}, 404)
+                return
             if parts[:2] in (["api", "chats"], ["api", "connectors"]):
                 if chatui.handle_post(self, parts, self._body()):
                     return
@@ -1019,6 +1207,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "session"]:
                 sid, action = _sid(parts[2]), parts[3]
                 req = self._body()
+                auth.require("act", core.load_meta(sid))
                 if action == "commit":
                     result = core.commit_session(
                         sid, merge=bool(req.get("merge")), force=bool(req.get("force")),
@@ -1052,6 +1241,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send({"error": "unknown action"}, 404)
             else:
                 self._send({"error": "not found"}, 404)
+        except auth.Forbidden as e:
+            self._send({"error": str(e)}, 403)
+        except auth.LoginFailed as e:
+            self._send({"error": str(e)}, 401)
+        except auth.TooMany as e:
+            self._send({"error": str(e)}, 429)
         except (core.OverlordError, SystemExit) as e:
             self._send({"error": str(e)}, 400)
         except Exception as e:
@@ -1066,6 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                 chatui.handle_put(self, self.path, self.rfile.read(n).decode())
                 return
             if self.path == "/api/policy":
+                auth.require("admin")
                 n = int(self.headers.get("Content-Length") or 0)
                 text = self.rfile.read(n).decode()
                 json.loads(text)  # must be valid JSON before it becomes law
@@ -1075,15 +1271,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"saved": True})
             else:
                 self._send({"error": "not found"}, 404)
+        except auth.Forbidden as e:
+            self._send({"error": str(e)}, 403)
         except (core.OverlordError, SystemExit) as e:
             self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 400)
 
 
-def serve(port=7777):
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"OVERLORD mission control: http://127.0.0.1:{port}  (local only)")
+def _visible_metas():
+    """Every record this principal may see (all of them with accounts off,
+    or for admins and viewers; an operator's own otherwise)."""
+    return [m for m in (core.load_meta(s) for s in core.list_sessions()) if auth.visible(m)]
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None):
+    """The listening server. Beyond loopback it insists on accounts and TLS:
+    a workspace that can commit an agent's changes to a real tree is not
+    something to leave on a LAN behind a Host check."""
+    bind = bind or "127.0.0.1"
+    loopback = bind in LOOPBACK
+    if bool(tls_cert) != bool(tls_key):
+        raise core.OverlordError("error: --tls-cert and --tls-key go together")
+    if not loopback:
+        if not auth.enabled():
+            raise core.OverlordError(
+                f"error: --bind {bind} reaches beyond this machine; create accounts first "
+                "(overlord users add <name> --role admin)")
+        if not tls_cert:
+            raise core.OverlordError(
+                f"error: --bind {bind} reaches beyond this machine; serve TLS "
+                "(--tls-cert/--tls-key, or `overlord tls selfsign`)")
+    server = _Server((bind, port), Handler)
+    port = server.server_address[1]
+    allowed = set()
+    if not loopback:
+        allowed.add(f"{bind}:{port}")
+    for h in hosts or []:
+        h = h.strip()
+        if not h:
+            continue
+        allowed.add(h)
+        if not re.match(r"^(\[.*\]|[^:]+):\d+$", h):
+            allowed.add(f"{h}:{port}")
+    server.hosts = allowed
+    server.tls = bool(tls_cert)
+    if tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            ctx.load_cert_chain(tls_cert, tls_key)
+        except (OSError, ssl.SSLError) as e:
+            server.server_close()
+            raise core.OverlordError(f"error: cannot load the certificate: {e}")
+        server.socket = ctx.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
+    return server
+
+
+def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None):
+    server = make_server(port, bind, tls_cert, tls_key, hosts)
+    scheme = "https" if server.tls else "http"
+    shown = bind if bind in LOOPBACK else (sorted(server.hosts) or [bind])[0].split(":")[0]
+    who = ("accounts required" if auth.enabled() else "no accounts — local person is the operator")
+    print(f"OVERLORD workspace: {scheme}://{shown}:{server.server_address[1]}  "
+          f"({'loopback only' if bind in LOOPBACK else 'bound ' + bind}; {who})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -97,8 +97,16 @@ try:
         except Exception as e:
             skip(f"chromium unavailable ({type(e).__name__})")
         page = browser.new_page(viewport={"width": 1280, "height": 900})
-        page.on("console", lambda m: errors.append(f"console.{m.type}: {m.text}")
-                if m.type == "error" else None)
+        expected = {"lenient": False}     # the sign-in block provokes a 401 and a key-less 400
+
+        def on_console(m):
+            if m.type != "error":
+                return
+            if expected["lenient"] and "Failed to load resource" in m.text \
+                    and any(f" {c} " in m.text for c in ("401", "400")):
+                return
+            errors.append(f"console.{m.type}: {m.text}")
+        page.on("console", on_console)
         page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
 
         page.goto(BASE + "/", wait_until="networkidle")
@@ -173,6 +181,41 @@ try:
             fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()
         ok("Settings shows provider, endpoint, generation knobs, and a live model list")
+
+        # accounts on: the page sends you to sign in, the form signs you in,
+        # the rail names you, and the admin panels appear in Settings
+        r = subprocess.run([sys.executable, os.path.join(HERE, "overlord.py"), "users", "add",
+                            "alice", "--role", "admin", "--password-stdin"],
+                           input="correct horse\n", capture_output=True, text=True, env=os.environ)
+        if r.returncode != 0:
+            fail(f"users add: {r.stderr}")
+        expected["lenient"] = True
+        page.goto(BASE + "/")
+        page.wait_for_selector("#f", timeout=5000)
+        if "/login" not in page.url:
+            fail(f"no redirect to sign-in: {page.url}")
+        page.locator("#u").fill("alice")
+        page.locator("#p").fill("wrong password")
+        page.locator("#f button").click()
+        page.locator("#e").get_by_text("wrong user or password").wait_for(timeout=5000)
+        page.locator("#p").fill("correct horse")
+        page.locator("#f button").click()
+        page.wait_for_selector("#whoami", timeout=5000)
+        page.locator("#whoami").get_by_text("alice").wait_for(timeout=5000)
+        if page.locator("#logout").evaluate("e => e.classList.contains('hide')"):
+            fail("sign-out button hidden while signed in")
+        # a fresh account has no key yet, so Settings may already be open
+        if not page.locator(".modal.open").count():
+            page.locator("#opensettings").click()
+        page.wait_for_selector(".modal.open", timeout=5000)
+        for sel in ("#users-section", "#account-section"):
+            if page.locator(sel).evaluate("e => e.classList.contains('hide')"):
+                fail(f"{sel} hidden for an admin")
+        page.locator("#users-section summary").click()
+        page.locator("#u-list").get_by_text("alice").wait_for(timeout=5000)
+        page.locator("#closesettings").click()
+        expected["lenient"] = False
+        ok("sign-in page, wrong password reported, admin panels shown once signed in")
 
         # a phone width must not overflow horizontally
         page.set_viewport_size({"width": 390, "height": 850})

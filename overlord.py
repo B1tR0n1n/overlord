@@ -1334,8 +1334,9 @@ def reconcile_session(sid, meta):
 
 
 def open_session(target, backend, grants, trace=None, wait=False, stack=False,
-                 capture=False, agent=None):
-    """Snapshot the target, mount the overlay, start the holder. Returns LiveSession."""
+                 capture=False, agent=None, owner=None):
+    """Snapshot the target, mount the overlay, start the holder. Returns LiveSession.
+    owner: the account that opened it (accounts on); who may act on it."""
     target = os.path.realpath(target)
     if not os.path.isdir(target):
         raise OverlordError(f"error: target is not a directory: {target}")
@@ -1374,7 +1375,7 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
     meta = {
         "id": sid, "target": target, "cmd": [], "execs": [], "backend": backend,
         "grants": {k: v for k, v in grants.items() if not k.startswith("_")},
-        "trace": trace, "agent": agent,
+        "trace": trace, "agent": agent, "owner": owner,
         "layers": [{"n": 0, "started": _now()}],
         "started": _now(), "status": "open",
     }
@@ -2285,7 +2286,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2663,7 +2664,8 @@ def cmd_daemon(args):
 def cmd_ui(args):
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import ui
-    return ui.serve(args.port)
+    return ui.serve(args.port, bind=args.bind, tls_cert=args.tls_cert, tls_key=args.tls_key,
+                    hosts=args.host)
 
 
 # ---------------------------------------------------------------- main
@@ -2712,9 +2714,18 @@ def main(argv=None):
     pd.add_argument("--socket", help=f"socket path (default {DEFAULT_SOCKET})")
     pd.set_defaults(fn=cmd_daemon)
 
-    pu = sub.add_parser("ui", help="mission control: localhost web UI for session review")
+    pu = sub.add_parser("ui", help="the workspace and mission control (web UI)")
     pu.add_argument("--port", type=int, default=7777)
+    pu.add_argument("--bind", default="127.0.0.1",
+                    help="address to listen on; anything but loopback needs accounts + TLS")
+    pu.add_argument("--tls-cert", help="PEM certificate chain (serve https)")
+    pu.add_argument("--tls-key", help="PEM private key")
+    pu.add_argument("--host", action="append",
+                    help="a hostname browsers will use (Host header allowlist); repeatable")
     pu.set_defaults(fn=cmd_ui)
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import auth as auth_mod
+    auth_mod.add_auth_parsers(sub)
 
     for name, fn in (("diff", cmd_diff), ("log", cmd_log), ("rollback", cmd_rollback)):
         sp = sub.add_parser(name)

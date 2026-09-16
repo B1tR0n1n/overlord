@@ -73,22 +73,32 @@ def project_memory(target):
     return _read(os.path.join(target, PROJECT_FILE), PROJECT_CAP)
 
 
-def user_memory():
-    return _read(USER_FILE, USER_CAP)
+def user_file(owner=None):
+    """Whose notes: a named account's, else the person serving this request
+    (accounts on), else the shared file."""
+    import auth
+    if owner:
+        return os.path.join(auth.user_dir(owner), "memory.md")
+    return auth.user_path("memory.md", USER_FILE)
 
 
-def set_user_memory(text):
-    os.makedirs(core.OVERLORD_HOME, exist_ok=True)
-    tmp = USER_FILE + ".tmp"
+def user_memory(owner=None):
+    return _read(user_file(owner), USER_CAP)
+
+
+def set_user_memory(text, owner=None):
+    path = user_file(owner)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
-    os.replace(tmp, USER_FILE)
+    os.replace(tmp, path)
 
 
-def append_user_memory(line):
-    cur, _ = _read(USER_FILE, 10**9)
+def append_user_memory(line, owner=None):
+    cur, _ = _read(user_file(owner), 10**9)
     text = cur.rstrip("\n") + ("\n" if cur.strip() else "") + line.strip() + "\n"
-    set_user_memory(text)
+    set_user_memory(text, owner)
 
 
 # ---------------------------------------------------------------- journal
@@ -177,7 +187,7 @@ def accept_suggestion(sid, suggestion_id):
         if s["id"] == suggestion_id:
             if s["accepted"]:
                 return s
-            append_user_memory(s["text"])
+            append_user_memory(s["text"], owner=core.load_meta(sid).get("owner"))
             with open(core.session_file(sid, "transcript.jsonl"), "a") as f:
                 f.write(json.dumps({"ts": time.strftime(core.TS_FORMAT), "type": "memory_accepted",
                                     "id": suggestion_id}) + "\n")
@@ -189,16 +199,16 @@ def accept_suggestion(sid, suggestion_id):
 # ---------------------------------------------------------------- context
 
 
-def build_context(target):
+def build_context(target, owner=None):
     """The memory block appended to the system prompt, and a summary of
     what went into it (recorded on the session so the record shows what
-    the model was told)."""
+    the model was told). owner: whose notes, when accounts are on."""
     parts, summary = [], {}
     pm, ptrunc = project_memory(target)
     if pm.strip():
         parts.append(f"## Project notes (OVERLORD.md in the project root)\n{pm.strip()}")
         summary["project_chars"] = len(pm)
-    um, utrunc = user_memory()
+    um, utrunc = user_memory(owner)
     if um.strip():
         parts.append("## About the person you are working for (their notes; do not "
                      f"contradict them)\n{um.strip()}")
@@ -244,7 +254,7 @@ def cmd_memory(args):
             print("noted")
             return 0
         text, _ = user_memory()
-        print(text.rstrip() if text.strip() else f"(empty — {USER_FILE})")
+        print(text.rstrip() if text.strip() else f"(empty — {user_file()})")
         return 0
     if args.mem_cmd == "journal":
         target = os.path.realpath(args.target or os.getcwd())

@@ -31,6 +31,7 @@ import agent as agent_mod
 import providers as prov
 import mcp as mcp_mod
 import memory as memory_mod
+import auth
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -59,10 +60,15 @@ def _esc(s):
 # ---------------------------------------------------------------- settings
 
 
+def _settings_file():
+    """Each account has its own settings once accounts exist."""
+    return auth.user_path("ui.json", SETTINGS_FILE)
+
+
 def load_settings():
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
     try:
-        with open(SETTINGS_FILE) as f:
+        with open(_settings_file()) as f:
             saved = json.load(f)
         for k, v in saved.items():
             if k == "gen" and isinstance(v, dict):
@@ -176,8 +182,9 @@ def save_settings(incoming):
     if not os.path.isdir(os.path.expanduser(wd)):
         raise core.OverlordError(f"error: not a folder: {wd}")
     s["workdir"] = os.path.realpath(os.path.expanduser(wd))
-    os.makedirs(core.OVERLORD_HOME, exist_ok=True)
-    with open(SETTINGS_FILE, "w") as f:
+    path = _settings_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump(s, f, indent=2)
     if key:
         if provider not in prov.PROVIDERS:
@@ -393,6 +400,7 @@ def _run(sid, live, provider, message, first, max_turns, connectors=None):
 def start_conversation(message, target=None, provider=None, model=None, connectors=None):
     """Open a fresh transaction and set the agent to work. Returns its sid.
     connectors: MCP server names to grant this conversation (host-side tools)."""
+    auth.require("use")
     s = load_settings()
     connectors = [str(c) for c in (connectors or []) if c]
     if connectors:
@@ -418,7 +426,7 @@ def start_conversation(message, target=None, provider=None, model=None, connecto
             "error: this folder already has an open conversation. Commit or discard it "
             "first, or pick another folder in Settings.")
     live = core.open_session(target, backend, grants, capture=True,
-                             agent=f"{provider.name}:{provider.model}")
+                             agent=f"{provider.name}:{provider.model}", owner=auth.current_user())
     sid = live.sid
     _conv(sid)
     if note:
@@ -438,6 +446,7 @@ def send_message(sid, message):
     if not (message or "").strip():
         raise core.OverlordError("error: empty message")
     meta = core.load_meta(sid)
+    auth.require("act", meta)
     if meta.get("status") != "pending":
         raise core.OverlordError(
             "error: this conversation is closed (its changes were committed or discarded). "
@@ -452,6 +461,7 @@ def send_message(sid, message):
 
 
 def cancel(sid):
+    auth.require("act", core.load_meta(sid))
     _conv(sid)["cancel"].set()
     return {"cancelling": True}
 
@@ -534,9 +544,9 @@ def conversations():
     out = []
     for sid in core.list_sessions():
         m = core.load_meta(sid)
-        if not m.get("agent"):
+        if not m.get("agent") or not auth.visible(m):
             continue
-        out.append({"sid": sid, "title": _title(m), "status": m.get("status"),
+        out.append({"sid": sid, "title": _title(m), "status": m.get("status"), "owner": m.get("owner"),
                     "target": m.get("target"), "updated": m.get("finished") or m.get("started"),
                     "thinking": _conv(sid)["running"]})
     out.sort(key=lambda c: c["updated"] or "", reverse=True)
@@ -546,12 +556,14 @@ def conversations():
 def conversation(sid):
     core.validate_session_id(sid)
     meta = core.load_meta(sid)
+    auth.require("read", meta)
     c = _conv(sid)
     with c["lock"]:
         event_count = len(c["events"])
     return {"meta": {"id": meta["id"], "title": _title(meta), "status": meta.get("status"),
                      "target": meta.get("target"), "agent": meta.get("agent"),
-                     "grants": meta.get("grants")},
+                     "grants": meta.get("grants"), "owner": meta.get("owner"),
+                     "may_act": auth.may("act", meta)},
             "messages": messages_from_transcript(sid),
             "running": c["running"], "event_count": event_count,
             "inspector": render_inspector(sid)}
@@ -879,6 +891,8 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <button class="gear" id="opensettings">Settings</button>
       <a class="consolelink" href="/console">Console</a>
       <span class="backend" id="backend"></span>
+      <span class="backend" id="whoami"></span>
+      <button class="gear hide" id="logout">Sign out</button>
     </div>
   </nav>
   <main class="chat">
@@ -923,7 +937,7 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>
     <div class="field"><label>API key <span class="keystate" id="keystate"></span></label>
       <input id="s-key" type="password" placeholder="paste to set — never shown again">
-      <div class="desc">Stored on this machine only, in ~/.overlord/keys.json (mode 600).</div></div>
+      <div class="desc" id="keydesc">Stored on this machine only, in ~/.overlord/keys.json (mode 600).</div></div>
     <div class="row2">
       <div class="field"><label>Endpoint (base URL)</label>
         <input id="s-baseurl" type="text" placeholder="default">
@@ -1002,6 +1016,30 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="ap-acts"><button class="act act-review" id="c-add">Add connector</button>
       <span class="act-msg" id="c-msg"></span></div>
     </details>
+    <details class="adv hide" id="account-section"><summary>My account</summary>
+    <div class="desc">Your conversations, keys, settings and notes are yours alone; an admin sees every record.</div>
+    <div class="field"><label>New password (8+ characters)</label>
+      <input id="a-pass" type="password" autocomplete="new-password"></div>
+    <div class="ap-acts"><button class="act act-review" id="a-passwd">Change password</button>
+      <span class="act-msg" id="a-msg"></span></div>
+    <div class="field"><label>Bearer token for scripts</label>
+      <div class="desc">Minted once, shown once; send it as an Authorization: Bearer header.</div>
+      <pre class="memview" id="a-token"></pre></div>
+    <div class="ap-acts"><button class="act act-review" id="a-mint">New token</button></div>
+    </details>
+    <details class="adv hide" id="users-section"><summary>Accounts</summary>
+    <div class="desc">Who may sign in, and as what. Operators work in their own conversations; viewers read everything and change nothing; admins run the machine (accounts, policy, connectors).</div>
+    <div id="u-list" class="conn-list"></div>
+    <div class="row2">
+      <div class="field"><label>Name</label><input id="u-name" type="text" placeholder="alice" autocomplete="off"></div>
+      <div class="field"><label>Role</label><select id="u-role"><option value="operator">operator</option>
+        <option value="admin">admin</option><option value="viewer">viewer</option></select></div>
+    </div>
+    <div class="field"><label>Password (8+ characters)</label>
+      <input id="u-pass" type="password" autocomplete="new-password"></div>
+    <div class="ap-acts"><button class="act act-review" id="u-add">Add account</button>
+      <span class="act-msg" id="u-msg"></span></div>
+    </details>
     <div class="modal-acts">
       <span class="act-msg right-auto" id="setmsg"></span>
       <button class="closebtn" id="closesettings">Close</button>
@@ -1012,14 +1050,21 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <script nonce="__NONCE__">
 const $ = id => document.getElementById(id);
-const j = (u, o) => fetch(u, o).then(r => r.json());
-let SEL = null, FROM = 0, POLL = null, RUNNING = false, SETTINGS = {}, CONNECTORS = {servers:{}};
+const j = (u, o) => fetch(u, o).then(r => {
+  if(r.status===401){ location.href='/login?next='+encodeURIComponent(location.pathname); return new Promise(()=>{}); }
+  return r.json(); });
+let SEL = null, FROM = 0, POLL = null, RUNNING = false, READONLY = false, SETTINGS = {}, CONNECTORS = {servers:{}};
+let ME = {auth:false, user:null, role:'admin'};
+const isAdmin = () => !ME.auth || ME.role==='admin';
 
 function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls;
   if(text!=null)e.textContent=text; return e; }
 
 async function loadSettings(){ SETTINGS = await j('/api/settings');
+  try { ME = await j('/api/me'); } catch(e) {}
   $('backend').textContent = SETTINGS.backend + ' backend';
+  $('whoami').textContent = ME.auth ? (ME.user+' \u00b7 '+ME.role) : '';
+  $('logout').classList.toggle('hide', !ME.auth);
   try { CONNECTORS = await j('/api/connectors'); } catch(e) { CONNECTORS = {servers:{}}; }
   return SETTINGS; }
 
@@ -1106,7 +1151,7 @@ function renderMsg(m){
 
 function setThinking(on){
   RUNNING = on;
-  $('send').disabled = on;
+  $('send').disabled = on || READONLY;
   $('stop').classList.toggle('hide', !on);
   $('composer').classList.toggle('busy', on);
   let ind = $('ind');
@@ -1123,6 +1168,9 @@ async function select(sid){
   const d = await j('/api/chats/'+encodeURIComponent(sid));
   $('title').textContent = d.meta.title || 'conversation';
   const s = $('stream'); s.innerHTML=''; showComposer(true);
+  READONLY = d.meta.may_act === false;
+  $('input').disabled = READONLY;
+  if(READONLY) $('input').placeholder = 'Read-only: this conversation belongs to '+(d.meta.owner||'someone else');
   d.messages.forEach(renderMsg);
   $('inspector').innerHTML = d.inspector;
   FROM = d.event_count||0;
@@ -1134,7 +1182,7 @@ async function select(sid){
 
 function showComposer(on){ $('input').placeholder = SEL ? 'Reply, or ask for a change…' : 'Tell the agent what to do…'; }
 
-function newChat(){
+function newChat(){ READONLY=false; $('input').disabled=false;
   stopPoll(); SEL=null; FROM=0;
   $('title').textContent='New conversation';
   $('hstatus').textContent='';
@@ -1285,6 +1333,13 @@ async function openSettings(msg){
   fillProvider(SETTINGS.provider);
   renderConnectors();
   loadMemory();
+  $('account-section').classList.toggle('hide', !ME.auth);
+  $('users-section').classList.toggle('hide', !(ME.auth && ME.role==='admin'));
+  if(ME.auth && ME.role==='admin') loadUsers();
+  $('c-add').disabled = !isAdmin(); $('c-approval').disabled = !isAdmin();
+  $('keydesc').textContent = ME.auth
+    ? 'Stored for your account only (mode 600). If you set none, the machine\'s shared key is used.'
+    : 'Stored on this machine only, in ~/.overlord/keys.json (mode 600).';
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'
@@ -1346,8 +1401,41 @@ function renderConnectors(){
     const rm = el('button','linkbtn','remove'); rm.addEventListener('click', async()=>{
       await j('/api/connectors/'+encodeURIComponent(n)+'/remove',{method:'POST',body:'{}'});
       CONNECTORS = await j('/api/connectors'); renderConnectors(); });
-    row.appendChild(t); row.appendChild(rm); list.appendChild(row); });
+    row.appendChild(t); if(isAdmin()) row.appendChild(rm); list.appendChild(row); });
 }
+async function loadUsers(){
+  const r = await j('/api/users'); const list = $('u-list'); list.innerHTML='';
+  if(r.error){ list.appendChild(el('div','desc',r.error)); return; }
+  r.users.forEach(u=>{ const row = el('div','conn-item'); row.appendChild(el('span','cn',u.name));
+    const sel = document.createElement('select');
+    r.roles.forEach(x=>{ const o=document.createElement('option'); o.value=x; o.textContent=x; sel.appendChild(o); });
+    sel.value = u.role;
+    sel.addEventListener('change', async()=>{ const q = await j('/api/users/'+encodeURIComponent(u.name)+'/role',
+      {method:'POST',body:JSON.stringify({role:sel.value})}); $('u-msg').textContent = q.error||''; loadUsers(); });
+    row.appendChild(sel);
+    row.appendChild(el('span','cw',(u.tokens||[]).length+' token(s)'));
+    const rm = el('button','linkbtn','remove'); rm.addEventListener('click', async()=>{
+      const q = await j('/api/users/'+encodeURIComponent(u.name)+'/remove',{method:'POST',body:'{}'});
+      $('u-msg').textContent = q.error||''; loadUsers(); });
+    row.appendChild(rm); list.appendChild(row); });
+}
+async function addUser(){
+  const r = await j('/api/users',{method:'POST',body:JSON.stringify({name:$('u-name').value.trim(),
+    password:$('u-pass').value, role:$('u-role').value})});
+  const m=$('u-msg'); m.textContent = r.error||'added'; m.className='act-msg '+(r.error?'bad':'ok');
+  if(!r.error){ $('u-name').value=''; $('u-pass').value=''; loadUsers(); }
+}
+async function changePassword(){
+  const r = await j('/api/users/'+encodeURIComponent(ME.user)+'/passwd',{method:'POST',
+    body:JSON.stringify({password:$('a-pass').value})});
+  const m=$('a-msg'); m.textContent = r.error||'changed \u2014 sign in again'; m.className='act-msg '+(r.error?'bad':'ok');
+  if(!r.error) $('a-pass').value='';
+}
+async function mintToken(){
+  const r = await j('/api/users/'+encodeURIComponent(ME.user)+'/token',{method:'POST',body:JSON.stringify({label:'workspace'})});
+  $('a-token').textContent = r.error||r.token;
+}
+async function signOut(){ await j('/api/logout',{method:'POST',body:'{}'}); location.href='/login'; }
 async function addConnector(){
   const transport = $('c-transport').value, msg = $('c-msg');
   const body = {name: $('c-name').value.trim()};
@@ -1381,6 +1469,10 @@ $('c-transport').addEventListener('change',()=>{ const h=$('c-transport').value=
   $('c-http').classList.toggle('hide',!h); $('c-stdio').classList.toggle('hide',h); });
 $('c-add').addEventListener('click',addConnector);
 $('m-save').addEventListener('click',saveMemory);
+$('u-add').addEventListener('click',addUser);
+$('a-passwd').addEventListener('click',changePassword);
+$('a-mint').addEventListener('click',mintToken);
+$('logout').addEventListener('click',signOut);
 $('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
   body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });
 $('togglerail').addEventListener('click',()=>$('app').classList.toggle('show-rail'));
@@ -1415,7 +1507,7 @@ def handle_get(handler, path, query):
         wd = os.path.realpath(os.path.expanduser(wd))
         user_text, _u = memory_mod.user_memory()
         proj_text, ptrunc = memory_mod.project_memory(wd) if os.path.isdir(wd) else ("", False)
-        handler._send({"user": user_text, "user_file": memory_mod.USER_FILE,
+        handler._send({"user": user_text, "user_file": memory_mod.user_file(),
                        "project": proj_text, "project_file": os.path.join(wd, memory_mod.PROJECT_FILE),
                        "project_truncated": ptrunc,
                        "journal": memory_mod.journal_entries(wd) if os.path.isdir(wd) else []})
@@ -1434,6 +1526,7 @@ def handle_get(handler, path, query):
         rest = path[len("/api/chats/"):]
         sid = core.validate_session_id(rest.split("/")[0])
         if rest.endswith("/events"):
+            auth.require("read", core.load_meta(sid))
             frm = 0
             try:
                 frm = max(0, int((query.get("from") or ["0"])[0]))
@@ -1465,13 +1558,15 @@ def handle_post(handler, parts, req):
             handler._send(cancel(sid))
             return True
         if action == "approve":
+            auth.require("act", core.load_meta(sid))
             handler._send(decide(sid, str(req.get("id") or ""), bool(req.get("allow"))))
             return True
         if action == "remember":
-            core.load_meta(sid)
+            auth.require("act", core.load_meta(sid))
             handler._send(memory_mod.accept_suggestion(sid, str(req.get("id") or "")))
             return True
     if parts == ["api", "connectors"]:
+        auth.require("admin")
         env = req.get("env") or {}
         headers = req.get("headers") or {}
         if not isinstance(env, dict) or not isinstance(headers, dict):
@@ -1485,12 +1580,14 @@ def handle_post(handler, parts, req):
     if len(parts) == 3 and parts[:2] == ["api", "connectors"]:
         name = parts[2]
         if name == "approval":
+            auth.require("admin")
             mcp_mod.set_approval(str(req.get("mode") or ""))
             handler._send({"approval": req.get("mode")})
             return True
         raise core.OverlordError("error: unknown connector action")
     if len(parts) == 4 and parts[:2] == ["api", "connectors"]:
         name, action = parts[2], parts[3]
+        auth.require("admin")
         if action == "remove":
             mcp_mod.remove_server(name)
             handler._send({"removed": name})
@@ -1502,6 +1599,7 @@ def handle_post(handler, parts, req):
 
 
 def handle_put(handler, path, body_text):
+    auth.require("use")
     if path == "/api/memory":
         try:
             incoming = json.loads(body_text or "{}")

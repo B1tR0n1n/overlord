@@ -75,6 +75,9 @@ overlord agent --connector github -t /srv/app "<task>"   # grant it; actions ask
 overlord memory show -t /srv/app                     # what the agent is told before message one
 overlord memory user --add "Prefers pytest."         # a note about you, across every folder
 overlord memory accept <session> --all               # keep the notes an agent proposed
+overlord users add alice --role admin                # accounts: the UI now asks who you are
+overlord tls selfsign --host overlord.lan            # a certificate for --bind
+overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.overlord/tls/key.pem
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
@@ -188,6 +191,37 @@ all capped, and the session records what the model was told:
 
 Nothing outside a transaction changes without a human hand, which is the
 same rule as everywhere else in OVERLORD.
+
+## Accounts, TLS, a team on one machine
+
+`overlord ui` binds loopback with no accounts: the person at the keyboard
+is the operator, as it always was. The first `overlord users add` turns
+sign-in on (`auth.py`), and from then on every request names a principal —
+a login cookie (HttpOnly, SameSite=Strict, Secure under TLS) or a bearer
+token for scripts (`Authorization: Bearer ovl_…`, hashed at rest,
+revocable one by one, `overlord users token`). Five wrong passwords in five
+minutes lock that address+name for a minute; passwords are scrypt hashes in
+a mode-600 file.
+
+Three roles, checked on every route:
+
+| role | may |
+|---|---|
+| **admin** | everything: accounts, policy, connector config, every record on the machine |
+| **operator** | their own conversations — start, commit, discard, rewind, fork, review — and their own settings, API keys and notes; connectors may be used, not configured |
+| **viewer** | read every record, change nothing (an auditor) |
+
+Each account has its own `~/.overlord/users/<name>/` with its `ui.json`,
+`keys.json` (a key you set is yours; the machine's shared key is the
+fallback an admin can provision) and `memory.md`. A session records its
+`owner`; sessions opened from the CLI have none and are the admin's to see.
+
+Beyond loopback the server refuses to start without both accounts and TLS
+(`--bind 0.0.0.0 --tls-cert … --tls-key …`; `overlord tls selfsign` makes a
+certificate with openssl for a private deployment). A `--host name`
+allowlist backs the Host check, HSTS is sent, and a plain-HTTP probe at the
+TLS port is shrugged off. A workspace that can commit an agent's changes to
+a real tree is not something to leave on a LAN behind a Host header.
 
 ## Grants (the capability manifest)
 
@@ -312,6 +346,9 @@ byte-identical.
   profile when you switch. On the kernel backend the agent's hands are jailed
   and offline by default; the model still thinks on your machine with network,
   only its tools are confined.
+- **Accounts** (when on) appear under Settings: an admin adds people and
+  sets roles; everyone can change their own password and mint a script
+  token. A conversation you may only read shows a read-only composer.
 - **Memory** lives under Settings: your notes (editable), the folder's
   project notes, and its journal of committed work; a note the agent proposes
   about you shows in the chat with a Save button.
@@ -411,6 +448,7 @@ python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy
 python3 test/providers_test.py    # 10 provider adapter assertions: wire shapes, streaming, knobs, listing (offline)
 python3 test/mcp_test.py          # 6 connector assertions: stdio + http transports, grants, approval gate, policy, workspace
 python3 test/memory_test.py       # 7 memory assertions: injection, caps, transactional remember, proposals, journal, CLI, workspace
+python3 test/auth_test.py         # 7 auth assertions: open mode, sign-in + lockout, roles, ownership, tokens, TLS + Host allowlist, CLI sessions
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -537,3 +575,12 @@ grants are absent.
   a note a person accepts; `overlord memory show|user|journal|accept`; a
   Memory section in the workspace with proposal cards. 144 assertions across
   thirteen suites.
+- 2026-09-16 — v0.12: accounts, TLS, a team on one machine. `auth.py`:
+  scrypt-hashed accounts in a mode-600 file, login cookies and hashed
+  bearer tokens, lockout after repeated failures, roles admin / operator /
+  viewer checked on every route, per-account settings, keys and notes,
+  `owner` recorded on sessions and honoured in both pages; `overlord users`
+  and `overlord tls selfsign`; `overlord ui --bind/--tls-cert/--tls-key/
+  --host`, refused beyond loopback without accounts and TLS; a sign-in page,
+  an Accounts panel and read-only conversations in the workspace. 152
+  assertions across fourteen suites.

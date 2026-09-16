@@ -83,6 +83,7 @@ overlord shell -t /srv/app                           # interactive transactional
 
 overlord agent -t /srv/app "add a Makefile with a test target"   # jailed by default
 overlord agent --net none -t /srv/app "<task>"       # ...and offline too
+overlord agent --net proxy --net-allow github.com --net-allow "*.pypi.org" -t /srv/app "<task>"  # recorded, allowlisted egress
 overlord agent --no-jail -t /srv/app "<task>"        # opt out: tools reach the real fs
 overlord agent --provider openai-compatible --base-url http://127.0.0.1:11434/v1 \
                --model llama3 -t /srv/app "<task>"   # a local model, same jail
@@ -737,6 +738,22 @@ rather than failing when no backend exists.
 | **kernel** | full — the overlay is mounted over the target's own path in a private mount namespace, so even absolute-path writes into the target are captured; `--jail` makes the rest of the filesystem cease to exist for the process | unprivileged user namespaces; on Ubuntu 24.04+ the shipped AppArmor profile grants exactly that to the `overlord` binary alone, nothing else weakened |
 | **fuse** | cooperative — the overlay is the working directory, but absolute-path writes elsewhere are not intercepted | none |
 
+**Recorded egress (`--net proxy`).** `--net host` gives the agent the host's
+network and records nothing — the diff shows what it wrote, never what it
+sent. `--net proxy` closes that: the command runs in an EMPTY network
+namespace with no route out (a direct `connect()` returns `ENETUNREACH`,
+enforced by the kernel), and its only path is an HTTP proxy OVERLORD runs.
+Every connection is one line on the session's egress log (`egress.jsonl`:
+host, port, method, allowed, bytes each way), and `--net-allow host` (or
+`*.suffix`, repeatable) turns recording into refusal — a host outside the
+list gets 403. It needs no `slirp4netns`, `passt` or host root: a tiny front
+inside the namespace hands each client socket to a back in the parent's
+namespace (which has the real network) over `SCM_RIGHTS`, so the proxy is
+the only way out by construction, not by cooperation. TLS is not
+intercepted; a CONNECT tunnel records host, port and byte counts, which is
+what a tunnel honestly exposes. DNS resolves in the back, so a proxied jail
+needs no resolver of its own.
+
 The design choice that matters: **the fuse backend refuses `--jail` and
 `--net` rather than pretending to honor them.** A degraded backend that
 silently ignored a containment grant would be worse than no grant at all — so
@@ -789,6 +806,8 @@ python3 test/webhook_test.py      # 5 webhook assertions against a local receive
 python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
 python3 test/bundle_test.py       # 5 bundle assertions: signed export, second-machine import + tamper/forgery refusal, replay + commit, UI, crafted tars
 python3 test/escape_test.py       # 5 escape assertions: the agent is told the truth; env / keys / home / pid 1 / net / writes-out all fail; all recorded; DNS with net=host; A13
+python3 test/netproxy_test.py     # 5 egress-proxy assertions (offline): allowlist, CONNECT tunnel, 403, absolute HTTP, per-connection log
+python3 test/netproxy_live_test.py # 5 net=proxy assertions on the kernel backend: empty netns, proxy-only egress, recorded, allowlist refusal
 python3 test/limits_test.py       # 6 limits + gates assertions: rlimits, cgroup, disk grant + agent stop, policy ceilings, protected paths + truncated review, shell tools
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
@@ -1031,6 +1050,17 @@ grants are absent.
   even by the key holder when the pin is kept off-box. (Review verdicts were
   already bound to a fingerprint of the exact diff; keying the log now covers
   those records too.) `--audit`
+- 2026-09-16 — v0.27: recorded egress (`--net proxy`). The agent's network is
+  mediated: an empty namespace with no route out, and one path through a
+  recording, allowlisting proxy (`netproxy.py`). Every connection is on the
+  session's `egress.jsonl` with destination and byte counts; `--net-allow`
+  turns it into a lock (403 outside the list). Enforced by the kernel (empty
+  netns) with no slirp/passt/root — a front in the namespace passes client
+  sockets to a back in the host namespace over SCM_RIGHTS. Workspace gains a
+  "recorded (proxy)" network option and an allowlist field. Proven end to
+  end on the kernel backend against a local upstream, plus an offline proxy
+  suite. This closes the network half of the trust-kernel "complete
+  mediation" gap; connectors remain host-side.
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

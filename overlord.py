@@ -48,6 +48,8 @@ Grants (the capability manifest, via flags or --manifest file):
     --jail          pivot_root jail: the process sees system dirs + the target
                     and nothing else — $HOME and the rest of the fs don't exist
     --net none      private network namespace: no network, not even loopback
+    --net proxy     empty netns whose only egress is a recording, allowlisting
+                    proxy — every connection is on the session's record
                     to host services
     --timeout N     hard wall-clock limit; the process group is killed
     --merge-base    keep a base copy of the target to enable commit --merge
@@ -387,7 +389,10 @@ def prepare_kernel(target, sdir, grants):
     _check_mount_path(target, "target")
     _check_mount_path(sdir, "session")
     argv = ["unshare", "--map-root-user", "--mount"]
-    if grants.get("net") == "none":
+    if grants.get("net") in ("none", "proxy"):
+        # proxy egress runs in an EMPTY namespace with no route out; the only
+        # path is the in-namespace proxy front (netproxy), so a direct connect
+        # is refused by the kernel, not by cooperation
         argv.append("--net")
     if grants.get("jail"):
         # private pid, uts and ipc namespaces: a jailed process must not see
@@ -1063,7 +1068,7 @@ def load_grants(args):
     """Capability manifest: --manifest file defaults, CLI flags override."""
     grants = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
     optional = {"connectors": list, "connector_approval": str, "limits": dict,
-                "connector_shell": bool}
+                "connector_shell": bool, "net_allow": list}
     manifest_file = getattr(args, "manifest", None)
     if manifest_file:
         with open(manifest_file) as f:
@@ -1077,6 +1082,8 @@ def load_grants(args):
         grants.update(declared)
     if getattr(args, "net", None):
         grants["net"] = args.net
+    if getattr(args, "net_allow", None):
+        grants["net_allow"] = list(args.net_allow)
     if getattr(args, "jail", False):
         grants["jail"] = True
     if getattr(args, "timeout", None):
@@ -1101,7 +1108,7 @@ def load_grants(args):
 # reconciled to "pending" by whoever loads it next.
 
 _EXECUTOR_SRC = r"""
-import base64, json, os, signal, socket, subprocess, sys, threading
+import base64, fcntl, json, os, signal, socket, struct, subprocess, sys, threading
 # red team A11: the executor inherits the holder's environment, which is the
 # operator's — provider keys, OVERLORD_HOME, whatever `overlord ui` was
 # started with. Nothing a sandboxed command runs may read those, so the
@@ -1112,6 +1119,37 @@ for _k in list(os.environ):
     if _k not in _KEEP and not _k.startswith("LC_"):
         del os.environ[_k]
 os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+# net=proxy: this process holds an EMPTY network namespace. Bring loopback up
+# and run a front that hands every client socket to the back (the parent, in
+# the host namespace) over the passed control fd. The agent's tools reach the
+# world only through http://127.0.0.1:PORT — a direct connect has no route.
+_pfd = int(sys.argv[2]) if len(sys.argv) > 2 else -1
+_pport = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+if _pfd >= 0:
+    def _lo_up():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            cur = struct.unpack("16sh", fcntl.ioctl(s, 0x8913, struct.pack("16sh", b"lo", 0)))[1]
+            fcntl.ioctl(s, 0x8914, struct.pack("16sh", b"lo", cur | 0x1))
+        finally:
+            s.close()
+    def _front(ctrlfd, port):
+        ctrl = socket.socket(fileno=ctrlfd)
+        try: _lo_up()
+        except OSError: pass
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port)); srv.listen(64)
+        while True:
+            try: cl, _ = srv.accept()
+            except OSError: break
+            try: ctrl.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", cl.fileno()))])
+            except OSError: pass
+            cl.close()
+    threading.Thread(target=_front, args=(_pfd, _pport), daemon=True).start()
+    _url = "http://127.0.0.1:%d" % _pport
+    os.environ.update(HTTP_PROXY=_url, HTTPS_PROXY=_url, http_proxy=_url,
+                      https_proxy=_url, NO_PROXY="", no_proxy="")
 sock = socket.socket(fileno=int(sys.argv[1]))
 rf = sock.makefile("rb")
 wl = threading.Lock()
@@ -1222,6 +1260,7 @@ class LiveSession:
         self._queue = queue
         self.expired = False
         self.closed = False
+        self._proxy = None
         self._ready = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -1463,6 +1502,12 @@ class LiveSession:
             self._sock.close()
         except OSError:
             pass
+        if self._proxy:
+            self._proxy["stop"].set()
+            try:
+                self._proxy["sock"].close()
+            except OSError:
+                pass
         if self._cleanup:
             self._cleanup()
         if self._ebpf:
@@ -1852,12 +1897,19 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         cg = _cgroup_create(sid, limits)
     else:
         cg = {"kind": "none", "paths": []}
+    proxy_parent = proxy_child = None
+    proxy_fd, proxy_port = -1, 0
+    if grants.get("net") == "proxy":
+        import netproxy as _np
+        proxy_parent, proxy_child = socket.socketpair()
+        proxy_fd, proxy_port = proxy_child.fileno(), _np.PROXY_PORT
     argv = (sd + _systemd_props(limits) + ["--"] if sd else []) + prefix + \
-        [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
+        [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno()), str(proxy_fd), str(proxy_port)]
     # red team A11: the environment is cut BEFORE the process exists. Unsetting
     # variables inside it is cosmetic — /proc/<pid>/environ reads the original
     # block, so a jailed `cat /proc/1/environ` would still show the keys.
-    popen_kw = {"pass_fds": (child_sock.fileno(),), "env": sandbox_env()}
+    pass_fds = (child_sock.fileno(),) + ((proxy_child.fileno(),) if proxy_child else ())
+    popen_kw = {"pass_fds": pass_fds, "env": sandbox_env()}
     if cg.get("paths"):
         popen_kw["preexec_fn"] = _cgroup_joiner(cg)
     if capture:
@@ -1870,12 +1922,24 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         raise
     finally:
         child_sock.close()
+        if proxy_child:
+            proxy_child.close()
         if capture:
             outfile.close()
     meta["holder_pid"] = proc.pid
     meta["limits"] = limits
     meta["cgroup"] = cg
     save_meta(sid, meta)
+    proxy = None
+    if grants.get("net") == "proxy":
+        import netproxy as _np
+        import threading as _threading
+        allow = _np.Allow(grants.get("net_allow"))
+        rec = _np.Recorder(path=os.path.join(sdir, "egress.jsonl"))
+        stop = _threading.Event()
+        back = _threading.Thread(target=_np.run_backend, args=(proxy_parent, allow, rec, stop), daemon=True)
+        back.start()
+        proxy = {"sock": proxy_parent, "stop": stop, "thread": back, "rec": rec, "allow": allow}
     ebpf = None
     if trace == "ebpf":
         try:
@@ -1886,12 +1950,17 @@ def _launch_holder(sid, meta, lock, capture, fresh):
             raise
     try:
         live = LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+        live._proxy = proxy
     except OverlordError:
+        if proxy:
+            proxy["stop"].set()
+            proxy["sock"].close()
         abort(parent_sock, cleanup, proc)
         raise
     _audit("session.open" if fresh else "session.reopen", sid=sid, target=target,
            owner=meta.get("owner"), backend=backend, agent=meta.get("agent"),
            jail=bool(grants.get("jail")), net=grants.get("net"),
+           net_allow=grants.get("net_allow") or None,
            connectors=grants.get("connectors") or None)
     return live
 
@@ -2730,6 +2799,8 @@ def cmd_doctor(args):
          "available" if k else "blocked", k),
         ("fuse backend (fuse-overlayfs, cooperative)",
          "available" if fu else _fuse_backend_reason(), fu),
+        ("recorded egress (--net proxy: empty netns + in-process proxy)",
+         "available" if k else "needs the kernel backend", k),
         ("syscall trace (--trace, strace)",
          "available" if shutil.which("strace") else "missing",
          bool(shutil.which("strace"))),
@@ -2783,7 +2854,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.26.0"
+VERSION = "0.27.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -3183,8 +3254,11 @@ def _add_exec_flags(parser):
     parser.add_argument("--manifest", help="capability manifest JSON (flags override)")
     parser.add_argument("--jail", action="store_true",
                         help="pivot_root jail: only system dirs + target exist")
-    parser.add_argument("--net", choices=["host", "none"],
-                        help="network grant (none = private empty netns)")
+    parser.add_argument("--net", choices=["host", "none", "proxy"],
+                        help="network grant (none = empty netns; proxy = recorded egress via an allowlisting proxy)")
+    parser.add_argument("--net-allow", action="append", metavar="HOST",
+                        help="with --net proxy: a host or *.suffix the agent may reach "
+                             "(repeatable; none given = record every connection, allow all)")
     parser.add_argument("--limit", action="append", metavar="KEY=N",
                         help=f"a resource grant: {', '.join(LIMIT_KEYS)} (0 = unlimited)")
     parser.add_argument("--connector-shell", action="store_true",

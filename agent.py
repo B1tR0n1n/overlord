@@ -678,7 +678,11 @@ def _conditions_block(live, provider):
                               "unreachable. Your working folder is the real project mounted read-only "
                               "beneath your overlay, at its real path."
                               if g.get("jail") else "a cooperative overlay (no jail)")
-             + "; network: " + ("none" if g.get("net", "none") == "none" else "host")
+             + "; network: " + {"none": "none", "host": "host"}.get(
+                 g.get("net", "none"),
+                 "recorded — your only route out is a proxy that logs every connection"
+                 + (" and allows only " + ", ".join(g.get("net_allow") or [])
+                    if g.get("net_allow") else "; a direct connection has no route"))
              + (f"; time limit {g['timeout']}s" if g.get("timeout") else "") + ".",
              "- Every command and file change is recorded; provenance is derived from the "
              "overlay by the engine, not from what you report. A person reviews the diff "

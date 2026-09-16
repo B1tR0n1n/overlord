@@ -19,7 +19,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --create-home --home-dir /home/overlord overlord
 
-COPY overlord.py agent.py providers.py review.py mcp.py memory.py auth.py cost.py audit.py \
+COPY overlord.py agent.py providers.py review.py mcp.py memory.py auth.py cost.py audit.py netproxy.py \
      retention.py skills.py oidc.py notify.py vault.py bundle.py ui.py chatui.py /usr/local/lib/overlord/
 COPY sdk/overlord_client.py /usr/local/lib/overlord/overlord_client.py
 COPY packaging/ebpf/provenance.bt /usr/local/lib/overlord/provenance.bt

@@ -39,7 +39,7 @@ import notify as notify_mod
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
 DEFAULT_SETTINGS = {"provider": "anthropic", "model": "", "jail": True,
-                    "net": "none", "max_turns": 40, "workdir": "",
+                    "net": "none", "net_allow": [], "max_turns": 40, "workdir": "",
                     # the second model that countersigns: blank provider = the agent's
                     # provider, in which case the model must differ from the agent's
                     "review_provider": "", "review_model": "",
@@ -206,8 +206,15 @@ def save_settings(incoming):
             except (TypeError, ValueError):
                 raise core.OverlordError("error: context window must be a whole number of tokens or blank")
         s["gen"] = g
-    if s.get("net") not in ("none", "host"):
-        raise core.OverlordError("error: net must be none or host")
+    if s.get("net") not in ("none", "host", "proxy"):
+        raise core.OverlordError("error: net must be none, host or proxy")
+    na = s.get("net_allow")
+    if na is not None:
+        if isinstance(na, str):
+            na = [h.strip() for h in na.replace(",", " ").split() if h.strip()]
+        if not isinstance(na, list) or any(not isinstance(h, str) for h in na):
+            raise core.OverlordError("error: net_allow must be a list of hosts")
+        s["net_allow"] = na
     rp = str(s.get("review_provider") or "")
     if rp and rp not in prov.PROVIDERS + ["scripted"]:
         raise core.OverlordError("error: the second model's provider must be one of "
@@ -358,8 +365,11 @@ def _grants_for(settings, backend):
     backend; on fuse they are refused rather than faked, so the workspace
     drops them and says so."""
     if backend == "kernel":
-        return {"net": settings.get("net", "none"), "jail": bool(settings.get("jail", True)),
-                "timeout": None, "merge_base": False}, None
+        g = {"net": settings.get("net", "none"), "jail": bool(settings.get("jail", True)),
+             "timeout": None, "merge_base": False}
+        if g["net"] == "proxy" and settings.get("net_allow"):
+            g["net_allow"] = list(settings["net_allow"])
+        return g, None
     note = ("Cooperative backend (fuse-overlayfs): the agent works in an overlay, "
             "but the jail and offline grants need the kernel backend, so they are off. "
             "Writes outside the folder are not contained.")
@@ -1121,7 +1131,8 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="row2">
       <div class="field"><label>Sandbox</label>
         <label class="toggle"><input type="checkbox" id="s-jail"> Jail (kernel backend)</label>
-        <select id="s-net"><option value="none">Network: offline</option><option value="host">Network: host</option></select>
+        <select id="s-net"><option value="none">Network: offline</option><option value="proxy">Network: recorded (proxy)</option><option value="host">Network: host</option></select>
+        <input id="s-netallow" type="text" placeholder="allow (recorded proxy): github.com, *.pypi.org — blank records all">
         <div class="desc" id="jailnote"></div></div>
       <div class="field"><label>Max steps per message</label>
         <input id="s-maxturns" type="number" min="1" max="200"></div>
@@ -1548,6 +1559,8 @@ async function openSettings(msg){
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('s-net').value = SETTINGS.net || 'none';
   $('s-net').disabled = !SETTINGS.jail_available;
+  $('s-netallow').value = (SETTINGS.net_allow||[]).join(', ');
+  $('s-netallow').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available
     ? 'Jail: namespaces, no capabilities, seccomp, the host tree read-only. Network: with host access the agent can fetch packages and call APIs; every connection it makes is on the record, and OVERLORD\'s own UI still needs the launch token.'
     : 'This machine has the cooperative backend; the jail and the offline grant are unavailable.';
@@ -1565,6 +1578,7 @@ async function saveSettings(){
   const body = {provider:$('s-provider').value,
     review_provider:$('r-provider').value, review_model:$('r-model').value.trim(),
     workdir:$('s-workdir').value.trim(), jail:$('s-jail').checked, net:$('s-net').value,
+    net_allow:$('s-netallow').value.split(/[\s,]+/).filter(Boolean),
     max_turns:Number($('s-maxturns').value)||40,
     provider_opts:{model:$('s-model').value.trim(), base_url:$('s-baseurl').value.trim(),
       headers:$('s-headers').value.trim(), azure_api_version:$('s-azurever').value.trim()},

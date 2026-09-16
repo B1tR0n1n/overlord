@@ -186,6 +186,7 @@ def build_dossier(sid, meta=None):
     lines.append("")
     lines.append("DIFF:")
     budget = MAX_DIFF_CHARS
+    omitted = []
     for kind, rel in changes:
         if rel.endswith("/") or kind == "invalid-whiteout":
             continue
@@ -208,11 +209,19 @@ def build_dossier(sid, meta=None):
                 chunk = f"--- {rel}: {kind}, no textual difference\n"
             if len(chunk) > MAX_FILE_CHARS:
                 chunk = chunk[:MAX_FILE_CHARS] + f"\n... [{rel}: diff truncated]\n"
+                omitted.append(rel)
         if len(chunk) > budget:
+            rest = [x for _k, x in changes[changes.index((kind, rel)):] if not x.endswith("/")]
+            omitted.extend(x for x in rest if x not in omitted)
             lines.append(f"... [diff budget exhausted; {rel} and later files omitted — use read_file]")
             break
         budget -= len(chunk)
         lines.append(chunk.rstrip("\n"))
+    if omitted:
+        lines.append("\nNOTE: you have NOT seen the whole diff (" + ", ".join(omitted[:12])
+                     + (", …" if len(omitted) > 12 else "") + "). An approval on a partial view does "
+                     "not countersign a commit; read the omitted files in full or reject.")
+    build_dossier.last_omitted = omitted
     return "\n".join(lines), (changes, origin, uppers)
 
 
@@ -309,9 +318,11 @@ def run_review(sid, provider, max_turns=DEFAULT_MAX_TURNS, emit=None, allow_same
             if decided:
                 break
     finally:
+        omitted = list(getattr(build_dossier, "last_omitted", []) or [])
         rec = {"reviewer": reviewer, "verdict": verdict, "reason": reason, "paths": paths,
                "fingerprint": fp, "same_model": same, "usage": usage,
-               "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "changes": len(changes)}
+               "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "changes": len(changes),
+               "truncated": bool(omitted), "omitted": omitted[:40]}
         record({"type": "verdict", **rec})
         log.close()
         meta = ov.load_meta(sid)          # re-read: nothing else may be lost

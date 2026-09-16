@@ -421,7 +421,7 @@ async function fork(sid, at) {
 }
 
 async function review(sid) {
-  const provider = ($('rev-provider') || {}).value || 'anthropic';
+  const provider = ($('rev-provider') || {}).value || null;   // blank: Settings → Countersignature
   const model = ($('rev-model') || {}).value || null;
   const box = $('sig-status');
   if (box) box.textContent = 'reviewing…';
@@ -1385,11 +1385,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise core.OverlordError("error: fork needs an integer savepoint")
                     self._send({"sid": core.fork_session(sid, at)})
                 elif action == "review":
-                    import agent as agent_mod
                     import review as review_mod
-                    provider = agent_mod.make_provider(
-                        str(req.get("provider") or "anthropic"), req.get("model") or None,
-                        script_env=review_mod.SCRIPT_ENV)
+                    provider = chatui.build_review_provider(chatui.load_settings(),
+                                                            req.get("provider") or None,
+                                                            req.get("model") or None)
                     rec = review_mod.run_review(sid, provider,
                                                 allow_same=bool(req.get("same_model")))
                     self._send({"review": rec})

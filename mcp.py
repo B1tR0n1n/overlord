@@ -32,6 +32,7 @@ process environment, so one connector's token is not another's.
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -342,12 +343,25 @@ def is_read_only(tool):
     return bool(ann.get("readOnlyHint"))
 
 
+SHELL_RE = re.compile(r"(^|[_\-. ])(shell|bash|zsh|sh|exec|execute|run_command|run_cmd|"
+                      r"terminal|cmd|command|eval|spawn|subprocess|system|powershell)([_\-. ]|$)", re.I)
+
+
+def looks_like_shell(tool):
+    """A connector tool that would hand the model a shell on the host — the
+    one capability the transaction exists to contain. Withheld unless the
+    session was granted connector_shell."""
+    return bool(SHELL_RE.search(tool.get("name") or ""))
+
+
 class Registry:
     """The connectors a session was granted, connected on first use, with
     their tools in the agent's tool form."""
 
-    def __init__(self, names, config=None):
+    def __init__(self, names, config=None, allow_shell=False):
         cfg = config or load_config()
+        self.allow_shell = bool(allow_shell)
+        self.withheld = []
         self.specs = {}
         for n in names or []:
             spec = cfg["servers"].get(n)
@@ -365,6 +379,9 @@ class Registry:
                 if n not in self._conns:
                     self._conns[n] = Connector(n, spec)
                     for t in self._conns[n].tools:
+                        if not self.allow_shell and looks_like_shell(t):
+                            self.withheld.append(tool_name(n, t["name"]))
+                            continue
                         self._map[tool_name(n, t["name"])] = (n, t)
         return self
 

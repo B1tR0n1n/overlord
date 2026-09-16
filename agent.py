@@ -445,7 +445,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         connectors = list(grants.get("connectors") or [])
     registry = None
     if connectors:
-        registry = mcp_mod.Registry(connectors)
+        registry = mcp_mod.Registry(connectors, allow_shell=bool(grants.get("connector_shell")))
         grants["connectors"] = list(connectors)
     mode = approval or (registry.approval if registry else "ask")
     if mode not in mcp_mod.APPROVAL_MODES:
@@ -506,7 +506,8 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             record({"type": "error", "text": str(e)})
             raise
         record({"type": "connectors", "servers": list(connectors), "approval": mode,
-                "tools": [t["name"] for t in all_tools[len(TOOLS):]]})
+                "tools": [t["name"] for t in all_tools[len(TOOLS):]],
+                "withheld": list(registry.withheld)})
     if catalogue and not resume:
         record({"type": "skills", "offered": [{"name": s["name"], "source": s["source"]}
                                               for s in catalogue]})
@@ -616,6 +617,14 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                     record({"type": "skill_use", "turn": turn, "name": name, "source": source,
                             "file": rel})
                 recorded_skill_uses = len(tools.skill_uses)
+            if getattr(live, "over_disk", False):
+                record({"type": "error", "turn": turn,
+                        "text": "the session crossed its disk grant; nothing more can run — "
+                                "what was written stays for review"})
+                record({"type": "done", "reason": "limit", "turn": turn, "usage": live.meta["usage"]})
+                audit_mod.record("limit.stop", sid=live.sid, owner=live.meta.get("owner"),
+                                 what="disk", bytes=live.meta.get("disk_bytes"))
+                return final
             if compact_due:
                 messages = _compact(live, provider, system_prompt, messages, task, turn,
                                     reply.usage.get("in", 0), record)
@@ -659,6 +668,11 @@ def _conditions_block(live, provider):
     if limits:
         lines.append("- Budget: " + ", ".join(f"{k}={v}" for k, v in limits.items())
                      + "; the session stops before the call that would cross a line.")
+    lim = live.meta.get("limits") or {}
+    if lim:
+        lines.append("- Resource grants: " + ", ".join(f"{k}={v}" for k, v in lim.items() if v)
+                     + f" (enforced by {(live.meta.get('cgroup') or {}).get('kind', 'rlimits')}"
+                     " and rlimits); crossing the disk line ends the session's ability to run commands.")
     if live.meta.get("owner"):
         lines.append(f"- You are working for {live.meta['owner']}.")
     if os.path.isfile(os.path.join(live.meta.get("target") or "", "overlord.py")):

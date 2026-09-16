@@ -40,6 +40,9 @@ LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
 DEFAULT_SETTINGS = {"provider": "anthropic", "model": "", "jail": True,
                     "net": "none", "max_turns": 40, "workdir": "",
+                    # the second model that countersigns: blank provider = the agent's
+                    # provider, in which case the model must differ from the agent's
+                    "review_provider": "", "review_model": "",
                     # per-provider endpoint + model, kept when you switch providers
                     "providers": {},
                     # generation knobs; blank means "do not send"
@@ -99,7 +102,7 @@ def provider_opts(s, provider=None):
     return o
 
 
-def build_provider(s, provider=None, model=None):
+def build_provider(s, provider=None, model=None, script_env="OVERLORD_AGENT_SCRIPT"):
     """The model the workspace talks to, from settings (or an override)."""
     p = provider or s["provider"]
     o = provider_opts(s, p)
@@ -107,7 +110,25 @@ def build_provider(s, provider=None, model=None):
         p, model or o.get("model") or None,
         base_url=o.get("base_url") or None, headers=o.get("headers") or None,
         config=prov.ModelConfig.from_dict(s.get("gen")),
-        azure_api_version=o.get("azure_api_version") or None)
+        azure_api_version=o.get("azure_api_version") or None, script_env=script_env)
+
+
+def build_review_provider(s, provider=None, model=None):
+    """The second model, from Settings → Countersignature (or an override).
+    It must not be the agent's own model: a countersignature by the same
+    mind is a signature, not a second one."""
+    import review as review_mod
+    p = provider or s.get("review_provider") or s["provider"]
+    m = model or s.get("review_model") or None
+    if p == "scripted":
+        return agent_mod.make_provider("scripted", m, script_env=review_mod.SCRIPT_ENV)
+    agent_model = provider_opts(s, s["provider"]).get("model") or prov.DEFAULT_MODELS.get(s["provider"], "")
+    if not m:
+        m = prov.DEFAULT_MODELS.get(p, "")
+    if p == s["provider"] and m == agent_model:
+        raise core.OverlordError("error: the second model is the agent's own model — choose a different "
+                                 "model or provider under Settings → Countersignature")
+    return build_provider(s, p, m, script_env=review_mod.SCRIPT_ENV)
 
 
 def save_settings(incoming):
@@ -184,6 +205,12 @@ def save_settings(incoming):
         s["gen"] = g
     if s.get("net") not in ("none", "host"):
         raise core.OverlordError("error: net must be none or host")
+    rp = str(s.get("review_provider") or "")
+    if rp and rp not in prov.PROVIDERS + ["scripted"]:
+        raise core.OverlordError("error: the second model's provider must be one of "
+                                 + ", ".join(prov.PROVIDERS) + " (or blank for the agent's)")
+    s["review_provider"] = rp
+    s["review_model"] = str(s.get("review_model") or "").strip()
     try:
         s["max_turns"] = max(1, min(200, int(s.get("max_turns") or 40)))
     except (TypeError, ValueError):
@@ -1032,6 +1059,19 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <input id="g-context" type="number" min="8000" step="1000" placeholder="128000">
       <div class="desc">When a call uses three quarters of this, the agent writes a handover note and older turns are dropped; the note is on the transcript.</div></div>
     </details>
+    <details class="adv" id="review-section"><summary>Countersignature (second model)</summary>
+    <div class="desc">The model that reviews a diff before it can be countersigned. It must not be the agent's own model — a signature by the same mind is not a second one. Blank provider means the agent's provider with a different model.</div>
+    <div class="row2">
+      <div class="field"><label>Reviewer provider</label>
+        <select id="r-provider"><option value="">same as the agent</option>
+          <option value="anthropic">Anthropic (Claude)</option><option value="openai">OpenAI</option>
+          <option value="azure">Azure OpenAI</option><option value="openai-compatible">OpenAI-compatible</option>
+          <option value="gemini">Google Gemini</option></select></div>
+      <div class="field"><label>Reviewer model</label>
+        <input id="r-model" type="text" placeholder="that provider's default" autocomplete="off"></div>
+    </div>
+    <div class="desc">Uses the provider's saved endpoint, headers and key from above. A review with a truncated diff never countersigns; harness files (and any policy-protected path) need a complete one.</div>
+    </details>
     <div class="field"><label>Working folder</label>
       <input id="s-workdir" type="text">
       <div class="desc">The agent works on a sandboxed copy of this folder. Nothing changes until you Commit.</div></div>
@@ -1389,8 +1429,10 @@ document.addEventListener('click', async e=>{
   if(b.dataset.commit!==undefined) return insAction('/api/session/'+encodeURIComponent(b.dataset.commit)+'/commit');
   if(b.dataset.discard!==undefined) return insAction('/api/session/'+encodeURIComponent(b.dataset.discard)+'/rollback');
   if(b.dataset.review!==undefined){ const m=$('actmsg'); if(m){m.textContent='asking a second model…';m.className='act-msg';}
+    // the second model comes from Settings → Countersignature; the server refuses
+    // the agent's own model, so a blank setting fails loudly instead of guessing
     return insAction('/api/session/'+encodeURIComponent(b.dataset.review)+'/review',
-                     {provider: SETTINGS.provider==='openai'?'anthropic':'openai'}); }
+                     {provider: SETTINGS.review_provider||null, model: SETTINGS.review_model||null}); }
 });
 
 // settings modal
@@ -1433,6 +1475,8 @@ async function openSettings(msg){
   $('g-stream').checked = g.stream !== false;
   $('g-fallbacks').checked = g.fallbacks !== false;
   $('g-context').value = g.context_limit || '';
+  $('r-provider').value = SETTINGS.review_provider || '';
+  $('r-model').value = SETTINGS.review_model || '';
   fillProvider(SETTINGS.provider);
   renderConnectors();
   loadMemory();
@@ -1462,6 +1506,7 @@ function keystate(){ const has = SETTINGS.keys && SETTINGS.keys[$('s-provider').
   const k=$('keystate'); k.textContent = has?'set':'not set'; k.className='keystate '+(has?'set':'unset'); }
 async function saveSettings(){
   const body = {provider:$('s-provider').value,
+    review_provider:$('r-provider').value, review_model:$('r-model').value.trim(),
     workdir:$('s-workdir').value.trim(), jail:$('s-jail').checked,
     max_turns:Number($('s-maxturns').value)||40,
     provider_opts:{model:$('s-model').value.trim(), base_url:$('s-baseurl').value.trim(),

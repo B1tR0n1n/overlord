@@ -986,10 +986,38 @@ def apply_layers(uppers, target, backend=None):
 # ---------------------------------------------------------------- execution
 
 
+# resource grants: what a session may consume of the machine. Enforced by
+# rlimits in every command (both backends) and, where the host allows, a
+# cgroup around the whole session; the disk figure is measured per layer.
+DEFAULT_LIMITS = {"memory_mb": 4096, "pids": 512, "cpu_pct": 200, "disk_mb": 8192,
+                  "fsize_mb": 4096, "nofile": 4096}
+LIMIT_KEYS = tuple(DEFAULT_LIMITS)
+DISK_RC = 122            # a command's exit code when the session crossed its disk grant
+
+
+def parse_limits(pairs, base=None):
+    """--limit key=value (repeatable) over defaults; 0 means unlimited."""
+    limits = dict(base or DEFAULT_LIMITS)
+    for pair in pairs or []:
+        k, sep, v = str(pair).partition("=")
+        if not sep or k not in LIMIT_KEYS:
+            raise OverlordError(f"error: --limit takes one of {', '.join(LIMIT_KEYS)}=N")
+        try:
+            limits[k] = max(0, int(v))
+        except ValueError:
+            raise OverlordError(f"error: --limit {k} must be a whole number")
+    return limits
+
+
+def effective_limits(grants):
+    return {k: int(v) for k, v in (grants.get("limits") or DEFAULT_LIMITS).items() if k in LIMIT_KEYS}
+
+
 def load_grants(args):
     """Capability manifest: --manifest file defaults, CLI flags override."""
     grants = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
-    optional = {"connectors": list, "connector_approval": str}
+    optional = {"connectors": list, "connector_approval": str, "limits": dict,
+                "connector_shell": bool}
     manifest_file = getattr(args, "manifest", None)
     if manifest_file:
         with open(manifest_file) as f:
@@ -1009,6 +1037,10 @@ def load_grants(args):
         grants["timeout"] = args.timeout
     if getattr(args, "merge_base", False):
         grants["merge_base"] = True
+    if getattr(args, "limit", None):
+        grants["limits"] = parse_limits(args.limit, grants.get("limits"))
+    if getattr(args, "connector_shell", False):
+        grants["connector_shell"] = True
     return grants
 
 
@@ -1041,12 +1073,35 @@ procs = {}
 def send(o):
     with wl:
         sock.sendall((json.dumps(o) + "\n").encode())
+def _limits_hook(lim):
+    # rlimits in the child, before exec: the process count, the size of any
+    # one file, open files, and — when no cgroup surrounds the session — the
+    # data segment as a coarse memory line. Inherited by everything below.
+    import resource
+    def hook():
+        MB = 1 << 20
+        for key, res in (("pids", resource.RLIMIT_NPROC), ("nofile", resource.RLIMIT_NOFILE)):
+            v = int(lim.get(key) or 0)
+            if v > 0:
+                try: resource.setrlimit(res, (v, v))
+                except (ValueError, OSError): pass
+        v = int(lim.get("fsize_mb") or 0)
+        if v > 0:
+            try: resource.setrlimit(resource.RLIMIT_FSIZE, (v * MB, v * MB))
+            except (ValueError, OSError): pass
+        v = int(lim.get("memory_mb") or 0)
+        if v > 0 and lim.get("rlimit_memory"):
+            try: resource.setrlimit(resource.RLIMIT_DATA, (v * MB, v * MB))
+            except (ValueError, OSError): pass
+    return hook
 def run(req):
     rid, cmd = req["id"], req["cmd"]
     cwd = req.get("cwd") or None
     kw = {}
     if req.get("capture", True):
         kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if req.get("limits"):
+        kw["preexec_fn"] = _limits_hook(req["limits"])
     try:
         p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True, **kw)
     except OSError as e:
@@ -1240,6 +1295,8 @@ class LiveSession:
         if self.closed or self.expired:
             raise OverlordError("error: session is closed" if self.closed else
                              "error: session expired (timeout grant)")
+        if getattr(self, "over_disk", False):
+            raise OverlordError("error: session exceeded its disk grant; commit or discard it")
         cwd = _check_rel_cwd(cwd)
         rid = uuid.uuid4().hex[:8]
         q = self._queue.Queue()
@@ -1264,8 +1321,11 @@ class LiveSession:
         if not self.meta.get("cmd"):
             self.meta["cmd"] = list(cmd)
         save_meta(self.sid, self.meta)
+        lim = dict(effective_limits(self.meta.get("grants") or {}))
+        if (self.meta.get("cgroup") or {}).get("kind") in (None, "none"):
+            lim["rlimit_memory"] = True          # no cgroup: the data segment is the memory line
         self._send({"op": "run", "id": rid, "cmd": wrapped, "capture": capture,
-                    "cwd": run_cwd})
+                    "cwd": run_cwd, "limits": lim})
         timer = None
         timed_out = [False]
         if timeout:
@@ -1306,6 +1366,24 @@ class LiveSession:
         if timed_out[0] or (self.expired and rc in (137, TIMEOUT_RC)):
             rc = TIMEOUT_RC
             rec["timed_out"] = True
+        # the disk grant: this layer's upper is measured after the command; the
+        # session's total is the sum over layers, and a crossing ends the session's
+        # ability to run anything else — what was written stays for review
+        disk_mb = int(effective_limits(self.meta.get("grants") or {}).get("disk_mb") or 0)
+        if disk_mb:
+            try:
+                lrec["bytes"] = _tree_bytes(os.path.join(self.sdir, layer_upper_rel(layer)))
+            except OSError:
+                pass
+            total = sum(int(lr.get("bytes") or 0) for lr in self.layers)
+            self.meta["disk_bytes"] = total
+            if total > disk_mb << 20:
+                self.over_disk = True
+                rec["disk_exceeded"] = True
+                note = f"\noverlord: session exceeded its disk grant ({total >> 20} MiB > {disk_mb} MiB)\n"
+                out += note.encode()
+                if rc == 0:
+                    rc = DISK_RC
         rec.update(exit_code=rc, finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         save_meta(self.sid, self.meta)
         return rc, bytes(out)
@@ -1339,6 +1417,7 @@ class LiveSession:
             self._cleanup()
         if self._ebpf:
             self._ebpf.terminate()
+        _cgroup_release(self.meta.get("cgroup"))
         fcntl.flock(self._lock, fcntl.LOCK_UN)
         self._lock.close()
         changes = _finalize_session(self.sid, self.meta)
@@ -1495,6 +1574,156 @@ def reopen_session(sid, wait=False, capture=False):
     return _launch_holder(sid, m, lock, capture, fresh=False)
 
 
+def _cgroup_prefix(limits):
+    """systemd-run --user --scope with the limits, when a user manager is
+    there to delegate a cgroup (desktops, WSL2 with systemd on). Probed once."""
+    if _cgroup_prefix.cache is not None:
+        return list(_cgroup_prefix.cache)
+    prefix = []
+    if shutil.which("systemd-run"):
+        try:
+            r = subprocess.run(["systemd-run", "--user", "--scope", "-q", "-p", "TasksMax=64", "--", "true"],
+                               capture_output=True, timeout=10)
+            if r.returncode == 0:
+                prefix = ["systemd-run", "--user", "--scope", "-q"]
+        except (OSError, subprocess.TimeoutExpired):
+            prefix = []
+    _cgroup_prefix.cache = prefix
+    return list(prefix)
+
+
+_cgroup_prefix.cache = None
+
+
+def _systemd_props(limits):
+    props = []
+    if limits.get("memory_mb"):
+        props += ["-p", f"MemoryMax={int(limits['memory_mb'])}M"]
+    if limits.get("pids"):
+        props += ["-p", f"TasksMax={int(limits['pids'])}"]
+    if limits.get("cpu_pct"):
+        props += ["-p", f"CPUQuota={int(limits['cpu_pct'])}%"]
+    return props
+
+
+def _cgroup_create(sid, limits):
+    """Make a cgroup with the limits BEFORE the holder is launched: the child
+    joins it in its own pre-exec hook, so every process below it is born
+    inside. (Joining after Popen missed the executor that `unshare --fork`
+    had already forked.) Tries cgroup v2 directly (root, or a delegated
+    tree), then v1 controllers. Returns {"kind", "paths"}; "none" = rlimits only."""
+    def w(path, val):
+        with open(path, "w") as f:
+            f.write(str(val))
+    base = "/sys/fs/cgroup"
+    if os.path.isfile(os.path.join(base, "cgroup.controllers")):
+        for parent in (base, _own_cgroup_dir()):
+            if not parent:
+                continue
+            d = os.path.join(parent, "overlord", sid) if parent == base else os.path.join(parent, f"overlord-{sid}")
+            try:
+                os.makedirs(os.path.dirname(d), exist_ok=True)
+                try:
+                    w(os.path.join(os.path.dirname(d), "cgroup.subtree_control"), "+memory +pids +cpu")
+                except OSError:
+                    pass
+                os.makedirs(d, exist_ok=True)
+                if limits.get("memory_mb"):
+                    w(os.path.join(d, "memory.max"), int(limits["memory_mb"]) << 20)
+                if limits.get("pids"):
+                    w(os.path.join(d, "pids.max"), int(limits["pids"]))
+                if limits.get("cpu_pct"):
+                    w(os.path.join(d, "cpu.max"), f"{int(limits['cpu_pct']) * 1000} 100000")
+                return {"kind": "v2", "paths": [d]}
+            except OSError:
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+                continue
+        return {"kind": "none", "paths": []}
+    paths = []
+    for ctl, files in (("memory", {"memory.limit_in_bytes": (int(limits.get("memory_mb") or 0) << 20) or None}),
+                       ("pids", {"pids.max": int(limits.get("pids") or 0) or None}),
+                       ("cpu", {"cpu.cfs_quota_us": (int(limits.get("cpu_pct") or 0) * 1000) or None,
+                                "cpu.cfs_period_us": 100000 if limits.get("cpu_pct") else None})):
+        root = os.path.join(base, ctl)
+        if not os.path.isdir(root) or not any(v for v in files.values()):
+            continue
+        d = os.path.join(root, f"overlord-{sid}")
+        try:
+            os.makedirs(d, exist_ok=True)
+            for fn, val in files.items():
+                if val is not None:
+                    w(os.path.join(d, fn), val)
+            paths.append(d)
+        except OSError:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    return {"kind": "v1" if paths else "none", "paths": paths}
+
+
+def _cgroup_joiner(info):
+    """The child's pre-exec hook: write its own pid into every cgroup made
+    for the session, before it forks anything."""
+    paths = list((info or {}).get("paths") or [])
+
+    def join():
+        pid = str(os.getpid())
+        for d in paths:
+            try:
+                with open(os.path.join(d, "cgroup.procs"), "w") as f:
+                    f.write(pid)
+            except OSError:
+                pass
+    return join
+
+
+def _own_cgroup_dir():
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    return "/sys/fs/cgroup" + line.strip()[3:]
+    except OSError:
+        pass
+    return None
+
+
+def _cgroup_release(info):
+    for d in reversed((info or {}).get("paths") or []):
+        for _ in range(20):
+            try:
+                os.rmdir(d)
+                break
+            except OSError:
+                time.sleep(0.05)
+
+
+def limits_backend():
+    """For doctor: how a session's limits are enforced on this host."""
+    if _cgroup_prefix(DEFAULT_LIMITS):
+        return "cgroup v2 via systemd-run --user --scope (+ rlimits)"
+    if os.path.isfile("/sys/fs/cgroup/cgroup.controllers"):
+        probe = os.path.join("/sys/fs/cgroup", "overlord", "probe")
+        try:
+            os.makedirs(probe, exist_ok=True)
+            os.rmdir(probe)
+            return "cgroup v2, direct (+ rlimits)"
+        except OSError:
+            return "rlimits only (cgroup v2 not delegated to this user; enable systemd --user for cgroups)"
+    if os.path.isdir("/sys/fs/cgroup/pids"):
+        try:
+            os.makedirs("/sys/fs/cgroup/pids/overlord-probe", exist_ok=True)
+            os.rmdir("/sys/fs/cgroup/pids/overlord-probe")
+            return "cgroup v1 (+ rlimits)"
+        except OSError:
+            pass
+    return "rlimits only"
+
+
 SANDBOX_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "TERM", "USER", "LOGNAME",
                     "SHELL", "TZ", "COLUMNS", "LINES", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")
 
@@ -1506,6 +1735,17 @@ def sandbox_env():
            if k in SANDBOX_ENV_KEEP or k.startswith("LC_")}
     env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     return env
+
+
+def _tree_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
 
 
 def _launch_holder(sid, meta, lock, capture, fresh):
@@ -1553,11 +1793,23 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         raise
     parent_sock, child_sock = socket.socketpair()
     py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
-    argv = prefix + [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
+    limits = effective_limits(grants)
+    want_cg = any(limits.get(k) for k in ("memory_mb", "pids", "cpu_pct"))
+    sd = _cgroup_prefix(limits) if want_cg else []
+    if sd:
+        cg = {"kind": "systemd", "paths": []}
+    elif want_cg:
+        cg = _cgroup_create(sid, limits)
+    else:
+        cg = {"kind": "none", "paths": []}
+    argv = (sd + _systemd_props(limits) + ["--"] if sd else []) + prefix + \
+        [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
     # red team A11: the environment is cut BEFORE the process exists. Unsetting
     # variables inside it is cosmetic — /proc/<pid>/environ reads the original
     # block, so a jailed `cat /proc/1/environ` would still show the keys.
     popen_kw = {"pass_fds": (child_sock.fileno(),), "env": sandbox_env()}
+    if cg.get("paths"):
+        popen_kw["preexec_fn"] = _cgroup_joiner(cg)
     if capture:
         outfile = open(os.path.join(sdir, "output.log"), "ab")
         popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
@@ -1571,6 +1823,8 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         if capture:
             outfile.close()
     meta["holder_pid"] = proc.pid
+    meta["limits"] = limits
+    meta["cgroup"] = cg
     save_meta(sid, meta)
     ebpf = None
     if trace == "ebpf":
@@ -2000,12 +2254,25 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
     # (or policy) demands a fresh approval
     import review as review_mod
     rev, fresh = review_mod.review_state(sid, m, selected if (only or drop) else None)
-    if countersigned and not (rev and fresh and rev.get("verdict") == "approve"):
+    # protected paths: a policy list, or the harness's own modules when the
+    # target is OVERLORD's source. Touching one needs a fresh, complete
+    # countersignature and can never be forced past a rejection or conflict.
+    protected = protected_hits(m["target"], changes)
+    if protected:
+        if force:
+            raise OverlordError("error: --force is refused: the diff touches protected paths: "
+                                + ", ".join(protected[:8]))
+        countersigned = True
+    if countersigned and not (rev and fresh and rev.get("verdict") == "approve"
+                              and not rev.get("truncated")):
         why = ("no review recorded" if rev is None else
                "the last review is stale — the diff changed since it was signed" if not fresh
+               else "the reviewer did not see the whole diff (dossier truncated) — fail closed"
+               if rev.get("verdict") == "approve" and rev.get("truncated")
                else f"the last review {rev.get('verdict')}ed")
         raise OverlordError(f"error: commit needs a fresh countersignature ({why}): "
-                            f"overlord review {sid}")
+                            f"overlord review {sid}" + (f" — protected: {', '.join(protected[:5])}"
+                                                        if protected else ""))
     if rev and fresh and rev.get("verdict") == "reject" and not force:
         _audit("session.commit_refused", sid=sid, owner=m.get("owner"), target=m["target"],
                why="rejected by review", reviewer=rev.get("reviewer"))
@@ -2075,6 +2342,32 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
            overrode_rejection=m.get("overrode_rejection") or None, usage=m.get("usage"))
     return {"committed": True, "applied": len(changes), "merged": merged,
             "target": m["target"], "layers": selected, "dropped": dropped}
+
+
+HARNESS_FILES = ("overlord.py", "agent.py", "providers.py", "review.py", "mcp.py", "memory.py",
+                 "auth.py", "vault.py", "oidc.py", "notify.py", "cost.py", "audit.py", "bundle.py",
+                 "skills.py", "retention.py", "ui.py", "chatui.py", "packaging/*", "Dockerfile")
+
+
+def protected_patterns(target):
+    """The policy rule's "protect" globs; with no rule, the harness's own
+    modules when the folder is OVERLORD's source."""
+    pol = load_policy()
+    rule = _policy_rule(pol, os.path.realpath(target)) if pol else None
+    if rule is not None and "protect" in rule:
+        return [str(p) for p in (rule.get("protect") or [])]
+    if os.path.isfile(os.path.join(target, "overlord.py")):
+        return list(HARNESS_FILES)
+    return []
+
+
+def protected_hits(target, changes):
+    import fnmatch
+    pats = protected_patterns(target)
+    if not pats:
+        return []
+    return [rel for _k, rel in changes
+            if any(fnmatch.fnmatch(rel.rstrip("/"), p) or fnmatch.fnmatch(rel, p + "/*") for p in pats)]
 
 
 def rollback_session(sid):
@@ -2416,6 +2709,7 @@ def cmd_doctor(args):
     v = audit_mod.verify()
     checks.append(("audit chain", f"intact, {v['entries']} entries" if v["ok"]
                    else f"BROKEN at line {v['broken_at']}: {v['reason']}", v["ok"]))
+    checks.append(("resource limits (memory / pids / cpu per session)", limits_backend(), True))
     du = retention_mod.usage()
     rc = retention_mod.load_config()
     checks.append(("records on disk",
@@ -2433,7 +2727,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.22.0"
+VERSION = "0.23.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2477,6 +2771,15 @@ def resolve_policy(target, requested):
     cap = rule.get("timeout")
     if cap is not None:
         eff["timeout"] = min(cap, eff.get("timeout") or cap)
+    if isinstance(rule.get("limits"), dict):
+        # a policy limit is a ceiling: the smaller of the two wins, 0 = unlimited on either side
+        lim = effective_limits(eff)
+        for k, v in rule["limits"].items():
+            if k in LIMIT_KEYS:
+                lim[k] = int(v) if not lim.get(k) else (int(v) if not int(v) else min(lim[k], int(v)))
+        eff["limits"] = lim
+    if not rule.get("connector_shell", False):
+        eff.pop("connector_shell", None)
     return eff, rule
 
 
@@ -2826,6 +3129,10 @@ def _add_exec_flags(parser):
                         help="pivot_root jail: only system dirs + target exist")
     parser.add_argument("--net", choices=["host", "none"],
                         help="network grant (none = private empty netns)")
+    parser.add_argument("--limit", action="append", metavar="KEY=N",
+                        help=f"a resource grant: {', '.join(LIMIT_KEYS)} (0 = unlimited)")
+    parser.add_argument("--connector-shell", action="store_true",
+                        help="offer connector tools that look like a shell (withheld by default)")
     parser.add_argument("--timeout", type=float, metavar="SECS",
                         help="hard wall-clock limit; kills the process group")
     parser.add_argument("--merge-base", action="store_true",

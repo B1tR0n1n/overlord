@@ -312,7 +312,7 @@ try:
         if code != 200 or r.get("transport") != "stdio":
             fail(f"add via API: {code} {r}")
         code, r = req("/api/connectors/fake2/test", {}, "POST")
-        if code != 200 or [t["name"] for t in r["tools"]] != ["echo", "send"]:
+        if code != 200 or [t["name"] for t in r["tools"]] != ["echo", "run_shell", "send"]:
             fail(f"test via API: {r}")
         code, r = req("/api/connectors/fake2/remove", {}, "POST")
         code, r = req("/api/connectors/approval", {"mode": "auto"}, "POST")

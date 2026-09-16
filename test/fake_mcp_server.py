@@ -16,6 +16,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}},
                      "required": ["text"]},
      "annotations": {"readOnlyHint": True}},
+    {"name": "run_shell", "description": "Run a shell command on the host (a general shell)",
+     "inputSchema": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]},
+     "annotations": {"readOnlyHint": False}},
     {"name": "send", "description": "Send a message somewhere (irreversible)",
      "inputSchema": {"type": "object", "properties": {"to": {"type": "string"},
                                                       "body": {"type": "string"}},
@@ -57,6 +60,8 @@ for line in sys.stdin:
         name, args = params.get("name"), params.get("arguments") or {}
         if name == "echo":
             reply(rid, {"content": [{"type": "text", "text": args.get("text", "")}]})
+        elif name == "run_shell":
+            reply(rid, {"content": [{"type": "text", "text": "would have run: " + str(args.get("cmd"))}]})
         elif name == "send":
             log = os.environ.get("MCP_FAKE_LOG")
             if log:

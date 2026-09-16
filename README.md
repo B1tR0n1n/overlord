@@ -447,6 +447,22 @@ is what each one is:
 4. *Sensitive code in-tree* — the same as 1: the code that handles secrets
    is not the secrets.
 
+## Resource grants
+
+A session may consume only what it was granted of the machine (`limits`:
+`memory_mb`, `pids`, `cpu_pct`, `disk_mb`, `fsize_mb`, `nofile`; defaults
+4 GiB, 512, 200 %, 8 GiB, 4 GiB, 4096; `--limit key=N`, 0 = unlimited;
+a policy rule's `limits` are ceilings). Enforcement, in layers: rlimits
+in every command on both backends (process count, file size, open files,
+and the data segment when nothing better exists); a cgroup around the
+whole session where the host allows — v2 through `systemd-run --user
+--scope`, v2 directly, or v1 — created before the holder is launched so
+every process is born inside it, released after; and the disk grant
+measured per layer, whose crossing ends the session's ability to run
+anything (what was written stays for review; the agent stops with reason
+`limit`, audited). `overlord doctor` says which layer this host provides.
+A fork bomb or a disk fill costs the session, not the machine.
+
 ## Grants (the capability manifest)
 
 Grants scope what a session may do — commander's intent as enforced constraints.
@@ -521,6 +537,21 @@ absorbing writes. On the fuse backend the merged view is remounted between
 commands; a lingering process that pins it makes the next savepoint coarser
 rather than failing. Rewind is refused while a command is running.
 
+## Deterministic gates
+
+Two rules the reviewer's judgment cannot be talked out of. **Fail closed
+on a partial view**: when the dossier had to omit or truncate part of the
+diff, the verdict records it, the reviewer is told it has not seen the
+whole diff, and an approval on a partial view never countersigns a
+commit. **Protected paths**: a policy rule's `protect` globs — or, when
+the working folder is OVERLORD's own source, the harness's modules —
+need a fresh, complete countersignature to commit and are refused
+`--force` outright. Connector tools that look like a shell (`shell`,
+`exec`, `run_command`, `terminal`, …) are withheld from the agent unless
+the session holds the `connector_shell` grant, which policy must allow:
+a general shell on the host is the one capability the transaction exists
+to contain.
+
 ## Countersignature: a two-person rule for machines
 
 ```bash
@@ -570,6 +601,9 @@ byte-identical.
   profile when you switch. On the kernel backend the agent's hands are jailed
   and offline by default; the model still thinks on your machine with network,
   only its tools are confined.
+- **Countersignature** under Settings names the second model (provider and
+  model); the inspector's Second-model check uses it, and the server refuses
+  the agent's own model rather than guessing another provider.
 - **Accounts** (when on) appear under Settings: an admin adds people and
   sets roles; everyone can change their own password and mint a script
   token. A conversation you may only read shows a read-only composer.
@@ -682,6 +716,7 @@ python3 test/webhook_test.py      # 5 webhook assertions against a local receive
 python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
 python3 test/bundle_test.py       # 5 bundle assertions: signed export, second-machine import + tamper/forgery refusal, replay + commit, UI, crafted tars
 python3 test/escape_test.py       # 3 escape assertions: the agent is told the truth; env / keys / home / pid 1 / net / writes-out all fail; all recorded
+python3 test/limits_test.py       # 6 limits + gates assertions: rlimits, cgroup, disk grant + agent stop, policy ceilings, protected paths + truncated review, shell tools
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -890,3 +925,12 @@ grants are absent.
   capability set before exec. The conditions block names OVERLORD's own
   source when it is the working folder. 198 assertions across twenty-three
   suites.
+- 2026-09-16 — v0.23: resource grants and deterministic gates. `limits`
+  (memory, pids, cpu, disk, file size, open files) enforced by rlimits in
+  every command, a cgroup around the session (v2 via systemd, v2, v1) and a
+  per-layer disk measure that ends the session and stops the agent; policy
+  ceilings; `--limit`. Protected paths need a complete countersignature and
+  refuse --force; a truncated reviewer dossier fails closed; shell-shaped
+  connector tools withheld without the `connector_shell` grant. The
+  workspace names the second model under Settings instead of guessing a
+  provider. 204 assertions across twenty-four suites.

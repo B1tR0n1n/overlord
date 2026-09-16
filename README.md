@@ -82,6 +82,7 @@ overlord sso set --issuer https://login.example.com --client-id … --client-sec
 overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.overlord/tls/key.pem
 overlord skills add skills/python-testing            # packaged know-how, loaded when it fits
 overlord skills new release -t /srv/app              # a project skill: part of the tree, reviewed like code
+overlord webhooks add team https://hooks.slack.com/… # tell the channel when work waits for a person
 overlord cost                                        # what the models spent, by model / account / day
 overlord cost budget --day-usd 20                    # a line no conversation crosses
 overlord audit verify                                # the hash chain of every consequential act
@@ -282,6 +283,23 @@ itself a transcript event (`compaction`: the note, what was kept, the
 tokens that triggered it), the note's call is on the ledger, and a resume
 rebuilds exactly the view the model had — nothing the model was told is
 lost from the record, only from its context.
+
+## Notifications
+
+A gate nobody is told about is a gate that stalls. Webhooks (`notify.py`)
+subscribe to **audit actions** — the log is already the machine's index of
+consequential acts — and two acts exist for this: `session.needs_review`,
+when an agent finishes with changes waiting for a person, and
+`connector.approval_requested`, when an external action waits at the
+approval gate. `budget.stop`, `session.commit`, `review.verdict` and the
+rest are there to subscribe to. Format `slack` posts `{"text": …}` that
+Slack-compatible incoming webhooks render, with a link to the conversation
+when a base URL is set; format `json` posts the audit entry with a text
+line and an HMAC signature (`X-Overlord-Signature`) when a secret is set.
+Delivery is off the caller's path — a background queue, three attempts
+with backoff, a 4xx tried once — and a failing endpoint never fails the
+work. `overlord webhooks add|list|test|rm|base-url`, or Settings →
+Notifications.
 
 ## Cost
 
@@ -561,6 +579,7 @@ python3 test/audit_test.py        # 5 audit assertions: chained acts, tamper det
 python3 test/skills_test.py       # 6 skills assertions: catalogue + shadowing, jailed / host loads, authored in-transaction, policy, CLI, workspace
 python3 test/sso_test.py          # 5 SSO assertions against a fake provider: config, PKCE round-trip, role mapping + domains, password refusal, audit
 python3 test/session_test.py      # 5 long-conversation assertions: compaction + record, exact resume replay, the window setting, durable logins, rate limit
+python3 test/webhook_test.py      # 5 webhook assertions against a local receiver: config, needs-review + link + signature, approval gate + budget, retries, API
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -723,3 +742,9 @@ grants are absent.
   replays it exactly; the note's call is on the ledger. Logins persist
   across restarts (hashed at rest); a per-address rate limit. 179
   assertions across nineteen suites.
+- 2026-09-16 — v0.17: notifications. `notify.py`: webhooks subscribed to
+  audit actions, slack text or signed json, links to the conversation,
+  background delivery with retries; `session.needs_review` and
+  `connector.approval_requested` become audited acts; `overlord webhooks`;
+  a Notifications panel; `?sid=` deep links. 184 assertions across twenty
+  suites.

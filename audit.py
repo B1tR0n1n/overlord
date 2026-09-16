@@ -101,6 +101,12 @@ def record(action, **fields):
     except OSError as e:
         import sys
         print(f"audit: could not write {AUDIT_FILE}: {e}", file=sys.stderr)
+    try:
+        import notify
+        notify.dispatch(entry)          # webhooks subscribe to audit actions
+    except Exception as e:              # noqa: BLE001 — never on the caller's path
+        import sys
+        print(f"audit: webhook dispatch: {e}", file=sys.stderr)
     return entry
 
 

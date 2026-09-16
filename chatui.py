@@ -34,6 +34,7 @@ import memory as memory_mod
 import auth
 import cost as cost_mod
 import skills as skills_mod
+import notify as notify_mod
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -1073,6 +1074,20 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="ap-acts"><button class="act act-review" id="sk-add">Add skill</button>
       <span class="act-msg" id="sk-msg"></span></div>
     </details>
+    <details class="adv hide" id="hooks-section"><summary>Notifications</summary>
+    <div class="desc">Tell a chat channel or a service when something needs a person: an agent finished and its changes wait for review, an external action waits for approval, a budget stopped a conversation. Slack-compatible incoming webhooks work as they are.</div>
+    <div class="field"><label>Workspace URL for links</label><input id="wh-base" type="text" placeholder="https://overlord.example.lan:7777"></div>
+    <div id="wh-list" class="conn-list"></div>
+    <div class="row2">
+      <div class="field"><label>Name</label><input id="wh-name" type="text" placeholder="team"></div>
+      <div class="field"><label>Format</label><select id="wh-format"><option value="slack">slack (text)</option><option value="json">json (signed)</option></select></div>
+    </div>
+    <div class="field"><label>URL</label><input id="wh-url" type="text" placeholder="https://hooks.slack.com/services/…"></div>
+    <div class="field"><label>Events (comma-separated; blank = needs review, approval requested, budget stop)</label>
+      <input id="wh-events" type="text" placeholder="session.needs_review, connector.approval_requested, budget.stop"></div>
+    <div class="ap-acts"><button class="act act-review" id="wh-add">Add webhook</button>
+      <span class="act-msg" id="wh-msg"></span></div>
+    </details>
     <details class="adv" id="cost-section"><summary>Cost</summary>
     <div class="desc">Every model call is priced from the table in ~/.overlord/cost.json and written to a ledger. A conversation stops before the call that would cross a budget line.</div>
     <div class="field"><label>Spend</label><div class="memview" id="cost-spend"></div></div>
@@ -1410,6 +1425,8 @@ async function openSettings(msg){
   $('account-section').classList.toggle('hide', !ME.auth);
   loadCost();
   loadSkills();
+  $('hooks-section').classList.toggle('hide', !isAdmin());
+  if(isAdmin()) loadHooks();
   $('audit-section').classList.toggle('hide', !(isAdmin() || ME.role==='viewer'));
   if(isAdmin() || ME.role==='viewer') loadAudit();
   $('users-section').classList.toggle('hide', !(ME.auth && ME.role==='admin'));
@@ -1513,6 +1530,30 @@ async function mintToken(){
   const r = await j('/api/users/'+encodeURIComponent(ME.user)+'/token',{method:'POST',body:JSON.stringify({label:'workspace'})});
   $('a-token').textContent = r.error||r.token;
 }
+async function loadHooks(){
+  const r = await j('/api/webhooks'); const list = $('wh-list'); list.innerHTML='';
+  if(r.error){ list.appendChild(el('div','desc',r.error)); return; }
+  $('wh-base').value = r.base_url||'';
+  if(!r.hooks.length) list.appendChild(el('div','desc','No webhooks yet.'));
+  r.hooks.forEach(h=>{ const row = el('div','conn-item'); row.appendChild(el('span','cn', h.name));
+    row.appendChild(el('span','cw', '['+h.format+(h.has_secret?', signed':'')+'] '+h.url+' — '+h.events.join(', ')));
+    const t = el('button','linkbtn','test'); t.addEventListener('click', async()=>{ t.textContent='sending…';
+      const q = await j('/api/webhooks/'+encodeURIComponent(h.name)+'/test',{method:'POST',body:'{}'});
+      t.textContent = q.error ? 'failed' : 'delivered'; if(q.error) $('wh-msg').textContent = q.error; });
+    const rm = el('button','linkbtn','remove'); rm.addEventListener('click', async()=>{
+      await j('/api/webhooks/'+encodeURIComponent(h.name)+'/remove',{method:'POST',body:'{}'}); loadHooks(); });
+    row.appendChild(t); row.appendChild(rm); list.appendChild(row); });
+  if(r.stats && (r.stats.sent||r.stats.failed)) list.appendChild(el('div','desc',
+    `delivered ${r.stats.sent}, failed ${r.stats.failed}`+(r.stats.last_error?' — last error: '+r.stats.last_error:'')));
+}
+async function addHook(){
+  const events = $('wh-events').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const r = await j('/api/webhooks',{method:'POST',body:JSON.stringify({name:$('wh-name').value.trim(),
+    url:$('wh-url').value.trim(), format:$('wh-format').value, events})});
+  const m=$('wh-msg'); m.textContent = r.error||('added '+r.added); m.className='act-msg '+(r.error?'bad':'ok');
+  if(!r.error){ $('wh-name').value=''; $('wh-url').value=''; $('wh-events').value=''; loadHooks(); }
+}
+async function saveBase(){ await j('/api/webhooks',{method:'POST',body:JSON.stringify({base_url:$('wh-base').value.trim()})}); }
 async function loadSkills(){
   const r = await j('/api/skills'); const list = $('skills-list'); list.innerHTML='';
   if(r.error){ list.appendChild(el('div','desc',r.error)); return; }
@@ -1601,6 +1642,8 @@ $('a-passwd').addEventListener('click',changePassword);
 $('a-mint').addEventListener('click',mintToken);
 $('b-save').addEventListener('click',saveBudget);
 $('sk-add').addEventListener('click',addSkill);
+$('wh-add').addEventListener('click',addHook);
+$('wh-base').addEventListener('change',saveBase);
 $('logout').addEventListener('click',signOut);
 $('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
   body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });
@@ -1610,6 +1653,8 @@ $('input').addEventListener('input',autosize);
 $('input').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} });
 
 (async ()=>{ await loadSettings(); await loadConvs();
+  const want = new URLSearchParams(location.search).get('sid');   // a notification's deep link
+  if(want && /^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$/.test(want)){ try { await select(want); return; } catch(e) {} }
   if(!SETTINGS.provider_ready) openSettings('Add your API key to begin.');
   newChat();
 })();
@@ -1629,6 +1674,10 @@ def handle_get(handler, path, query):
         return True
     if path == "/api/connectors":
         handler._send(mcp_mod.public_config())
+        return True
+    if path == "/api/webhooks":
+        auth.require("admin")
+        handler._send(notify_mod.public())
         return True
     if path == "/api/skills":
         s = load_settings()
@@ -1700,6 +1749,26 @@ def handle_post(handler, parts, req):
         if action == "remember":
             auth.require("act", core.load_meta(sid))
             handler._send(memory_mod.accept_suggestion(sid, str(req.get("id") or "")))
+            return True
+    if parts == ["api", "webhooks"]:
+        auth.require("admin")
+        if "base_url" in req and len(req) == 1:
+            notify_mod.set_base_url(str(req.get("base_url") or ""))
+            handler._send({"base_url": notify_mod.load_config()["base_url"]})
+            return True
+        h = notify_mod.add_hook(str(req.get("name") or ""), str(req.get("url") or ""),
+                                [str(e) for e in (req.get("events") or [])] or None,
+                                str(req.get("format") or "slack"), str(req.get("secret") or ""))
+        handler._send({"added": h["name"]})
+        return True
+    if len(parts) == 4 and parts[:2] == ["api", "webhooks"]:
+        auth.require("admin")
+        if parts[3] == "remove":
+            notify_mod.remove_hook(parts[2])
+            handler._send({"removed": parts[2]})
+            return True
+        if parts[3] == "test":
+            handler._send({"status": notify_mod.send_test(parts[2])})
             return True
     if parts == ["api", "skills"]:
         auth.require("admin")

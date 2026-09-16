@@ -653,6 +653,9 @@ def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=N
     req = {"id": tc["id"], "turn": turn, "tool": desc["tool"], "server": desc["server"],
            "name": tc["name"], "input": tc["input"], "read_only": desc["read_only"]}
     decision = "read-only" if desc["read_only"] else None
+    if decision is None and mode == "ask" and approve:
+        audit_mod.record("connector.approval_requested", sid=sid, owner=owner,
+                         server=desc["server"], tool=desc["tool"])
     if not desc["read_only"]:
         if mode == "readonly":
             decision = "denied-by-policy"

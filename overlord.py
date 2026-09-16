@@ -1264,6 +1264,11 @@ class LiveSession:
         fcntl.flock(self._lock, fcntl.LOCK_UN)
         self._lock.close()
         changes = _finalize_session(self.sid, self.meta)
+        if self.meta.get("agent") and changes:
+            # an agent's work is waiting for a person: the act a webhook tells the team about
+            _audit("session.needs_review", sid=self.sid, target=self.meta.get("target"),
+                   owner=self.meta.get("owner"), agent=self.meta.get("agent"),
+                   files=len(changes), task=(self.meta.get("task") or "")[:200])
         return self.sid, changes
 
 
@@ -2334,7 +2339,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2781,8 +2786,10 @@ def main(argv=None):
     import retention as retention_mod
     import skills as skills_mod
     import oidc as oidc_mod
+    import notify as notify_mod
     skills_mod.add_skills_parser(sub)
     oidc_mod.add_sso_parser(sub)
+    notify_mod.add_webhooks_parser(sub)
     auth_mod.add_auth_parsers(sub)
     cost_mod.add_cost_parser(sub)
     audit_mod.add_audit_parser(sub)

@@ -324,14 +324,35 @@ def _operator_note(live, note):
 
 
 def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
-              should_stop=None, resume=False, note=None):
+              should_stop=None, resume=False, note=None, connectors=None,
+              approval=None, approve=None):
     """Drive the model against an open LiveSession until it stops calling
     tools, hits max_turns, or should_stop() is true. Emits events:
-      assistant / tool_call / tool_result / done / error
+      assistant_delta / assistant / tool_call / tool_result / approval / done / error
     With resume=True the transcript already on disk (as cut by rewind) is
     the model's memory; an operator note is delivered as the next user turn.
+
+    connectors: MCP server names this session is granted (default: the
+    session's recorded grant). Their tools are offered next to the built-ins;
+    a call runs on the host, outside the transaction, and is recorded with
+    the server that served it. Non-read-only connector tools pass through the
+    approval gate: `approval` is ask|auto|readonly (default from mcp.json) and
+    `approve(request) -> bool` is asked under "ask" — no approver means deny.
     Returns the final assistant text."""
+    import mcp as mcp_mod
     emit = emit or (lambda e: None)
+    grants = live.meta.setdefault("grants", {})
+    if connectors is None:
+        connectors = list(grants.get("connectors") or [])
+    registry = None
+    if connectors:
+        registry = mcp_mod.Registry(connectors)
+        grants["connectors"] = list(connectors)
+    mode = approval or (registry.approval if registry else "ask")
+    if mode not in mcp_mod.APPROVAL_MODES:
+        raise ov.OverlordError(f"error: connector approval must be one of {mcp_mod.APPROVAL_MODES}")
+    if connectors:
+        grants["connector_approval"] = mode
     tpath = os.path.join(live.sdir, "transcript.jsonl")
     start_turn = 1
     messages = [{"role": "user", "content": task}]
@@ -367,6 +388,15 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
 
     tools = ToolRunner(live)
     attribution = Attribution(live)
+    all_tools = list(TOOLS)
+    if registry:
+        try:
+            all_tools += registry.tools()
+        except ov.OverlordError as e:
+            record({"type": "error", "text": str(e)})
+            raise
+        record({"type": "connectors", "servers": list(connectors), "approval": mode,
+                "tools": [t["name"] for t in all_tools[len(TOOLS):]]})
     if resume:
         text = _operator_note(live, note)
         messages.append({"role": "user", "content": text})
@@ -381,7 +411,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                 record({"type": "done", "reason": "cancelled", "turn": turn})
                 return final
             reply = provider.complete(
-                SYSTEM_PROMPT, messages, tools=TOOLS,
+                SYSTEM_PROMPT, messages, tools=all_tools,
                 on_delta=lambda t, _turn=turn: emit({"type": "assistant_delta",
                                                      "turn": _turn, "text": t}))
             live.meta["usage"]["in"] += reply.usage.get("in", 0)
@@ -416,8 +446,11 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                         "usage": live.meta["usage"]})
                 return final
             for tc in reply.tool_calls:
-                record({"type": "tool_call", "turn": turn, "id": tc["id"],
-                        "tool": tc["name"], "input": tc["input"]})
+                ev = {"type": "tool_call", "turn": turn, "id": tc["id"],
+                      "tool": tc["name"], "input": tc["input"]}
+                if registry and registry.owns(tc["name"]):
+                    ev.update(external=True, **{"connector": registry.describe(tc["name"])["server"]})
+                record(ev)
                 label = f"turn{turn}:{tc['id']}:{tc['name']}"
                 cause = {"turn": turn, "tool_call_id": tc["id"], "tool": tc["name"],
                          "summary": _summarize(tc)}
@@ -425,6 +458,9 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                     # streamed tool input that did not parse strictly: hand it
                     # back as an error so the model can retry, never run it
                     out, rc = json.dumps({"INVALID_JSON": tc["invalid_json"][:4000]}), 1
+                    touched = []
+                elif registry and registry.owns(tc["name"]):
+                    out, rc = _connector_call(registry, mode, approve, tc, turn, record)
                     touched = []
                 else:
                     out, rc = tools.run(tc["name"], tc["input"], label, cause)
@@ -447,6 +483,53 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         raise
     finally:
         transcript.close()
+        if registry:
+            registry.close()
+
+
+def _connector_call(registry, mode, approve, tc, turn, record):
+    """A connector tool: outside the jail and the transaction, so gated.
+    Returns (output, rc) for the model; every decision is in the transcript."""
+    desc = registry.describe(tc["name"])
+    req = {"id": tc["id"], "turn": turn, "tool": desc["tool"], "server": desc["server"],
+           "name": tc["name"], "input": tc["input"], "read_only": desc["read_only"]}
+    decision = "read-only" if desc["read_only"] else None
+    if not desc["read_only"]:
+        if mode == "readonly":
+            decision = "denied-by-policy"
+        elif mode == "auto":
+            decision = "auto-approved"
+        else:
+            record({"type": "approval", **req})
+            allowed = bool(approve(req)) if approve else False
+            decision = "approved" if allowed else ("denied" if approve else "denied-no-approver")
+    record({"type": "approval_decision", "id": tc["id"], "turn": turn, "decision": decision,
+            "server": desc["server"], "tool": desc["tool"]})
+    if decision.startswith("denied"):
+        why = {"denied-by-policy": "connector approval mode is readonly",
+               "denied-no-approver": "no one is available to approve external actions",
+               "denied": "the operator denied this action"}[decision]
+        return f"error: {desc['server']}.{desc['tool']} was not run: {why}", 1
+    try:
+        out, is_error = registry.call(tc["name"], tc["input"])
+    except ov.OverlordError as e:
+        return f"error: {e}", 1
+    return out, (1 if is_error else 0)
+
+
+def cli_approve(req):
+    """The CLI's approval gate: ask on a terminal, deny without one."""
+    if not sys.stdin.isatty():
+        print(f"  [connector] {req['server']}.{req['tool']} needs approval and there is "
+              "no terminal to ask — denied", file=sys.stderr)
+        return False
+    print(f"\n  [connector] {req['server']}.{req['tool']} wants to run with:", file=sys.stderr)
+    print("    " + json.dumps(req["input"])[:600], file=sys.stderr)
+    try:
+        ans = input("  allow this external action? [y/N] ")
+    except EOFError:
+        return False
+    return ans.strip().lower() in ("y", "yes")
 
 
 def _summarize(tc):
@@ -491,7 +574,9 @@ def cmd_agent(args):
           f"  [session {live.sid}]", file=sys.stderr)
 
     try:
-        run_agent(live, provider, args.task, max_turns=args.max_turns, emit=_show)
+        run_agent(live, provider, args.task, max_turns=args.max_turns, emit=_show,
+                  connectors=args.connector or None, approval=args.connector_approval,
+                  approve=cli_approve)
     finally:
         sid, changes = live.close()
     ov._print_session_footer(sid, ov.load_meta(sid).get("exit_code"),
@@ -537,7 +622,7 @@ def cmd_resume(args, meta):
     try:
         run_agent(live, provider, meta.get("task", ""),
                   max_turns=args.max_turns or DEFAULT_MAX_TURNS, emit=_show,
-                  resume=True, note=args.note)
+                  resume=True, note=args.note, approve=cli_approve)
     finally:
         sid, changes = live.close()
     ov._print_session_footer(sid, ov.load_meta(sid).get("exit_code"),
@@ -573,6 +658,11 @@ def _show(ev):
               + (f"  touched={len(ev['touched'])}  @{ev.get('layer')}" if ev["touched"] else ""))
     elif t == "resume":
         print(f"  ↺ resumed at savepoint @{ev.get('layer')}")
+    elif t == "connectors":
+        print(f"  ⇄ connectors {', '.join(ev['servers'])} ({ev['approval']}): "
+              f"{len(ev['tools'])} tool(s)")
+    elif t == "approval_decision":
+        print(f"    {ev['server']}.{ev['tool']}: {ev['decision']}")
     elif t == "done":
         print(f"\n[{ev['reason']} after {ev['turn']} turn(s), "
               f"tokens in/out {ev.get('usage', {}).get('in', 0)}/"
@@ -625,6 +715,11 @@ def add_model_flags(p):
     p.add_argument("--no-stream", action="store_true", help="one-shot responses instead of SSE")
     p.add_argument("--no-fallbacks", action="store_true",
                    help="anthropic native: do not opt into server-side refusal fallbacks")
+    p.add_argument("--connector", action="append", metavar="NAME",
+                   help="grant an MCP connector's tools to this session (repeatable; "
+                        "they run on the host, outside the transaction)")
+    p.add_argument("--connector-approval", choices=["ask", "auto", "readonly"],
+                   help="gate for non-read-only connector tools (default from mcp.json)")
 
 
 def add_agent_parser(sub, add_exec_flags):

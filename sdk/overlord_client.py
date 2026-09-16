@@ -160,7 +160,8 @@ class OverlordClient:
     def agent(self, target, task, provider="anthropic", model=None, max_turns=None,
               jail=False, net="host", timeout=None, merge_base=False, trace=None,
               wait=False, stack=False, on_event=None, base_url=None, headers=None,
-              config=None, azure_api_version=None):
+              config=None, azure_api_version=None, connectors=None,
+              connector_approval=None, approve_all=False):
         """Run the built-in agent against target inside a live session, then
         seal it. on_event receives transcript events (assistant_delta while
         text streams, then assistant, tool_call, tool_result, done, error) and
@@ -168,7 +169,11 @@ class OverlordClient:
         openai, azure, openai-compatible, gemini; base_url/headers reach a
         gateway or a local server; config is a dict of generation knobs
         (max_tokens, temperature, top_p, stop, effort, thinking, system_extra,
-        stream, fallbacks) — blank knobs are not sent. Returns a Session plus
+        stream, fallbacks) — blank knobs are not sent. connectors grants MCP
+        servers by name (policy may cap them; they run on the daemon host,
+        outside the transaction); connector_approval is ask|auto|readonly and
+        approve_all=True answers "ask" with yes for this run — a brokered run
+        has no terminal, so the default answer is no. Returns a Session plus
         the agent's final text."""
         def _ev(ev):
             if not on_event:
@@ -181,6 +186,8 @@ class OverlordClient:
             "agent", on_event=_ev, target=str(target), task=task, provider=provider,
             model=model, max_turns=max_turns, base_url=base_url, headers=headers,
             config=config, azure_api_version=azure_api_version,
+            connectors=connectors, connector_approval=connector_approval,
+            approve_all=approve_all,
             grants={"jail": jail, "net": net, "timeout": timeout, "merge_base": merge_base},
             trace=trace, wait=wait, stack=stack,
         )

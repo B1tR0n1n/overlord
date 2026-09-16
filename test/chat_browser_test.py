@@ -165,6 +165,8 @@ try:
         if opts != 5:
             fail(f"provider choices: {opts}")
         page.locator("#s-models-note").get_by_text("models available").wait_for(timeout=8000)
+        if not page.locator("#conn-section").count() or not page.locator("#c-add").count():
+            fail("settings lacks the connectors section")
         if page.locator("#s-models option").count() != 1:
             fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()

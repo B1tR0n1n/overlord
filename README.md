@@ -68,6 +68,10 @@ overlord agent --provider openai-compatible --base-url http://127.0.0.1:11434/v1
                --model llama3 -t /srv/app "<task>"   # a local model, same jail
 overlord agent --effort xhigh --max-tokens 64000 -t /srv/app "<task>"   # generation knobs
 overlord models --provider anthropic                 # what the endpoint serves right now
+overlord mcp add github --command npx --arg -y --arg @modelcontextprotocol/server-github \
+                 --env GITHUB_TOKEN=…                # register an MCP connector (stdio)
+overlord mcp add docs --url https://host/mcp --header 'Authorization: Bearer …'   # (http)
+overlord agent --connector github -t /srv/app "<task>"   # grant it; actions ask you first
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
@@ -128,6 +132,34 @@ back as an error rather than run when malformed, and a reply cut off at
 `max_tokens` or declined by a safety classifier never executes its tool
 calls. The knobs and the endpoint a conversation ran with are recorded on
 the session, so `resume` uses the same model the same way.
+
+## Connectors (MCP)
+
+`mcp.py` is a Model Context Protocol client, stdlib only: stdio servers
+(a command) and streamable-HTTP servers (a URL), configured in
+`~/.overlord/mcp.json`. Their tools are offered to the model next to the
+built-ins, namespaced `mcp__<server>__<tool>`, and a call is routed back to
+the server that owns it.
+
+Connectors are different from everything else here, and the design says so:
+
+- **They run on the host, outside the jail and outside the transaction.** A
+  connector that sends an email has sent it; Discard cannot unsend it. So a
+  session must be *granted* each connector by name (`--connector`, or the
+  checkboxes on a new conversation), policy can list the connectors a
+  brokered session may have (`"connectors": ["github"]` or `"*"`), and every
+  call is written to the transcript with the server that served it and shown
+  to the countersigning reviewer as an **external action**.
+- **Actions ask first.** A tool declares itself read-only through MCP's
+  `readOnlyHint`; anything else goes through the approval gate. In `ask` mode
+  (the default) the run pauses: the CLI prompts on the terminal, the
+  workspace shows an approval card with the exact input, a brokered run with
+  no one to ask is denied. `auto` allows, `readonly` refuses every action.
+  Each decision is recorded in the transcript.
+- A stdio server gets only the environment you configure for it plus PATH,
+  HOME and LANG, never the whole process environment, so one connector's
+  token is not another's. `overlord mcp test <name>` connects and lists its
+  tools with their read-only status.
 
 ## Grants (the capability manifest)
 
@@ -252,6 +284,9 @@ byte-identical.
   profile when you switch. On the kernel backend the agent's hands are jailed
   and offline by default; the model still thinks on your machine with network,
   only its tools are confined.
+- **Connectors** are granted per conversation from the welcome screen and
+  configured under Settings; when the agent wants to run one that acts on the
+  world, the chat pauses with an Allow / Deny card showing the exact input.
 - **The inspector** is the review moment made friendly: the changed files, the
   steps that made them, Commit, Discard, and a one-click second-model check
   (the countersignature). Committed sessions link back into the console.
@@ -343,6 +378,7 @@ python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-de
 python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions
 python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy assertions
 python3 test/providers_test.py    # 10 provider adapter assertions: wire shapes, streaming, knobs, listing (offline)
+python3 test/mcp_test.py          # 6 connector assertions: stdio + http transports, grants, approval gate, policy, workspace
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -453,3 +489,11 @@ grants are absent.
   tool inputs; cut-off and refusal never run tool calls; per-conversation
   provider/model with the config recorded on the session. 131 assertions
   across eleven suites.
+- 2026-09-16 — v0.10: connectors. `mcp.py`, a Model Context Protocol client
+  over stdio and streamable HTTP; tools namespaced into the agent's set;
+  connectors are grants (per session, per conversation, capped by policy);
+  non-read-only tools pass an approval gate (ask / auto / readonly) — the CLI
+  prompts, the workspace shows an Allow / Deny card, a brokered run without an
+  approver is denied; every call and decision in the transcript and in the
+  reviewer's dossier as an external action; `overlord mcp add|list|test|rm|
+  approval`. 137 assertions across twelve suites.

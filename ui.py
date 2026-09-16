@@ -1011,7 +1011,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._guard(state_changing=True):
                 return
             parts = self.path.strip("/").split("/")
-            if parts[:2] == ["api", "chats"]:
+            if parts[:2] in (["api", "chats"], ["api", "connectors"]):
                 if chatui.handle_post(self, parts, self._body()):
                     return
                 self._send({"error": "not found"}, 404)

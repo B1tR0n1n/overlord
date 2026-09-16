@@ -86,6 +86,20 @@ Providers: `anthropic`, `openai`, `azure` (deployment as `model`, plus
 `fallbacks`; a blank knob is not sent, so a model that rejects it never sees it.
 `on_event` receives `assistant_delta` events while text streams.
 
+### Connectors from the SDK
+
+```python
+s = ov.agent("/srv/app", "open a PR for this change", jail=True, net="none",
+             connectors=["github"],            # must be allowed by policy "connectors"
+             connector_approval="ask",         # a brokered run has no terminal…
+             approve_all=True)                 # …so say yes for this run explicitly
+```
+
+Policy: `"connectors": ["github", "docs"]` (or `"*"`) on a target rule lists
+what a brokered session may be granted; without a rule the daemon grants
+none. Every connector call is an event on the stream and a line in the
+transcript; the reviewer sees them under EXTERNAL ACTIONS.
+
 ### Savepoints from the SDK
 
 Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`
@@ -151,6 +165,8 @@ Callers can request grants; they can never obtain a looser scope than policy:
 - `allow_force` gates `commit --force` through the daemon.
 - `require_review` refuses every commit on the target without a fresh
   countersignature (`review`) bound to exactly the diff being committed.
+- `connectors` lists the MCP connectors a brokered session may be granted
+  (`"*"` for any); none without it.
 - Edits apply immediately — policy is re-read per request.
 
 The direct CLI is the operator's own authority and does not consult policy;

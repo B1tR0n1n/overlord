@@ -29,6 +29,7 @@ import time
 import overlord as core
 import agent as agent_mod
 import providers as prov
+import mcp as mcp_mod
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -251,8 +252,44 @@ def _conv(sid):
         c = _RUNS.get(sid)
         if c is None:
             c = _RUNS[sid] = {"events": [], "running": False, "error": None,
-                              "cancel": threading.Event(), "lock": threading.Lock()}
+                              "cancel": threading.Event(), "lock": threading.Lock(),
+                              "pending": None}
         return c
+
+
+APPROVAL_WAIT = 600     # seconds a run waits for a person to decide
+
+
+def _approver(sid):
+    """The workspace's approval gate: publish the request as an event, block
+    the worker until the browser answers (or the wait expires — a no answer
+    is a no), and record what happened."""
+    c = _conv(sid)
+
+    def approve(req):
+        gate = {"id": req["id"], "decided": threading.Event(), "allow": False}
+        with c["lock"]:
+            c["pending"] = gate
+        _emit(sid, {"type": "approval", "id": req["id"], "server": req["server"],
+                    "tool": req["tool"], "input": req["input"], "turn": req.get("turn")})
+        gate["decided"].wait(APPROVAL_WAIT)
+        with c["lock"]:
+            c["pending"] = None
+        return bool(gate["allow"]) if gate["decided"].is_set() else False
+    return approve
+
+
+def decide(sid, approval_id, allow):
+    c = _conv(sid)
+    with c["lock"]:
+        gate = c["pending"]
+        if not gate or gate["id"] != approval_id:
+            raise core.OverlordError("error: nothing is waiting for that approval")
+        gate["allow"] = bool(allow)
+        gate["decided"].set()
+    _emit(sid, {"type": "approval_decision", "id": approval_id,
+                "decision": "approved" if allow else "denied"})
+    return {"ok": True}
 
 
 def _emit(sid, ev):
@@ -294,6 +331,7 @@ def _map_event(ev):
         return {"type": "assistant", "text": ev.get("text", "")}
     if t == "tool_call":
         return {"type": "tool_call", "id": ev.get("id"), "tool": ev.get("tool"),
+                "external": bool(ev.get("external")), "connector": ev.get("connector"),
                 "summary": agent_mod._summarize(
                     {"name": ev.get("tool"), "input": ev.get("input") or {}})}
     if t == "tool_result":
@@ -306,12 +344,18 @@ def _map_event(ev):
     if t == "done":
         return {"type": "done", "reason": ev.get("reason"), "turn": ev.get("turn"),
                 "usage": ev.get("usage")}
+    if t == "connectors":
+        return {"type": "note", "text": "Connectors: " + ", ".join(ev.get("servers") or [])
+                + f" ({ev.get('approval')} mode, {len(ev.get('tools') or [])} tools)"}
+    if t == "approval_decision":
+        return {"type": "approval_decision", "id": ev.get("id"), "decision": ev.get("decision"),
+                "server": ev.get("server"), "tool": ev.get("tool")}
     if t == "error":
         return {"type": "error", "text": ev.get("text", "")}
     return None
 
 
-def _run(sid, live, provider, message, first, max_turns):
+def _run(sid, live, provider, message, first, max_turns, connectors=None):
     c = _conv(sid)
     c["running"], c["error"] = True, None
     c["cancel"].clear()
@@ -325,7 +369,8 @@ def _run(sid, live, provider, message, first, max_turns):
         task = message if first else (live.meta.get("task") or message)
         agent_mod.run_agent(live, provider, task, max_turns=max_turns, emit=emit,
                             should_stop=c["cancel"].is_set,
-                            resume=not first, note=None if first else message)
+                            resume=not first, note=None if first else message,
+                            connectors=connectors, approve=_approver(sid))
     except (core.OverlordError, SystemExit) as e:
         c["error"] = str(e)
         _emit(sid, {"type": "error", "text": str(e)})
@@ -341,9 +386,13 @@ def _run(sid, live, provider, message, first, max_turns):
         _emit(sid, {"type": "idle"})
 
 
-def start_conversation(message, target=None, provider=None, model=None):
-    """Open a fresh transaction and set the agent to work. Returns its sid."""
+def start_conversation(message, target=None, provider=None, model=None, connectors=None):
+    """Open a fresh transaction and set the agent to work. Returns its sid.
+    connectors: MCP server names to grant this conversation (host-side tools)."""
     s = load_settings()
+    connectors = [str(c) for c in (connectors or []) if c]
+    if connectors:
+        mcp_mod.Registry(connectors)        # validates the names before anything opens
     target = os.path.realpath(os.path.expanduser(target or s["workdir"]))
     if not os.path.isdir(target):
         raise core.OverlordError(f"error: not a folder: {target}")
@@ -357,6 +406,8 @@ def start_conversation(message, target=None, provider=None, model=None):
         raise core.OverlordError(f"error: unknown provider: {provider}")
     provider = build_provider(s, provider or None, model or None)
     grants, note = _grants_for(s, backend)
+    if connectors:
+        grants["connectors"] = connectors
     pend = core.pending_sessions_for(target)
     if pend:
         raise core.OverlordError(
@@ -370,7 +421,8 @@ def start_conversation(message, target=None, provider=None, model=None):
         _emit(sid, {"type": "note", "text": note})
     _record_user(sid, message)
     threading.Thread(target=_run, args=(sid, live, provider, message, True,
-                                        int(s["max_turns"])), daemon=True).start()
+                                        int(s["max_turns"]), connectors or None),
+                     daemon=True).start()
     return sid
 
 
@@ -436,7 +488,15 @@ def messages_from_transcript(sid):
                 calls[ev.get("id")] = agent_mod._summarize(
                     {"name": ev.get("tool"), "input": ev.get("input") or {}})
                 msgs.append({"type": "tool_call", "id": ev.get("id"),
-                             "tool": ev.get("tool"), "summary": calls.get(ev.get("id"), "")})
+                             "tool": ev.get("tool"), "summary": calls.get(ev.get("id"), ""),
+                             "external": bool(ev.get("external")), "connector": ev.get("connector")})
+            elif t == "approval_decision":
+                msgs.append({"type": "approval_decision", "id": ev.get("id"),
+                             "decision": ev.get("decision"), "server": ev.get("server"),
+                             "tool": ev.get("tool")})
+            elif t == "connectors":
+                msgs.append({"type": "note", "text": "Connectors: " + ", ".join(ev.get("servers") or [])
+                             + f" ({ev.get('approval')} mode)"})
             elif t == "tool_result":
                 out = ev.get("output", "") or ""
                 if len(out) > MAX_TAIL:
@@ -751,6 +811,25 @@ button{font-family:inherit;cursor:pointer}
   font-family:var(--mono);font-size:12px;padding:9px 10px;resize:vertical}
 #f-azure.hide{display:none}
 .msg.assistant .bub.live::after{content:"▍";color:var(--accent);animation:pulse 1s infinite}
+.tool.external{border-color:var(--blue)}
+.tool.external .arrow{color:var(--blue)}
+.conn-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;max-width:560px;margin:0 auto 6px;text-align:left}
+.conn-row label:first-child{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+.conn-opt{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--text);cursor:pointer}
+.conn-hint{font-size:10px;color:var(--dim);max-width:560px;margin:0 auto 12px;text-align:left;font-style:italic;font-family:var(--serif)}
+.approval{max-width:760px;margin:0 auto 16px;border:1px solid var(--blue);background:var(--bg3);padding:14px 16px}
+.approval.done{border-color:var(--border);opacity:.85}
+.ap-t{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--blue);margin-bottom:6px}
+.ap-w{color:var(--bright);font-size:13px}
+.ap-in{font-size:11px;color:var(--dim);white-space:pre-wrap;margin:8px 0;max-height:200px;overflow:auto}
+.ap-acts{display:flex;gap:10px;align-items:center;margin-top:8px}
+.ap-acts .act{padding:8px 16px}
+.ap-res{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-top:6px}
+.conn-list{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.conn-item{display:flex;gap:10px;align-items:center;font-size:11px;border:1px solid var(--border);padding:7px 10px}
+.conn-item .cn{color:var(--bright)}.conn-item .cw{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conn-item .linkbtn{margin-left:4px}
+#c-http.hide,#c-stdio.hide{display:none}
 .keystate.set{color:var(--green)}.keystate.unset{color:var(--red)}
 .modal-acts{display:flex;gap:10px;justify-content:flex-end;margin-top:22px}
 .savebtn{background:var(--accent);color:var(--bg);border:0;padding:10px 22px;font-size:11px;
@@ -875,6 +954,27 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label>Max steps per message</label>
         <input id="s-maxturns" type="number" min="1" max="200"></div>
     </div>
+    <details class="adv" id="conn-section"><summary>Connectors (MCP)</summary>
+    <div class="desc">Tools from MCP servers, offered to the agent next to the built-ins. They run on this machine, outside the sandbox and the transaction, so each conversation must be granted them and non-read-only actions ask you first.</div>
+    <div class="field"><label>Approval for actions</label>
+      <select id="c-approval"><option value="ask">ask me each time</option>
+        <option value="auto">allow automatically</option><option value="readonly">read-only tools only</option></select></div>
+    <div id="conn-list" class="conn-list"></div>
+    <div class="row2">
+      <div class="field"><label>Name</label><input id="c-name" type="text" placeholder="github"></div>
+      <div class="field"><label>Transport</label><select id="c-transport"><option value="stdio">command (stdio)</option><option value="http">url (http)</option></select></div>
+    </div>
+    <div class="field" id="c-stdio"><label>Command and arguments</label>
+      <input id="c-command" type="text" placeholder="npx -y @modelcontextprotocol/server-github">
+      <div class="desc">Environment for it (JSON object, e.g. tokens):</div>
+      <input id="c-env" type="text" placeholder='{"GITHUB_TOKEN": "…"}'></div>
+    <div class="field hide" id="c-http"><label>URL</label>
+      <input id="c-url" type="text" placeholder="https://host/mcp">
+      <div class="desc">Headers (JSON object):</div>
+      <input id="c-headers" type="text" placeholder='{"Authorization": "Bearer …"}'></div>
+    <div class="ap-acts"><button class="act act-review" id="c-add">Add connector</button>
+      <span class="act-msg" id="c-msg"></span></div>
+    </details>
     <div class="modal-acts">
       <span class="act-msg right-auto" id="setmsg"></span>
       <button class="closebtn" id="closesettings">Close</button>
@@ -886,13 +986,14 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script nonce="__NONCE__">
 const $ = id => document.getElementById(id);
 const j = (u, o) => fetch(u, o).then(r => r.json());
-let SEL = null, FROM = 0, POLL = null, RUNNING = false, SETTINGS = {};
+let SEL = null, FROM = 0, POLL = null, RUNNING = false, SETTINGS = {}, CONNECTORS = {servers:{}};
 
 function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls;
   if(text!=null)e.textContent=text; return e; }
 
 async function loadSettings(){ SETTINGS = await j('/api/settings');
   $('backend').textContent = SETTINGS.backend + ' backend';
+  try { CONNECTORS = await j('/api/connectors'); } catch(e) { CONNECTORS = {servers:{}}; }
   return SETTINGS; }
 
 async function loadConvs(){
@@ -930,8 +1031,9 @@ function renderMsg(m){
     LIVE = null;
     const t = el('div','tool'); t.dataset.id = m.id||'';
     const th = el('div','th');
-    th.appendChild(el('span','arrow','↳'));
-    th.appendChild(el('span','tl', m.tool));
+    th.appendChild(el('span','arrow', m.external ? '⇄' : '↳'));
+    if(m.external) t.classList.add('external');
+    th.appendChild(el('span','tl', m.external ? (m.connector+' · '+m.tool.replace(/^mcp__[^_]+(?:-[^_]+)*__/,'')) : m.tool));
     th.appendChild(el('span','sm', m.summary||''));
     th.appendChild(el('span','tag','·'));
     th.addEventListener('click',()=>t.classList.toggle('open'));
@@ -944,6 +1046,22 @@ function renderMsg(m){
     if(m.output){ const b=el('div','body', m.output); t.appendChild(b); }
     if(m.touched && m.touched.length){
       t.appendChild(el('div','touched','changed: '+m.touched.join(', '))); }
+  } else if(m.type==='approval'){
+    LIVE = null;
+    const card = el('div','approval'); card.dataset.id = m.id;
+    card.appendChild(el('div','ap-t','External action needs your approval'));
+    card.appendChild(el('div','ap-w', m.server+' · '+m.tool));
+    card.appendChild(el('pre','ap-in', JSON.stringify(m.input||{}, null, 1).slice(0,1500)));
+    const acts = el('div','ap-acts');
+    const allow = el('button','act act-commit','Allow'); allow.dataset.approve='1';
+    const deny = el('button','act act-discard','Deny'); deny.dataset.approve='0';
+    acts.appendChild(allow); acts.appendChild(deny); card.appendChild(acts);
+    s.appendChild(card);
+  } else if(m.type==='approval_decision'){
+    const card = [...s.querySelectorAll('.approval')].reverse().find(x=>x.dataset.id===(m.id||''));
+    if(card){ card.classList.add('done'); const a=card.querySelector('.ap-acts'); if(a) a.remove();
+      card.appendChild(el('div','ap-res', m.decision)); }
+    else if(m.decision && m.decision!=='read-only'){ s.appendChild(el('div','note', (m.server||'')+'.'+(m.tool||'')+': '+m.decision)); }
   } else if(m.type==='note'){
     s.appendChild(el('div','note', m.text));
   } else if(m.type==='error'){
@@ -995,6 +1113,14 @@ function newChat(){
   fr.appendChild(el('label',null,'Folder'));
   const fi = el('input'); fi.id='folder'; fi.value = SETTINGS.workdir||''; fr.appendChild(fi);
   w.appendChild(fr);
+  const names = Object.keys((CONNECTORS.servers)||{});
+  if(names.length){
+    const cr = el('div','conn-row'); cr.appendChild(el('label',null,'Connectors'));
+    names.forEach(n=>{ const l=el('label','conn-opt'); const cb=el('input'); cb.type='checkbox';
+      cb.value=n; cb.className='conn-cb'; l.appendChild(cb); l.appendChild(el('span',null,n)); cr.appendChild(l); });
+    const hint = el('div','conn-hint','Connector tools run on this machine, outside the sandbox — each action asks you first.');
+    w.appendChild(cr); w.appendChild(hint);
+  }
   s.appendChild(w);
   setThinking(false);
   loadConvs();
@@ -1008,8 +1134,9 @@ async function send(){
     if(!SETTINGS.provider_ready){
       openSettings('Add your '+SETTINGS.provider+' API key to begin.'); return; }
     const folder = ($('folder')||{}).value || SETTINGS.workdir;
+    const connectors = [...document.querySelectorAll('.conn-cb:checked')].map(x=>x.value);
     inp.value=''; autosize();
-    const r = await j('/api/chats',{method:'POST',body:JSON.stringify({message:text,target:folder})});
+    const r = await j('/api/chats',{method:'POST',body:JSON.stringify({message:text,target:folder,connectors})});
     if(r.error){ flashHint(r.error,true); return; }
     await select(r.sid);
     startPoll();
@@ -1059,7 +1186,12 @@ async function insAction(url, body){
 }
 
 // inspector + review delegation
-document.addEventListener('click', e=>{
+document.addEventListener('click', async e=>{
+  const ap = e.target.closest('[data-approve]');
+  if(ap && SEL){ const card = ap.closest('.approval');
+    await j('/api/chats/'+encodeURIComponent(SEL)+'/approve',{method:'POST',
+      body:JSON.stringify({id:card.dataset.id, allow: ap.dataset.approve==='1'})});
+    return; }
   const b = e.target.closest('[data-commit],[data-discard],[data-review]');
   if(!b) return;
   if(b.dataset.commit!==undefined) return insAction('/api/session/'+encodeURIComponent(b.dataset.commit)+'/commit');
@@ -1109,6 +1241,7 @@ async function openSettings(msg){
   $('g-stream').checked = g.stream !== false;
   $('g-fallbacks').checked = g.fallbacks !== false;
   fillProvider(SETTINGS.provider);
+  renderConnectors();
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'
@@ -1140,6 +1273,41 @@ async function saveSettings(){
   if(!SEL) newChat();
 }
 
+function renderConnectors(){
+  const list = $('conn-list'); list.innerHTML='';
+  $('c-approval').value = CONNECTORS.approval || 'ask';
+  const names = Object.keys(CONNECTORS.servers||{});
+  if(!names.length){ list.appendChild(el('div','desc','No connectors yet.')); return; }
+  names.forEach(n=>{ const sv = CONNECTORS.servers[n];
+    const row = el('div','conn-item'); row.appendChild(el('span','cn', n));
+    row.appendChild(el('span','cw', sv.transport==='http' ? sv.url : [sv.command].concat(sv.args||[]).join(' ')));
+    const t = el('button','linkbtn','test'); t.addEventListener('click', async()=>{
+      t.textContent='testing…'; const r = await j('/api/connectors/'+encodeURIComponent(n)+'/test',{method:'POST',body:'{}'});
+      t.textContent = r.error ? 'failed' : (r.tools||[]).length+' tools'; if(r.error) $('c-msg').textContent = r.error; });
+    const rm = el('button','linkbtn','remove'); rm.addEventListener('click', async()=>{
+      await j('/api/connectors/'+encodeURIComponent(n)+'/remove',{method:'POST',body:'{}'});
+      CONNECTORS = await j('/api/connectors'); renderConnectors(); });
+    row.appendChild(t); row.appendChild(rm); list.appendChild(row); });
+}
+async function addConnector(){
+  const transport = $('c-transport').value, msg = $('c-msg');
+  const body = {name: $('c-name').value.trim()};
+  try {
+    if(transport==='stdio'){
+      const parts = $('c-command').value.trim().split(/\s+/).filter(Boolean);
+      body.command = parts[0]; body.args = parts.slice(1);
+      body.env = $('c-env').value.trim() ? JSON.parse($('c-env').value) : {};
+    } else {
+      body.url = $('c-url').value.trim();
+      body.headers = $('c-headers').value.trim() ? JSON.parse($('c-headers').value) : {};
+    }
+  } catch(e){ msg.textContent = 'env/headers must be a JSON object'; msg.className='act-msg bad'; return; }
+  const r = await j('/api/connectors',{method:'POST',body:JSON.stringify(body)});
+  if(r.error){ msg.textContent = r.error; msg.className='act-msg bad'; return; }
+  msg.textContent = 'added'; msg.className='act-msg ok';
+  $('c-name').value=''; $('c-command').value=''; $('c-env').value=''; $('c-url').value=''; $('c-headers').value='';
+  CONNECTORS = await j('/api/connectors'); renderConnectors();
+}
 function autosize(){ const t=$('input'); t.style.height='auto'; t.style.height=Math.min(180,t.scrollHeight)+'px'; }
 
 $('send').addEventListener('click',send);
@@ -1150,6 +1318,11 @@ $('closesettings').addEventListener('click',()=>$('settings').classList.remove('
 $('savesettings').addEventListener('click',saveSettings);
 $('s-provider').addEventListener('change',()=>fillProvider($('s-provider').value));
 $('s-models-refresh').addEventListener('click',()=>loadModels(true));
+$('c-transport').addEventListener('change',()=>{ const h=$('c-transport').value==='http';
+  $('c-http').classList.toggle('hide',!h); $('c-stdio').classList.toggle('hide',h); });
+$('c-add').addEventListener('click',addConnector);
+$('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
+  body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });
 $('togglerail').addEventListener('click',()=>$('app').classList.toggle('show-rail'));
 $('toggleins').addEventListener('click',()=>$('app').classList.toggle('show-ins'));
 $('input').addEventListener('input',autosize);
@@ -1172,6 +1345,9 @@ $('input').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.pr
 def handle_get(handler, path, query):
     if path == "/api/settings":
         handler._send(settings_public())
+        return True
+    if path == "/api/connectors":
+        handler._send(mcp_mod.public_config())
         return True
     if path == "/api/models":
         handler._send(models_for((query.get("provider") or [None])[0] or None,
@@ -1204,7 +1380,8 @@ def handle_post(handler, parts, req):
     if parts == ["api", "chats"]:
         sid = start_conversation(req.get("message", ""), req.get("target") or None,
                                  provider=req.get("provider") or None,
-                                 model=req.get("model") or None)
+                                 model=req.get("model") or None,
+                                 connectors=req.get("connectors") or None)
         handler._send({"sid": sid})
         return True
     if len(parts) == 4 and parts[:2] == ["api", "chats"]:
@@ -1215,6 +1392,36 @@ def handle_post(handler, parts, req):
             return True
         if action == "cancel":
             handler._send(cancel(sid))
+            return True
+        if action == "approve":
+            handler._send(decide(sid, str(req.get("id") or ""), bool(req.get("allow"))))
+            return True
+    if parts == ["api", "connectors"]:
+        env = req.get("env") or {}
+        headers = req.get("headers") or {}
+        if not isinstance(env, dict) or not isinstance(headers, dict):
+            raise core.OverlordError("error: env and headers must be JSON objects")
+        entry = mcp_mod.add_server(str(req.get("name") or ""), command=req.get("command") or None,
+                                   args=[str(a) for a in (req.get("args") or [])], env=env,
+                                   cwd=req.get("cwd") or None, url=req.get("url") or None,
+                                   headers=headers)
+        handler._send({"added": req.get("name"), "transport": entry["transport"]})
+        return True
+    if len(parts) == 3 and parts[:2] == ["api", "connectors"]:
+        name = parts[2]
+        if name == "approval":
+            mcp_mod.set_approval(str(req.get("mode") or ""))
+            handler._send({"approval": req.get("mode")})
+            return True
+        raise core.OverlordError("error: unknown connector action")
+    if len(parts) == 4 and parts[:2] == ["api", "connectors"]:
+        name, action = parts[2], parts[3]
+        if action == "remove":
+            mcp_mod.remove_server(name)
+            handler._send({"removed": name})
+            return True
+        if action == "test":
+            handler._send(mcp_mod.test_server(name))
             return True
     return False
 

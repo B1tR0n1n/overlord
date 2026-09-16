@@ -167,6 +167,19 @@ def build_dossier(sid, meta=None):
         for e in execs:
             lines.append(f"  {' '.join(e.get('cmd') or [])}  -> exit {e.get('exit_code')}")
         lines.append("")
+    external = []
+    if os.path.isfile(tpath):
+        with open(tpath) as f:
+            for line in f:
+                ev = json.loads(line)
+                if ev.get("type") == "approval_decision":
+                    external.append(f"  turn {ev.get('turn')} {ev.get('server')}.{ev.get('tool')}: "
+                                    f"{ev.get('decision')}")
+    if external:
+        lines.append("EXTERNAL ACTIONS (connector tools ran on the host, outside the "
+                     "transaction; a discard cannot undo them):")
+        lines.extend(external)
+        lines.append("")
     lines.append(f"MANIFEST ({len(changes)} change(s)):")
     for kind, rel in changes:
         lines.append(f"  {kind:12s} {rel}")

@@ -921,13 +921,17 @@ def apply_layers(uppers, target, backend=None):
 def load_grants(args):
     """Capability manifest: --manifest file defaults, CLI flags override."""
     grants = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
+    optional = {"connectors": list, "connector_approval": str}
     manifest_file = getattr(args, "manifest", None)
     if manifest_file:
         with open(manifest_file) as f:
             declared = json.load(f)
-        unknown = set(declared) - set(grants)
+        unknown = set(declared) - set(grants) - set(optional)
         if unknown:
             raise OverlordError(f"error: unknown manifest keys: {', '.join(sorted(unknown))}")
+        for k, typ in optional.items():
+            if k in declared and not isinstance(declared[k], typ):
+                raise OverlordError(f"error: manifest key {k} must be a {typ.__name__}")
         grants.update(declared)
     if getattr(args, "net", None):
         grants["net"] = args.net
@@ -2273,7 +2277,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2491,6 +2495,21 @@ def _api_rollback(req):
 AGENT_CANCEL = set()
 
 
+def _policy_connectors(rule, requested):
+    """Policy caps the connectors a brokered session may be granted: a rule
+    lists names (or "*"); no rule means none through the daemon."""
+    if not requested:
+        return []
+    allowed = (rule or {}).get("connectors")
+    if allowed == "*":
+        return list(requested)
+    allowed = set(allowed or [])
+    refused = [c for c in requested if c not in allowed]
+    if refused:
+        raise OverlordError(f"error: policy does not grant connector(s): {', '.join(refused)}")
+    return list(requested)
+
+
 def _api_agent(req, emit):
     """Streaming op: open a session, run the built-in agent, close it. Emits
     transcript events as they happen; returns the sealed session."""
@@ -2498,7 +2517,12 @@ def _api_agent(req, emit):
     target = os.path.realpath(req["target"])
     requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
     requested.update(req.get("grants") or {})
-    grants, _rule = resolve_policy(target, requested)
+    grants, rule = resolve_policy(target, requested)
+    connectors = list(req.get("connectors") or [])
+    if load_policy() is not None:
+        connectors = _policy_connectors(rule, connectors)
+    if connectors:
+        grants["connectors"] = connectors
     provider = agent_mod.make_provider(
         req.get("provider", "anthropic"), req.get("model"), base_url=req.get("base_url"),
         headers=req.get("headers"), config=req.get("config"),
@@ -2515,7 +2539,12 @@ def _api_agent(req, emit):
             ls, provider, req["task"], max_turns=int(req.get("max_turns") or
                                                     agent_mod.DEFAULT_MAX_TURNS),
             emit=lambda ev: emit({"ok": True, "event": "agent", **ev}),
-            should_stop=lambda: ls.sid in AGENT_CANCEL)
+            should_stop=lambda: ls.sid in AGENT_CANCEL,
+            connectors=connectors or None,
+            # brokered runs have no terminal: an action is auto-approved only
+            # when the caller asked for it AND policy did not say readonly
+            approval=req.get("connector_approval") or None,
+            approve=(lambda r: bool(req.get("approve_all"))))
     except SystemExit as e:
         emit({"ok": True, "event": "agent", "type": "error", "text": str(e)})
     finally:
@@ -2712,6 +2741,8 @@ def main(argv=None):
 
     import review as review_mod
     review_mod.add_review_parser(sub)
+    import mcp as mcp_mod
+    mcp_mod.add_mcp_parser(sub)
 
     psv = sub.add_parser("savepoints", help="the layer stack: one savepoint per writing command")
     psv.add_argument("session")

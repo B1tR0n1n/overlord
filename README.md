@@ -739,6 +739,10 @@ attach-race at process start.
 ## Test
 
 ```bash
+bash test/all.sh                  # every suite, one line each; logs kept; exit 1 on any failure
+```
+
+```bash
 bash test/smoke.sh                # 26 core transactional + replay-safety assertions
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
 python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
@@ -757,7 +761,7 @@ python3 test/session_test.py      # 5 long-conversation assertions: compaction +
 python3 test/webhook_test.py      # 5 webhook assertions against a local receiver: config, needs-review + link + signature, approval gate + budget, retries, API
 python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
 python3 test/bundle_test.py       # 5 bundle assertions: signed export, second-machine import + tamper/forgery refusal, replay + commit, UI, crafted tars
-python3 test/escape_test.py       # 3 escape assertions: the agent is told the truth; env / keys / home / pid 1 / net / writes-out all fail; all recorded
+python3 test/escape_test.py       # 5 escape assertions: the agent is told the truth; env / keys / home / pid 1 / net / writes-out all fail; all recorded; DNS with net=host; A13
 python3 test/limits_test.py       # 6 limits + gates assertions: rlimits, cgroup, disk grant + agent stop, policy ceilings, protected paths + truncated review, shell tools
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions

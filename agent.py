@@ -43,6 +43,8 @@ import time
 
 import overlord as ov
 import memory as memory_mod
+import cost as cost_mod
+import audit as audit_mod
 
 import providers as _providers_defaults  # noqa: E402
 DEFAULT_MODELS = _providers_defaults.DEFAULT_MODELS
@@ -447,12 +449,26 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             if should_stop and should_stop():
                 record({"type": "done", "reason": "cancelled", "turn": turn})
                 return final
+            try:
+                cost_mod.check(live.meta)          # before the money is spent
+            except cost_mod.BudgetExceeded as e:
+                record({"type": "error", "turn": turn, "text": str(e)})
+                record({"type": "done", "reason": "budget", "turn": turn,
+                        "usage": live.meta["usage"]})
+                audit_mod.record("budget.stop", sid=live.sid, owner=live.meta.get("owner"),
+                                 reason=str(e))
+                return final
             reply = provider.complete(
                 system_prompt, messages, tools=all_tools,
                 on_delta=lambda t, _turn=turn: emit({"type": "assistant_delta",
                                                      "turn": _turn, "text": t}))
             live.meta["usage"]["in"] += reply.usage.get("in", 0)
             live.meta["usage"]["out"] += reply.usage.get("out", 0)
+            model_name = getattr(provider, "model", "") or ""
+            usd = cost_mod.cost_of(model_name, reply.usage)
+            if usd is not None:
+                live.meta["usage"]["usd"] = round((live.meta["usage"].get("usd") or 0) + usd, 6)
+            cost_mod.ledger_append(live.sid, live.meta.get("owner"), model_name, reply.usage, usd)
             ov.save_meta(live.sid, live.meta)
             messages.append({"role": "assistant", "content": reply.text,
                              "tool_calls": reply.tool_calls})
@@ -497,7 +513,8 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                     out, rc = json.dumps({"INVALID_JSON": tc["invalid_json"][:4000]}), 1
                     touched = []
                 elif registry and registry.owns(tc["name"]):
-                    out, rc = _connector_call(registry, mode, approve, tc, turn, record)
+                    out, rc = _connector_call(registry, mode, approve, tc, turn, record,
+                                              sid=live.sid, owner=live.meta.get("owner"))
                     touched = []
                 else:
                     out, rc = tools.run(tc["name"], tc["input"], label, cause)
@@ -528,7 +545,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             registry.close()
 
 
-def _connector_call(registry, mode, approve, tc, turn, record):
+def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=None):
     """A connector tool: outside the jail and the transaction, so gated.
     Returns (output, rc) for the model; every decision is in the transcript."""
     desc = registry.describe(tc["name"])
@@ -546,6 +563,8 @@ def _connector_call(registry, mode, approve, tc, turn, record):
             decision = "approved" if allowed else ("denied" if approve else "denied-no-approver")
     record({"type": "approval_decision", "id": tc["id"], "turn": turn, "decision": decision,
             "server": desc["server"], "tool": desc["tool"]})
+    audit_mod.record("connector.decision", sid=sid, owner=owner, server=desc["server"],
+                     tool=desc["tool"], decision=decision)
     if decision.startswith("denied"):
         why = {"denied-by-policy": "connector approval mode is readonly",
                "denied-no-approver": "no one is available to approve external actions",

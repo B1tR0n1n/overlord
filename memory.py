@@ -187,7 +187,10 @@ def accept_suggestion(sid, suggestion_id):
         if s["id"] == suggestion_id:
             if s["accepted"]:
                 return s
-            append_user_memory(s["text"], owner=core.load_meta(sid).get("owner"))
+            owner = core.load_meta(sid).get("owner")
+            append_user_memory(s["text"], owner=owner)
+            import audit
+            audit.record("memory.accept", sid=sid, owner=owner, suggestion=suggestion_id)
             with open(core.session_file(sid, "transcript.jsonl"), "a") as f:
                 f.write(json.dumps({"ts": time.strftime(core.TS_FORMAT), "type": "memory_accepted",
                                     "id": suggestion_id}) + "\n")

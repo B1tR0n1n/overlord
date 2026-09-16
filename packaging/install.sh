@@ -26,6 +26,9 @@ install -m 0644 "$HERE/review.py" /usr/local/lib/overlord/review.py
 install -m 0644 "$HERE/mcp.py" /usr/local/lib/overlord/mcp.py
 install -m 0644 "$HERE/memory.py" /usr/local/lib/overlord/memory.py
 install -m 0644 "$HERE/auth.py" /usr/local/lib/overlord/auth.py
+install -m 0644 "$HERE/cost.py" /usr/local/lib/overlord/cost.py
+install -m 0644 "$HERE/audit.py" /usr/local/lib/overlord/audit.py
+install -m 0644 "$HERE/retention.py" /usr/local/lib/overlord/retention.py
 install -m 0644 "$HERE/ui.py" /usr/local/lib/overlord/ui.py
 install -m 0644 "$HERE/chatui.py" /usr/local/lib/overlord/chatui.py
 install -m 0644 "$HERE/packaging/ebpf/provenance.bt" /usr/local/lib/overlord/provenance.bt

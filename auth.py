@@ -49,6 +49,7 @@ import threading
 import time
 
 import overlord as core
+import audit
 
 USERS_FILE = os.path.join(core.OVERLORD_HOME, "users.json")
 USERS_DIR = os.path.join(core.OVERLORD_HOME, "users")
@@ -149,6 +150,7 @@ def add_user(name, password, role="operator"):
                              "created": time.strftime(core.TS_FORMAT), "disabled": False}
         _save(db)
     os.makedirs(user_dir(name), mode=0o700, exist_ok=True)
+    audit.record("users.add", user=name, role=role)
     return public_user(name, db["users"][name])
 
 
@@ -162,6 +164,7 @@ def set_password(name, password):
         db["users"][name]["hash"] = hash_password(password)
         _save(db)
     _drop_sessions(name)
+    audit.record("users.passwd", user=name)
 
 
 def set_role(name, role):
@@ -177,6 +180,7 @@ def set_role(name, role):
         db["users"][name]["role"] = role
         _save(db)
     _drop_sessions(name)
+    audit.record("users.role", user=name, role=role)
 
 
 def remove_user(name):
@@ -192,11 +196,33 @@ def remove_user(name):
         db["tokens"] = {t: v for t, v in db["tokens"].items() if v.get("user") != name}
         _save(db)
     _drop_sessions(name)
+    audit.record("users.rm", user=name)
 
 
 def public_user(name, u):
     return {"name": name, "role": u.get("role"), "created": u.get("created"),
-            "disabled": bool(u.get("disabled"))}
+            "disabled": bool(u.get("disabled")), "budget": u.get("budget") or {}}
+
+
+def user_budget(name):
+    """The account's own spending limits (see cost.py), {} if none."""
+    return (_load()["users"].get(name) or {}).get("budget") or {}
+
+
+def set_budget(name, budget):
+    import cost
+    clean = cost._clean_budget(budget or {})
+    with _LOCK:
+        db = _load()
+        if name not in db["users"]:
+            raise core.OverlordError(f"error: no such user: {name}")
+        if clean:
+            db["users"][name]["budget"] = clean
+        else:
+            db["users"][name].pop("budget", None)
+        _save(db)
+    audit.record("users.budget", user=name, budget=clean)
+    return clean
 
 
 def list_users():
@@ -225,6 +251,7 @@ def create_token(name, label=""):
         db["tokens"][tid] = {"user": name, "label": label or "",
                              "created": time.strftime(core.TS_FORMAT)}
         _save(db)
+    audit.record("users.token", user=name, token=tid[:12], label=label or "")
     return raw, tid[:12]
 
 
@@ -242,8 +269,9 @@ def revoke_token(prefix, owner=None):
                 and (owner is None or v.get("user") == owner)]
         if len(hits) != 1:
             raise core.OverlordError("error: no such token" if not hits else "error: ambiguous token id")
-        del db["tokens"][hits[0]]
+        rec = db["tokens"].pop(hits[0])
         _save(db)
+    audit.record("users.untoken", user=rec.get("user"), token=hits[0][:12])
 
 
 # ---------------------------------------------------------------- sessions
@@ -276,17 +304,21 @@ def login(name, password, remote="?"):
     if not good:
         with _LOCK:
             _FAILS.setdefault((remote, name), []).append(now)
+        audit.record("auth.login_failed", actor=f"{name or '?'}@{remote}", user=name, remote=remote)
         raise LoginFailed("error: wrong user or password")
     tok = secrets.token_urlsafe(32)
     with _LOCK:
         _FAILS.pop((remote, name), None)
         _SESSIONS[tok] = {"user": name, "role": u["role"], "created": now}
+    audit.record("auth.login", actor=f"{name}@cookie", user=name, role=u["role"], remote=remote)
     return tok, {"user": name, "role": u["role"], "via": "cookie"}
 
 
 def logout(tok):
     with _LOCK:
-        _SESSIONS.pop(tok, None)
+        s = _SESSIONS.pop(tok, None)
+    if s:
+        audit.record("auth.logout", actor=f"{s['user']}@cookie", user=s["user"])
 
 
 def _cookie(headers):
@@ -371,8 +403,8 @@ def may(action, meta=None, principal=None):
     if role == "admin":
         return True
     if role == "viewer":
-        return action == "read"
-    if action == "admin":
+        return action in ("read", "audit")
+    if action in ("admin", "audit"):
         return False
     if action == "use":
         return True
@@ -458,8 +490,9 @@ def cmd_users(args):
             print("no accounts: the UI is open to whoever reaches it (loopback only)")
             return 0
         for u in rows:
+            b = ", ".join(f"{k}={v}" for k, v in (u.get("budget") or {}).items())
             print(f"{u['name']:20} {u['role']:9} {'disabled' if u['disabled'] else ''} "
-                  f"{len(tokens_for(u['name']))} token(s)")
+                  f"{len(tokens_for(u['name']))} token(s)" + (f"  budget {b}" if b else ""))
         return 0
     if c == "token":
         raw, tid = create_token(args.name, args.label or "")
@@ -472,6 +505,18 @@ def cmd_users(args):
     if c == "untoken":
         revoke_token(args.token_id, owner=args.user)
         print("revoked")
+        return 0
+    if c == "budget":
+        cur = user_budget(args.name)
+        for k in ("session_tokens", "session_usd", "day_usd"):
+            v = getattr(args, k)
+            if v is not None:
+                if v == 0:
+                    cur.pop(k, None)
+                else:
+                    cur[k] = v
+        clean = set_budget(args.name, cur)
+        print(f"{args.name} budget: " + (", ".join(f"{k}={v}" for k, v in clean.items()) or "none"))
         return 0
     raise core.OverlordError("error: unknown users subcommand")
 
@@ -507,6 +552,11 @@ def add_auth_parsers(sub):
     pun = us.add_parser("untoken")
     pun.add_argument("token_id")
     pun.add_argument("--user", help="only this account's tokens")
+    pb = us.add_parser("budget", help="an account's spending limits (0 clears one)")
+    pb.add_argument("name")
+    pb.add_argument("--session-tokens", dest="session_tokens", type=int)
+    pb.add_argument("--session-usd", dest="session_usd", type=float)
+    pb.add_argument("--day-usd", dest="day_usd", type=float)
     pu.set_defaults(fn=cmd_users)
 
     pt = sub.add_parser("tls", help="certificates for `overlord ui --bind`")

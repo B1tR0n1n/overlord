@@ -650,7 +650,8 @@ class ScriptedProvider:
             on_delta(text[half:])
         calls = [{"id": f"call_{self.i}_{n}", "name": c["name"], "input": c["input"]}
                  for n, c in enumerate(step.get("tool_calls", []))]
-        return Reply(text, calls, "tool_use" if calls else "end_turn", {"in": 0, "out": 0})
+        usage = {"in": 0, "out": 0, **(step.get("usage") or {})}   # a step may price itself
+        return Reply(text, calls, "tool_use" if calls else "end_turn", usage)
 
     def models(self):
         return [{"id": "scripted", "name": "scripted", "context": None, "max_output": None}]

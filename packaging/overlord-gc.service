@@ -1,0 +1,16 @@
+# Nightly retention: prune finished records older than the configured
+# keep_days (default 30), orphan objects and stale locks. Pending sessions,
+# the audit log and the cost ledger are never touched.
+#
+#   sudo install -m 0644 packaging/overlord-gc.service packaging/overlord-gc.timer /etc/systemd/system/
+#   sudo systemctl enable --now overlord-gc.timer
+[Unit]
+Description=OVERLORD retention (gc)
+
+[Service]
+Type=oneshot
+User=overlord
+Group=overlord
+Environment=OVERLORD_HOME=/var/lib/overlord/.overlord
+EnvironmentFile=-/etc/overlord/ui.env
+ExecStart=/usr/local/bin/overlord gc

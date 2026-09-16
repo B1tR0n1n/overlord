@@ -78,6 +78,10 @@ overlord memory accept <session> --all               # keep the notes an agent p
 overlord users add alice --role admin                # accounts: the UI now asks who you are
 overlord tls selfsign --host overlord.lan            # a certificate for --bind
 overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.overlord/tls/key.pem
+overlord cost                                        # what the models spent, by model / account / day
+overlord cost budget --day-usd 20                    # a line no conversation crosses
+overlord audit verify                                # the hash chain of every consequential act
+overlord gc --dry-run                                # what retention would prune
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
@@ -222,6 +226,53 @@ certificate with openssl for a private deployment). A `--host name`
 allowlist backs the Host check, HSTS is sent, and a plain-HTTP probe at the
 TLS port is shrugged off. A workspace that can commit an agent's changes to
 a real tree is not something to leave on a LAN behind a Host header.
+
+## Cost
+
+Every model call returns its token usage; OVERLORD prices it (`cost.py`),
+writes one ledger line per call (`~/.overlord/ledger.jsonl`: session,
+account, model, tokens, dollars) and keeps the running total on the
+session, in its `done` event and in the inspector. Prices are a table in
+`~/.overlord/cost.json` — a few list prices ship as defaults, yours
+override them (`overlord cost set-price <model> <in> <out>`); an unpriced
+model is still counted in tokens.
+
+Budgets are lines, not estimates: `session_tokens`, `session_usd`,
+`day_usd`, from the global config (`overlord cost budget`), the policy rule
+for a folder (`"budget": {...}`) or the account (`overlord users budget`),
+the most restrictive of each winning. A conversation is checked **before
+every call** and stops with reason `budget` at the first line it has
+reached — the work done so far stays in the transaction for review, the
+stop is in the transcript and on the audit log. Second-model reviews are
+on the ledger too.
+
+## Audit
+
+Sessions keep their own records; `audit.py` keeps the machine's:
+`~/.overlord/audit.jsonl`, one line per consequential act — open, reopen,
+commit, refused commit, rollback, rewind, fork, review verdict, connector
+decision, memory acceptance, connector or policy or budget change, sign-in
+and failed sign-in, account change, budget stop, gc — from the CLI, the
+daemon and the web UI alike, since they share the engine. Each line carries
+the hash of the line before it; `overlord audit verify` walks the chain
+and names the first altered or missing line, `doctor` checks it, the
+workspace shows it to admins and viewers. The actor is the signed-in
+account, else the session's owner, else the OS user.
+
+## Retention and deployment
+
+`overlord gc` prunes finished records older than `keep_days` (default 30,
+the newest `keep_last` committed kept regardless), objects no remaining
+record refers to, and locks nobody holds — never a pending session, never
+the audit log or the ledger. `packaging/overlord-gc.timer` runs it nightly.
+
+To run it for a team: `packaging/overlord-ui.service` (a system unit that
+serves TLS on a bind address with `--log-json`, one JSON line per request
+on stderr), `/healthz` for a load balancer or container runtime (no login,
+nothing an outsider learns), and a `Dockerfile` for the fuse backend
+(`--device /dev/fuse --cap-add SYS_ADMIN`). `overlord doctor` reports
+accounts, TLS material, the audit chain and disk usage next to the
+backends.
 
 ## Grants (the capability manifest)
 
@@ -449,6 +500,8 @@ python3 test/providers_test.py    # 10 provider adapter assertions: wire shapes,
 python3 test/mcp_test.py          # 6 connector assertions: stdio + http transports, grants, approval gate, policy, workspace
 python3 test/memory_test.py       # 7 memory assertions: injection, caps, transactional remember, proposals, journal, CLI, workspace
 python3 test/auth_test.py         # 7 auth assertions: open mode, sign-in + lockout, roles, ownership, tokens, TLS + Host allowlist, CLI sessions
+python3 test/cost_test.py         # 6 cost assertions: prices, ledger, policy / global / account budgets, review ledger, CLI, workspace
+python3 test/audit_test.py        # 5 audit assertions: chained acts, tamper detection, actors + healthz, gc, --log-json + doctor
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -584,3 +637,11 @@ grants are absent.
   --host`, refused beyond loopback without accounts and TLS; a sign-in page,
   an Accounts panel and read-only conversations in the workspace. 152
   assertions across fourteen suites.
+- 2026-09-16 — v0.13: cost, audit, retention, deployment. `cost.py`: a
+  price table, a per-call ledger, dollars on the session, budgets from
+  policy / config / account checked before every call with a `budget`
+  stop. `audit.py`: a hash-chained machine-wide log of every consequential
+  act with `overlord audit verify`. `retention.py`: `overlord gc`.
+  `/healthz`, `overlord ui --log-json`, systemd units for the UI and
+  nightly gc, a Dockerfile, doctor rows for accounts / TLS / audit / disk.
+  163 assertions across sixteen suites.

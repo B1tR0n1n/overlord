@@ -317,6 +317,13 @@ def run_review(sid, provider, max_turns=DEFAULT_MAX_TURNS, emit=None, allow_same
         meta = ov.load_meta(sid)          # re-read: nothing else may be lost
         meta.setdefault("reviews", []).append(rec)
         ov.save_meta(sid, meta)
+        import audit as audit_mod
+        import cost as cost_mod
+        audit_mod.record("review.verdict", sid=sid, owner=meta.get("owner"), reviewer=reviewer,
+                         verdict=verdict, fingerprint=(fp or "")[:12])
+        model_name = getattr(provider, "model", "") or ""
+        cost_mod.ledger_append(sid, meta.get("owner"), model_name, usage,
+                               cost_mod.cost_of(model_name, usage), kind="review")
     return rec
 
 

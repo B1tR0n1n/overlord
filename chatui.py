@@ -32,6 +32,7 @@ import providers as prov
 import mcp as mcp_mod
 import memory as memory_mod
 import auth
+import cost as cost_mod
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -563,7 +564,7 @@ def conversation(sid):
     return {"meta": {"id": meta["id"], "title": _title(meta), "status": meta.get("status"),
                      "target": meta.get("target"), "agent": meta.get("agent"),
                      "grants": meta.get("grants"), "owner": meta.get("owner"),
-                     "may_act": auth.may("act", meta)},
+                     "may_act": auth.may("act", meta), "cost": cost_mod.summary(meta)},
             "messages": messages_from_transcript(sid),
             "running": c["running"], "event_count": event_count,
             "inspector": render_inspector(sid)}
@@ -609,6 +610,10 @@ def render_inspector(sid):
         return "".join(h)
 
 
+def _ktok(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 def _inspector_body(sid, m, live):
     h = []
 
@@ -617,6 +622,13 @@ def _inspector_body(sid, m, live):
     elif m.get("status") in ("rolled-back",) or (not live and m.get("status") != "pending"):
         h.append('<div class="ins-state">Discarded. The folder was left untouched.</div>')
 
+    u = m.get("usage") or {}
+    if u.get("in") or u.get("out"):
+        usd = u.get("usd")
+        h.append('<div class="ins-cost">'
+                 f'{_esc(_ktok(u.get("in", 0)))} in &middot; {_esc(_ktok(u.get("out", 0)))} out'
+                 + (f' &middot; ${usd:.4f}' if usd is not None else ' &middot; unpriced model')
+                 + '</div>')
     changes = core.session_stack(sid, m)[0] if live else []
     h.append(f'<div class="ins-k mt18">Changes '
              f'<span class="count">{len(changes)}</span></div>')
@@ -850,6 +862,7 @@ button{font-family:inherit;cursor:pointer}
 .ap-res{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin-top:6px}
 .memsug{max-width:760px;margin:0 auto 16px;border:1px solid var(--accent-dim);background:var(--bg3);padding:12px 16px}
 .memsug.done{border-color:var(--border);opacity:.85}
+.ins-cost{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.5px;margin-top:6px}
 .memview{background:var(--bg);border:1px solid var(--border);color:var(--dim);font-size:11px;
   padding:9px 10px;max-height:160px;overflow:auto;white-space:pre-wrap;margin:0}
 .memview .jr{margin-bottom:6px}.memview .jr b{color:var(--text);font-weight:400}
@@ -1015,6 +1028,22 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <input id="c-headers" type="text" placeholder='{"Authorization": "Bearer …"}'></div>
     <div class="ap-acts"><button class="act act-review" id="c-add">Add connector</button>
       <span class="act-msg" id="c-msg"></span></div>
+    </details>
+    <details class="adv" id="cost-section"><summary>Cost</summary>
+    <div class="desc">Every model call is priced from the table in ~/.overlord/cost.json and written to a ledger. A conversation stops before the call that would cross a budget line.</div>
+    <div class="field"><label>Spend</label><div class="memview" id="cost-spend"></div></div>
+    <div class="row2" id="cost-budget-row">
+      <div class="field"><label>Session limit (tokens)</label><input id="b-tokens" type="number" min="0" placeholder="none"></div>
+      <div class="field"><label>Session limit (USD)</label><input id="b-session" type="number" min="0" step="0.01" placeholder="none"></div>
+    </div>
+    <div class="field" id="cost-day-row"><label>Daily limit for the machine (USD)</label><input id="b-day" type="number" min="0" step="0.01" placeholder="none"></div>
+    <div class="ap-acts" id="cost-acts"><button class="act act-review" id="b-save">Save budget</button>
+      <span class="act-msg" id="b-msg"></span></div>
+    </details>
+    <details class="adv hide" id="audit-section"><summary>Audit</summary>
+    <div class="desc">The machine-wide, hash-chained record of consequential acts: opens, commits, discards, rewinds, reviews, connector decisions, sign-ins, account and policy changes.</div>
+    <div class="field"><label>Chain <span class="keystate" id="audit-chain"></span></label>
+      <div class="memview" id="audit-list"></div></div>
     </details>
     <details class="adv hide" id="account-section"><summary>My account</summary>
     <div class="desc">Your conversations, keys, settings and notes are yours alone; an admin sees every record.</div>
@@ -1334,6 +1363,9 @@ async function openSettings(msg){
   renderConnectors();
   loadMemory();
   $('account-section').classList.toggle('hide', !ME.auth);
+  loadCost();
+  $('audit-section').classList.toggle('hide', !(isAdmin() || ME.role==='viewer'));
+  if(isAdmin() || ME.role==='viewer') loadAudit();
   $('users-section').classList.toggle('hide', !(ME.auth && ME.role==='admin'));
   if(ME.auth && ME.role==='admin') loadUsers();
   $('c-add').disabled = !isAdmin(); $('c-approval').disabled = !isAdmin();
@@ -1435,6 +1467,36 @@ async function mintToken(){
   const r = await j('/api/users/'+encodeURIComponent(ME.user)+'/token',{method:'POST',body:JSON.stringify({label:'workspace'})});
   $('a-token').textContent = r.error||r.token;
 }
+function money(v){ return v==null ? '—' : '$'+Number(v).toFixed(4); }
+async function loadCost(){
+  const r = await j('/api/cost'); if(r.error){ $('cost-spend').textContent = r.error; return; }
+  const t = r.today, m = r.month;
+  $('cost-spend').textContent = `today (${r.scope}): ${t.calls} call(s), ${t.in} in / ${t.out} out, ${money(t.usd)}\n`
+    + `last 30 days: ${m.calls} call(s), ${m.in} in / ${m.out} out, ${money(m.usd)}`
+    + (m.unpriced ? ` (${m.unpriced} on unpriced models)` : '')
+    + (Object.keys(r.limits||{}).length ? `\nlimits in effect: ${Object.entries(r.limits).map(([k,v])=>k+'='+v).join(', ')}` : '');
+  const b = r.budget||{};
+  $('b-tokens').value = b.session_tokens||''; $('b-session').value = b.session_usd||''; $('b-day').value = b.day_usd||'';
+  const ro = !isAdmin(); ['b-tokens','b-session','b-day','b-save'].forEach(id=>{ $(id).disabled = ro; });
+}
+async function saveBudget(){
+  const body = {budget:{session_tokens:$('b-tokens').value||0, session_usd:$('b-session').value||0, day_usd:$('b-day').value||0}};
+  const r = await j('/api/cost',{method:'PUT',body:JSON.stringify(body)});
+  const m=$('b-msg'); m.textContent = r.error||'saved'; m.className='act-msg '+(r.error?'bad':'ok');
+  if(!r.error) loadCost();
+}
+async function loadAudit(){
+  const r = await j('/api/audit?n=40&verify=1'); const box = $('audit-list'); box.innerHTML='';
+  if(r.error){ box.textContent = r.error; return; }
+  const ch = $('audit-chain'); ch.textContent = r.chain && r.chain.ok ? 'intact · '+r.chain.entries : 'BROKEN';
+  ch.className = 'keystate '+(r.chain && r.chain.ok ? 'set' : 'unset');
+  r.entries.slice().reverse().forEach(e=>{ const d = el('div','jr');
+    const extra = Object.entries(e).filter(([k])=>!['ts','action','actor','seq','prev','hash'].includes(k))
+      .map(([k,v])=>k+'='+(typeof v==='string'?v:JSON.stringify(v))).join(' ');
+    d.appendChild(el('b', null, (e.ts||'').slice(0,19)+'  '+(e.actor||'')+'  '+e.action));
+    if(extra) d.appendChild(el('div', null, extra.slice(0,200)));
+    box.appendChild(d); });
+}
 async function signOut(){ await j('/api/logout',{method:'POST',body:'{}'}); location.href='/login'; }
 async function addConnector(){
   const transport = $('c-transport').value, msg = $('c-msg');
@@ -1472,6 +1534,7 @@ $('m-save').addEventListener('click',saveMemory);
 $('u-add').addEventListener('click',addUser);
 $('a-passwd').addEventListener('click',changePassword);
 $('a-mint').addEventListener('click',mintToken);
+$('b-save').addEventListener('click',saveBudget);
 $('logout').addEventListener('click',signOut);
 $('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
   body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });

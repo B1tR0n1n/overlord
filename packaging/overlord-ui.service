@@ -1,0 +1,36 @@
+# OVERLORD workspace as a system service, for a team on one machine.
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/overlord overlord
+#   sudo -u overlord overlord users add admin --role admin
+#   sudo -u overlord overlord tls selfsign --host overlord.example.lan
+#   sudo install -m 0644 packaging/overlord-ui.service /etc/systemd/system/
+#   sudo systemctl enable --now overlord-ui
+#
+# Beyond loopback the server refuses to start without accounts and TLS, so
+# the two commands above are not optional. Override the bind, port or
+# certificate paths with a drop-in (systemctl edit overlord-ui) or an
+# EnvironmentFile.
+[Unit]
+Description=OVERLORD agent workspace (web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=overlord
+Group=overlord
+Environment=OVERLORD_HOME=/var/lib/overlord/.overlord
+Environment=OVERLORD_BIND=0.0.0.0
+Environment=OVERLORD_PORT=7777
+Environment=OVERLORD_HOST=overlord.example.lan
+EnvironmentFile=-/etc/overlord/ui.env
+ExecStart=/usr/local/bin/overlord ui --bind ${OVERLORD_BIND} --port ${OVERLORD_PORT} --host ${OVERLORD_HOST} \
+    --tls-cert ${OVERLORD_HOME}/tls/cert.pem --tls-key ${OVERLORD_HOME}/tls/key.pem --log-json
+Restart=on-failure
+RestartSec=3
+# the sandbox needs user namespaces (kernel backend) or /dev/fuse (fuse backend)
+NoNewPrivileges=no
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

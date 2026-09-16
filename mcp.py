@@ -81,7 +81,7 @@ def _valid_name(name):
     return name
 
 
-def add_server(name, command=None, args=None, env=None, cwd=None, url=None, headers=None):
+def _add_server_impl(name, command=None, args=None, env=None, cwd=None, url=None, headers=None):
     """Register a connector. Exactly one of command (stdio) or url (http)."""
     _valid_name(name)
     if bool(command) == bool(url):
@@ -99,7 +99,7 @@ def add_server(name, command=None, args=None, env=None, cwd=None, url=None, head
     return entry
 
 
-def remove_server(name):
+def _remove_server_impl(name):
     cfg = load_config()
     if name not in cfg["servers"]:
         raise MCPError(f"error: no connector named {name}")
@@ -107,7 +107,7 @@ def remove_server(name):
     save_config(cfg)
 
 
-def set_approval(mode):
+def _set_approval_impl(mode):
     if mode not in APPROVAL_MODES:
         raise MCPError(f"error: approval must be one of {', '.join(APPROVAL_MODES)}")
     cfg = load_config()
@@ -482,3 +482,28 @@ def add_mcp_parser(sub):
     pv = ms.add_parser("approval", help="what happens before a non-read-only connector tool runs")
     pv.add_argument("mode", choices=APPROVAL_MODES)
     pm.set_defaults(fn=cmd_mcp)
+
+
+# ---------------------------------------------------------------- audit
+
+
+def add_server(name, command=None, args=None, env=None, cwd=None, url=None, headers=None):
+    entry = _add_server_impl(name, command=command, args=args, env=env, cwd=cwd, url=url,
+                             headers=headers)
+    import audit
+    audit.record("connector.config", op="add", server=name, transport=entry.get("transport"))
+    return entry
+
+
+def remove_server(name):
+    r = _remove_server_impl(name)
+    import audit
+    audit.record("connector.config", op="remove", server=name)
+    return r
+
+
+def set_approval(mode):
+    r = _set_approval_impl(mode)
+    import audit
+    audit.record("connector.config", op="approval", mode=mode)
+    return r

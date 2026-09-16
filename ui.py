@@ -18,12 +18,15 @@ import re
 import secrets
 import ssl
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
 import overlord as core
 import chatui
 import auth
+import audit
+import cost as cost_mod
 
 # Field Systems Division tokens. Dark ground is foundational; gold is earned.
 PALETTE = dict(
@@ -923,6 +926,22 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle_one_request(self):
+        self._t0 = time.time()
+        super().handle_one_request()
+
+    def log_request(self, code="-", size="-"):
+        # --log-json: one line per request on stderr, for a log shipper
+        if not getattr(self.server, "log_json", False):
+            return
+        p = auth.current()
+        line = {"ts": time.strftime(core.TS_FORMAT), "remote": self.client_address[0],
+                "method": self.command, "path": urlparse(self.path).path,
+                "status": int(code) if str(code).isdigit() else code,
+                "ms": int((time.time() - getattr(self, "_t0", time.time())) * 1000),
+                "user": p["user"] if p else None}
+        print(json.dumps(line), file=sys.stderr, flush=True)
+
     # --- browser-facing hardening -------------------------------------
     #
     # Loopback with no accounts is not the same as unreachable: any page the
@@ -1054,6 +1073,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if urlparse(self.path).path == "/healthz":
+                # liveness for a load balancer or a container runtime: no
+                # login, no record contents, nothing an outsider learns from
+                if not self._host_ok():
+                    self._send({"error": "bad host header"}, 421)
+                    return
+                self._send({"ok": True, "version": core.VERSION,
+                            "backend": core.detect_backend() or "none",
+                            "auth": auth.enabled(), "tls": self._tls()})
+                return
             if not self._guard(state_changing=False):
                 return
             parsed = urlparse(self.path)
@@ -1073,6 +1102,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/me":
                 self._send(auth.me())
+                return
+            if path == "/api/audit":
+                auth.require("audit")
+                n = max(1, min(500, int((query.get("n") or ["50"])[0] or 50)))
+                self._send({"entries": audit.entries(n, (query.get("action") or [None])[0]),
+                            "chain": audit.verify() if query.get("verify") else None})
+                return
+            if path == "/api/cost":
+                p = auth.current()
+                owner = None if (not p or p["role"] == "admin") else p["user"]
+                cfg = cost_mod.load_config()
+                self._send({"today": cost_mod.spent_today(owner),
+                            "month": cost_mod.spent(30, owner),
+                            "scope": owner or "everyone",
+                            "budget": cfg["budget"], "prices": cfg["prices"],
+                            "limits": cost_mod.budget_for(None, p["user"] if p else None)[0]})
                 return
             if path == "/api/users":
                 auth.require("admin")
@@ -1268,7 +1313,26 @@ class Handler(BaseHTTPRequestHandler):
                 os.makedirs(os.path.dirname(core.POLICY_FILE), exist_ok=True)
                 with open(core.POLICY_FILE, "w") as f:
                     f.write(text)
+                audit.record("policy.write", bytes=len(text))
                 self._send({"saved": True})
+            elif self.path == "/api/cost":
+                auth.require("admin")
+                req = self._body()
+                cfg = cost_mod.load_config()
+                if isinstance(req.get("budget"), dict):
+                    cfg["budget"] = cost_mod._clean_budget(req["budget"])
+                if isinstance(req.get("prices"), dict):
+                    for k, v in req["prices"].items():
+                        if v is None:
+                            cfg["prices"].pop(str(k), None)
+                        elif isinstance(v, dict):
+                            try:
+                                cfg["prices"][str(k)] = {"in": float(v["in"]), "out": float(v["out"])}
+                            except (KeyError, TypeError, ValueError):
+                                raise core.OverlordError(f"error: price for {k} needs numeric in/out")
+                cost_mod.save_config(cfg)
+                audit.record("cost.config", budget=cfg["budget"])
+                self._send({"saved": True, "budget": cfg["budget"], "prices": cfg["prices"]})
             else:
                 self._send({"error": "not found"}, 404)
         except auth.Forbidden as e:
@@ -1288,7 +1352,8 @@ def _visible_metas():
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 
-def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None):
+def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None,
+                log_json=False):
     """The listening server. Beyond loopback it insists on accounts and TLS:
     a workspace that can commit an agent's changes to a real tree is not
     something to leave on a LAN behind a Host check."""
@@ -1319,6 +1384,7 @@ def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=
             allowed.add(f"{h}:{port}")
     server.hosts = allowed
     server.tls = bool(tls_cert)
+    server.log_json = bool(log_json)
     if tls_cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1332,8 +1398,8 @@ def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=
     return server
 
 
-def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None):
-    server = make_server(port, bind, tls_cert, tls_key, hosts)
+def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None, log_json=False):
+    server = make_server(port, bind, tls_cert, tls_key, hosts, log_json)
     scheme = "https" if server.tls else "http"
     shown = bind if bind in LOOPBACK else (sorted(server.hosts) or [bind])[0].split(":")[0]
     who = ("accounts required" if auth.enabled() else "no accounts — local person is the operator")

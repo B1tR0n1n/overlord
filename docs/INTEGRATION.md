@@ -116,6 +116,14 @@ token: `overlord users token <name> --name ci` prints it once; send
 CI job that should only read gets a viewer's token. `GET /api/me` says who
 the server thinks you are.
 
+### Budgets, the ledger and the audit log
+
+A policy rule may carry `"budget": {"session_tokens": N, "session_usd": X}`;
+the daemon's agent sessions stop with reason `budget` before the call that
+would run past it. `overlord cost --user <name>` reads the ledger;
+`overlord audit --json` streams the machine-wide log for a SIEM, and
+`overlord audit verify` (exit 1 on a break) belongs in a nightly check.
+
 ### Savepoints from the SDK
 
 Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`

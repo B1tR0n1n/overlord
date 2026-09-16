@@ -1482,10 +1482,24 @@ def _launch_holder(sid, meta, lock, capture, fresh):
             abort(parent_sock, cleanup, proc)
             raise
     try:
-        return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+        live = LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
     except OverlordError:
         abort(parent_sock, cleanup, proc)
         raise
+    _audit("session.open" if fresh else "session.reopen", sid=sid, target=target,
+           owner=meta.get("owner"), backend=backend, agent=meta.get("agent"),
+           jail=bool(grants.get("jail")), net=grants.get("net"),
+           connectors=grants.get("connectors") or None)
+    return live
+
+
+def _audit(action, **fields):
+    """The machine-wide record (audit.py); never allowed to fail the work."""
+    try:
+        import audit as audit_mod
+        audit_mod.record(action, **fields)
+    except Exception as e:      # noqa: BLE001 — a broken audit path is reported, not fatal
+        print(f"audit: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- savepoints
@@ -1544,6 +1558,7 @@ def rewind_session(sid, to):
                             + (" (rewind it through the daemon that holds it)"
                                if m.get("status") == "open" else ""))
     _rewind_layers(sid, m, to)
+    _audit("session.rewind", sid=sid, owner=m.get("owner"), to=to)
     return _write_provenance(sid, m)
 
 
@@ -1609,6 +1624,7 @@ def fork_session(sid, at=None):
         raise
     m.setdefault("forks", []).append({"session": new, "at": at, "ts": _now()})
     save_meta(sid, m)
+    _audit("session.fork", sid=sid, owner=m.get("owner"), new=new, at=at)
     return new
 
 
@@ -1892,6 +1908,8 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
         raise OverlordError(f"error: commit needs a fresh countersignature ({why}): "
                             f"overlord review {sid}")
     if rev and fresh and rev.get("verdict") == "reject" and not force:
+        _audit("session.commit_refused", sid=sid, owner=m.get("owner"), target=m["target"],
+               why="rejected by review", reviewer=rev.get("reviewer"))
         return {"committed": False, "conflicts": [], "merged": [], "target": m["target"],
                 "layers": selected, "rejected": rev}
     bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
@@ -1906,6 +1924,8 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
             locate=lambda rel: _safe_join(uppers[origin[rel]], rel) if rel in origin
             else _safe_join(uppers[-1], rel))
     if conflicts and not force:
+        _audit("session.commit_refused", sid=sid, owner=m.get("owner"), target=m["target"],
+               why="conflicts", conflicts=len(conflicts))
         return {"committed": False, "conflicts": conflicts, "merged": merged,
                 "target": m["target"], "layers": selected}
     # provenance is derived while the tree still holds the "before" state
@@ -1950,6 +1970,10 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
             memory_mod.journal_record(m)
         except OSError:
             pass
+    _audit("session.commit", sid=sid, owner=m.get("owner"), target=m["target"],
+           files=len(changes), forced=bool(conflicts), merged=len(merged) or None,
+           only=only, drop=drop, countersigned=m.get("countersigned") or None,
+           overrode_rejection=m.get("overrode_rejection") or None, usage=m.get("usage"))
     return {"committed": True, "applied": len(changes), "merged": merged,
             "target": m["target"], "layers": selected, "dropped": dropped}
 
@@ -1969,6 +1993,8 @@ def rollback_session(sid):
                 break
             time.sleep(0.1)
     _force_rmtree(session_path(sid))
+    _audit("session.rollback", sid=sid, owner=m.get("owner"), target=m["target"],
+           was=m.get("status"), usage=m.get("usage"))
     return m["target"]
 
 
@@ -2275,6 +2301,28 @@ def cmd_doctor(args):
             checks.append(("apparmor userns restriction", f.read().strip(), True))
     except OSError:
         pass
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import auth as auth_mod
+    import audit as audit_mod
+    import retention as retention_mod
+    users = auth_mod.list_users()
+    checks.append(("accounts (web UI sign-in)",
+                   f"{len(users)} account(s): sign-in required" if users
+                   else "none: loopback only, the local person is the operator", True))
+    tls_dir = os.path.join(OVERLORD_HOME, "tls")
+    has_tls = os.path.isfile(os.path.join(tls_dir, "cert.pem"))
+    checks.append(("tls material (~/.overlord/tls)",
+                   "cert.pem present" if has_tls else "none (overlord tls selfsign, or bring your own)",
+                   True))
+    v = audit_mod.verify()
+    checks.append(("audit chain", f"intact, {v['entries']} entries" if v["ok"]
+                   else f"BROKEN at line {v['broken_at']}: {v['reason']}", v["ok"]))
+    du = retention_mod.usage()
+    rc = retention_mod.load_config()
+    checks.append(("records on disk",
+                   f"{du['sessions']} session(s) {du['sessions_bytes'] >> 20} MiB, "
+                   f"{du['objects']} object(s) {du['objects_bytes'] >> 20} MiB; "
+                   f"gc keeps {rc['keep_days']} days / newest {rc['keep_last']}", True))
     for name, val, good in checks:
         print(f"  {'ok ' if good else '!! '} {name}: {val}")
     if not (k or fu):
@@ -2286,7 +2334,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2665,7 +2713,7 @@ def cmd_ui(args):
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import ui
     return ui.serve(args.port, bind=args.bind, tls_cert=args.tls_cert, tls_key=args.tls_key,
-                    hosts=args.host)
+                    hosts=args.host, log_json=args.log_json)
 
 
 # ---------------------------------------------------------------- main
@@ -2722,10 +2770,17 @@ def main(argv=None):
     pu.add_argument("--tls-key", help="PEM private key")
     pu.add_argument("--host", action="append",
                     help="a hostname browsers will use (Host header allowlist); repeatable")
+    pu.add_argument("--log-json", action="store_true", help="one JSON line per request on stderr")
     pu.set_defaults(fn=cmd_ui)
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import auth as auth_mod
+    import cost as cost_mod
+    import audit as audit_mod
+    import retention as retention_mod
     auth_mod.add_auth_parsers(sub)
+    cost_mod.add_cost_parser(sub)
+    audit_mod.add_audit_parser(sub)
+    retention_mod.add_gc_parser(sub)
 
     for name, fn in (("diff", cmd_diff), ("log", cmd_log), ("rollback", cmd_rollback)):
         sp = sub.add_parser(name)

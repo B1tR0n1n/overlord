@@ -137,7 +137,7 @@ try:
 
     def req(path, data=None, method=None, headers=None, raw_body=None):
         body = raw_body.encode() if raw_body is not None else (json.dumps(data).encode() if data is not None else None)
-        h = {"Host": f"127.0.0.1:{PORT}"}
+        h = {"Host": f"127.0.0.1:{PORT}", "Cookie": ui.local_cookie()}
         h.update(headers or {})
         r = urllib.request.Request(BASE + path, data=body, method=method, headers=h)
         try:
@@ -265,7 +265,8 @@ try:
                 break
             except (urllib.error.URLError, ConnectionError, OSError):
                 time.sleep(0.1)
-        urllib.request.urlopen(f"http://127.0.0.1:{PORT2}/api/sessions", timeout=5).read()
+        urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{PORT2}/api/sessions",
+                                                      headers={"Cookie": ui.local_cookie()}), timeout=5).read()
     finally:
         proc.terminate()
         _out, err = proc.communicate(timeout=10)

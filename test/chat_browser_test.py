@@ -71,6 +71,7 @@ os.environ["OVERLORD_AGENT_SCRIPT"] = script
 
 sys.path.insert(0, HERE)
 import chatui  # noqa: E402
+import ui  # noqa: E402
 import overlord as core  # noqa: E402
 chatui.save_settings({"provider": "scripted", "workdir": target,
                       "jail": core.detect_backend() == "kernel",
@@ -84,7 +85,7 @@ errors, chrome = [], _chromium()
 try:
     for _ in range(60):
         try:
-            urllib.request.urlopen(BASE + "/api/settings", timeout=2)
+            urllib.request.urlopen(BASE + "/healthz", timeout=2)
             break
         except OSError:
             time.sleep(0.1)
@@ -109,7 +110,7 @@ try:
         page.on("console", on_console)
         page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
 
-        page.goto(BASE + "/", wait_until="networkidle")
+        page.goto(BASE + "/?token=" + ui.local_token(), wait_until="networkidle")
         page.wait_for_timeout(400)
         if errors:
             fail("load: " + "; ".join(errors))

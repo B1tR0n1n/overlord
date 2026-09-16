@@ -62,7 +62,7 @@ try:
 
     # 1. it was told the truth up front
     sysp = p.systems[0]
-    for needle in ("# Operating conditions", "scripted:scripted", "kernel jail", "network: none",
+    for needle in ("# Operating conditions", "served as model `scripted` via scripted", "kernel jail", "network: none",
                    "provenance is derived", "working for probe"):
         if needle not in sysp:
             fail(f"conditions block lacks {needle!r}")
@@ -106,6 +106,41 @@ try:
     ok("every probe and its outcome is on the transcript")
 
     ov.rollback_session(sid)
+
+    # 4. A13: a session granted net=host shares the host's loopback; OVERLORD's
+    # own UI must still refuse it — the launch token lives where the jail cannot see
+    import threading
+    import ui
+    from http.server import ThreadingHTTPServer
+    PORT = 7780
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), ui.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        probe = ("import urllib.request\n"
+                 "def get(p, h={}):\n"
+                 "    try:\n"
+                 f"        with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{PORT}'+p, headers=h), timeout=3) as r: return r.status\n"
+                 "    except urllib.error.HTTPError as e: return e.code\n"
+                 "    except Exception as e: return 'ERR'\n"
+                 "print('healthz', get('/healthz'))\n"
+                 "print('sessions', get('/api/sessions'))\n"
+                 "print('page', get('/'))\n"
+                 "print('token-file', get('/api/sessions', {'Cookie': 'overlord_local=' + (open('/root/.overlord/ui.token').read().strip() if __import__('os').path.exists('/root/.overlord/ui.token') else 'none')}))\n")
+        p2 = agent.ScriptedProvider([{"text": "reach", "tool_calls": [{"name": "shell", "input": {"command": "python3 -c \"" + probe.replace('"', '\\"') + "\""}}]}, {"text": "done"}])
+        live = ov.open_session(target, "kernel", {"net": "host", "jail": True, "timeout": None, "merge_base": False},
+                               capture=True, agent="scripted:scripted", owner="probe")
+        ev2 = []
+        agent.run_agent(live, p2, "reach the UI", max_turns=3, emit=ev2.append)
+        sid2, _ = live.close()
+        out = [r["output"] for r in ev2 if r["type"] == "tool_result"][0]
+        if "healthz 200" not in out:
+            fail(f"net=host should reach loopback at all (healthz): {out}")
+        if "sessions 401" not in out or "page 401" not in out or "token-file 401" not in out:
+            fail(f"the UI served a net=host session without the launch token: {out}")
+        ov.rollback_session(sid2)
+        ok("A13: with net=host the agent reaches loopback but OVERLORD's own UI refuses it without the token")
+    finally:
+        server.shutdown()
     print("PASS: escape")
 finally:
     subprocess.run(["rm", "-rf", HOME, target])

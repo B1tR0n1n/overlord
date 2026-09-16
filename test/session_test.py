@@ -159,7 +159,7 @@ try:
     for _ in range(7):
         try:
             with urllib.request.urlopen(urllib.request.Request(
-                    f"http://127.0.0.1:{PORT}/api/me", headers={"Host": f"127.0.0.1:{PORT}"}), timeout=5) as r:
+                    f"http://127.0.0.1:{PORT}/api/me", headers={"Host": f"127.0.0.1:{PORT}", "Cookie": ui.local_cookie()}), timeout=5) as r:
                 codes.append(r.status)
         except urllib.error.HTTPError as e:
             codes.append(e.code)

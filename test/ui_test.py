@@ -15,6 +15,8 @@ import urllib.parse
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OVERLORD_HOME = tempfile.mkdtemp()
 os.environ["OVERLORD_HOME"] = OVERLORD_HOME
+sys.path.insert(0, HERE)
+import ui  # noqa: E402  (the launch token: open mode's credential)
 PORT = 7791
 BASE = f"http://127.0.0.1:{PORT}"
 
@@ -30,7 +32,8 @@ def ok(msg):
 
 def req(path, data=None, method=None):
     r = urllib.request.Request(
-        BASE + path, data=data.encode() if data else None, method=method
+        BASE + path, data=data.encode() if data else None, method=method,
+        headers={"Cookie": ui.local_cookie()}
     )
     with urllib.request.urlopen(r, timeout=10) as resp:
         return resp.read().decode()
@@ -111,8 +114,9 @@ try:
     sid2 = next((w for w in run2.stdout.split() if w.startswith("2")), None) or fail("no session")
 
     def raw(path, data=None, method=None, headers=None):
+        hdrs = {"Cookie": ui.local_cookie(), **(headers or {})}
         r = urllib.request.Request(BASE + path, data=data.encode() if data else None,
-                                   method=method, headers=headers or {})
+                                   method=method, headers=hdrs)
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.read().decode()
 
@@ -158,7 +162,7 @@ try:
 
     # --- the same-origin path still works, and the page carries a CSP ---
     with urllib.request.urlopen(urllib.request.Request(
-            BASE + "/", headers={"Origin": BASE}), timeout=10) as resp:
+            BASE + "/", headers={"Origin": BASE, "Cookie": ui.local_cookie()}), timeout=10) as resp:
         csp = resp.headers.get("Content-Security-Policy") or ""
         if "script-src 'nonce-" not in csp or "default-src 'none'" not in csp:
             fail(f"page missing a nonce-based CSP: {csp!r}")

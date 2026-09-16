@@ -192,7 +192,7 @@ try:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{PORT}/api/session/{sid}/export",
-                                     headers={"Host": f"127.0.0.1:{PORT}"})
+                                     headers={"Host": f"127.0.0.1:{PORT}", "Cookie": ui.local_cookie()})
         with urllib.request.urlopen(req, timeout=20) as resp:
             data, hdrs = resp.read(), resp.headers
         if hdrs.get("Content-Type") != "application/gzip" or f'{sid}.ovl' not in hdrs.get("Content-Disposition", ""):

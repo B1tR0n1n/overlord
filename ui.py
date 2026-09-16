@@ -13,6 +13,7 @@ the stack degrades to Georgia / Consolas so the UI works airgapped.
 """
 
 import json
+import hmac
 import os
 import re
 import secrets
@@ -21,7 +22,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs, quote, urlencode
 
 import overlord as core
 import chatui
@@ -1016,11 +1017,45 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").strip()
         return host in self._allowed_hosts()
 
+    def _local_ok(self):
+        tok = local_token()
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == LOCAL_COOKIE and hmac.compare_digest(v, tok):
+                return True
+        authz = self.headers.get("Authorization") or ""
+        return authz.startswith("Bearer ") and hmac.compare_digest(authz[7:].strip(), tok)
+
     def _principal_ok(self, path):
-        """Accounts on: identify the caller, or send them to sign in."""
+        """Accounts on: identify the caller, or send them to sign in. Accounts
+        off: the launch token is the credential (red team A13) — loopback is
+        shared with any session granted net=host, so it proves nothing."""
         auth.set_current(None)
         if not auth.enabled():
-            return True
+            if self._local_ok():
+                return True
+            parsed = urlparse(self.path)
+            q = parse_qs(parsed.query)
+            tok = (q.get("token") or [""])[0]
+            if tok and hmac.compare_digest(tok, local_token()):
+                rest = urlencode({k: v[0] for k, v in q.items() if k != "token"})
+                loc = parsed.path + ("?" + rest if rest else "")
+                self.send_response(302)
+                self.send_header("Location", loc)
+                self.send_header("Set-Cookie", f"{LOCAL_COOKIE}={tok}; Path=/; Max-Age=2592000; HttpOnly; "
+                                 f"SameSite=Strict{'; Secure' if self._tls() else ''}")
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return False
+            if path.startswith("/api/") or path.startswith("/auth/"):
+                self._send({"error": "token required: open the link printed by `overlord ui` "
+                            "(?token=…), or send Authorization: Bearer <~/.overlord/ui.token>"}, 401)
+            else:
+                nonce = secrets.token_urlsafe(16)
+                self._send(None, code=401, raw=TOKEN_PAGE.replace("__NONCE__", nonce).encode(),
+                           ctype="text/html; charset=utf-8", nonce=nonce)
+            return False
         p = auth.authenticate(self.headers, self.client_address[0])
         if p is not None:
             auth.set_current(p)
@@ -1431,6 +1466,59 @@ def _visible_metas():
 
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
+LOCAL_COOKIE = "overlord_local"
+TOKEN_FILE = os.path.join(core.OVERLORD_HOME, "ui.token")
+
+
+def local_token():
+    """Open mode's credential (red team A13): a session granted net=host
+    shares the host's loopback, so "reachable on 127.0.0.1" is not "the
+    person at the keyboard". The token lives in ~/.overlord, which the jail
+    cannot see; whoever holds it is a person. Made once, kept across restarts
+    so a bookmark keeps working."""
+    try:
+        with open(TOKEN_FILE) as f:
+            tok = f.read().strip()
+            if tok:
+                return tok
+    except OSError:
+        pass
+    os.makedirs(core.OVERLORD_HOME, exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        with open(TOKEN_FILE) as f:          # someone else made it first: theirs wins
+            return f.read().strip()
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    return tok
+
+
+def local_cookie():
+    """For scripts and tests on the host: the Cookie header value."""
+    return f"{LOCAL_COOKIE}={local_token()}"
+
+
+TOKEN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>OVERLORD — token</title>
+<style nonce="__NONCE__">
+:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0908;
+color:#e8e2d4;font:15px/1.5 -apple-system,Segoe UI,Inter,sans-serif}
+.card{width:min(420px,92vw);padding:28px;border:1px solid #2a2620;background:#12100d}
+.name{font-weight:700;letter-spacing:.18em;color:#c9a227;font-size:13px}.sub{color:#8a8171;font-size:12px;margin-bottom:14px}
+p{font-size:13px;color:#b8ae98}code{color:#e8e2d4}
+input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #2a2620;background:#0a0908;color:#e8e2d4;font-size:14px;margin-top:10px}
+button{margin-top:12px;width:100%;padding:10px;background:#c9a227;color:#0a0908;border:0;font-weight:600;cursor:pointer}
+</style></head><body><form class="card" id="f">
+<div class="name">OVERLORD</div><div class="sub">this workspace needs its launch token</div>
+<p>The terminal that ran <code>overlord ui</code> printed a link with <code>?token=…</code>. Open that link, or paste the token here. It is in <code>~/.overlord/ui.token</code> on the machine that runs OVERLORD — nowhere an agent can read it.</p>
+<input id="t" placeholder="token" autocomplete="off"><button type="submit">Continue</button></form>
+<script nonce="__NONCE__">
+document.getElementById('f').addEventListener('submit', e => { e.preventDefault();
+  const t = document.getElementById('t').value.trim(); if(!t) return;
+  const u = new URL(location.href); u.searchParams.set('token', t); location.href = u.toString(); });
+</script></body></html>"""
 
 
 def make_server(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None,
@@ -1486,9 +1574,12 @@ def serve(port=7777, bind="127.0.0.1", tls_cert=None, tls_key=None, hosts=None, 
     server = make_server(port, bind, tls_cert, tls_key, hosts, log_json, rate_limit)
     scheme = "https" if server.tls else "http"
     shown = bind if bind in LOOPBACK else (sorted(server.hosts) or [bind])[0].split(":")[0]
-    who = ("accounts required" if auth.enabled() else "no accounts — local person is the operator")
-    print(f"OVERLORD workspace: {scheme}://{shown}:{server.server_address[1]}  "
-          f"({'loopback only' if bind in LOOPBACK else 'bound ' + bind}; {who})")
+    if auth.enabled():
+        who, tail = "accounts required", ""
+    else:
+        who, tail = "no accounts — the launch token is the credential", f"/?token={local_token()}"
+    print(f"OVERLORD workspace: {scheme}://{shown}:{server.server_address[1]}{tail}\n"
+          f"  ({'loopback only' if bind in LOOPBACK else 'bound ' + bind}; {who})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -61,6 +61,9 @@ def _chromium_path():
 
 OVERLORD_HOME = tempfile.mkdtemp()
 os.environ["OVERLORD_HOME"] = OVERLORD_HOME
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE)
+import ui  # noqa: E402  (the launch token: open mode's credential)
 target = tempfile.mkdtemp()
 with open(os.path.join(target, "calc.py"), "w") as f:
     f.write("def add(a, b):\n    return a + b\n")
@@ -105,7 +108,7 @@ errors, chrome = [], _chromium_path()
 try:
     for _ in range(60):
         try:
-            urllib.request.urlopen(BASE + "/api/sessions", timeout=2)
+            urllib.request.urlopen(BASE + "/healthz", timeout=2)
             break
         except OSError:
             time.sleep(0.1)
@@ -126,7 +129,7 @@ try:
             if errors:
                 fail(f"{step}: " + "; ".join(errors))
 
-        page.goto(BASE + "/console", wait_until="networkidle")
+        page.goto(BASE + "/console?token=" + ui.local_token(), wait_until="networkidle")
         clean("page load")
 
         if page.locator(".reg-item").count() != 2:

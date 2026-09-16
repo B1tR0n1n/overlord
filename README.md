@@ -227,7 +227,13 @@ same rule as everywhere else in OVERLORD.
 ## Accounts, TLS, a team on one machine
 
 `overlord ui` binds loopback with no accounts: the person at the keyboard
-is the operator, as it always was. The first `overlord users add` turns
+is the operator — proven by a **launch token**, not by loopback. Red team
+A13: a session granted `net: host` shares the host's loopback, so
+"reachable on 127.0.0.1" would include the agent, which could then read
+every session and commit its own. `overlord ui` prints
+`http://127.0.0.1:7777/?token=…`; the token lives in `~/.overlord/ui.token`
+(mode 600, outside the jail), the page keeps it as a strict cookie, scripts
+send it as `Authorization: Bearer`, and a request with neither is refused. The first `overlord users add` turns
 sign-in on (`auth.py`), and from then on every request names a principal —
 a login cookie (HttpOnly, SameSite=Strict, Secure under TLS) or a bearer
 token for scripts (`Authorization: Bearer ovl_…`, hashed at rest,
@@ -846,3 +852,10 @@ grants are absent.
   the agent's model, sandbox, network, budget and owner, and that everything
   is recorded. `escape_test.py`: an agent that probes its situation; every
   probe fails and is recorded. 197 assertions across twenty-three suites.
+- 2026-09-16 — v0.21: red team A13. With `net: host` a session reaches the
+  host's loopback — and so OVERLORD's own UI, which in open mode trusted
+  loopback: an agent could read every session and commit its own. Open mode
+  now has a launch token (`?token=…` printed by `overlord ui`, kept in
+  `~/.overlord/ui.token` where the jail cannot see it); the conditions
+  block names the served model as the API identifier to trust. 198
+  assertions across twenty-three suites.

@@ -53,8 +53,10 @@ class Client:
     def req(self, path, data=None, method=None, headers=None, raw=False):
         body = json.dumps(data).encode() if data is not None else None
         h = {"Host": self.base.split("://", 1)[1]}
+        cookies = [ui.local_cookie()]                 # open mode's credential; ignored once accounts exist
         if self.cookie:
-            h["Cookie"] = f"{auth.COOKIE}={self.cookie}"
+            cookies.append(f"{auth.COOKIE}={self.cookie}")
+        h["Cookie"] = "; ".join(cookies)
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         h.update(headers or {})

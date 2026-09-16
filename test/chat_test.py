@@ -41,7 +41,8 @@ def ok(msg):
 def req(path, data=None, method=None, headers=None):
     body = json.dumps(data).encode() if data is not None else None
     r = urllib.request.Request(BASE + path, data=body, method=method,
-                               headers={"Host": f"127.0.0.1:{PORT}", **(headers or {})})
+                               headers={"Host": f"127.0.0.1:{PORT}", "Cookie": ui.local_cookie(),
+                                        **(headers or {})})
     try:
         with urllib.request.urlopen(r, timeout=20) as resp:
             return resp.status, json.loads(resp.read().decode() or "{}")

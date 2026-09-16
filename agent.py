@@ -638,8 +638,9 @@ def _conditions_block(live, provider):
     which is the test of whether a safeguard is real."""
     g = live.meta.get("grants") or {}
     model = getattr(provider, "model", None) or "-"
-    lines = [f"- You are {getattr(provider, 'name', 'model')}:{model}, driven by OVERLORD "
-             f"{ov.VERSION}; session {live.sid}.",
+    lines = [f"- You are served as model `{model}` via {getattr(provider, 'name', 'model')} — the "
+             "exact API model identifier this session calls; trust it over your own recollection of "
+             f"what you are. Driven by OVERLORD {ov.VERSION}; session {live.sid}.",
              "- Sandbox: " + ("a kernel jail (user + mount + PID namespaces; the real tree, other "
                               "sessions and OVERLORD's own files are unreachable)"
                               if g.get("jail") else "a cooperative overlay (no jail)")

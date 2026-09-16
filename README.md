@@ -108,7 +108,7 @@ overlord secrets set-command 'vault kv get -field=value secret/overlord/{name}' 
 overlord export <session> -o review.ovl              # one signed file: record, retained versions, pending changes
 overlord import review.ovl -t /srv/app               # replay its changes here as a new pending session
 overlord cost                                        # what the models spent, by model / account / day
-overlord cost budget --day-usd 20                    # a line no conversation crosses
+overlord cost budget --day-usd 20 --month-usd 500    # lines no conversation crosses
 overlord audit verify                                # the hash chain of every consequential act
 overlord gc --dry-run                                # what retention would prune
 
@@ -378,13 +378,26 @@ override them (`overlord cost set-price <model> <in> <out>`); an unpriced
 model is still counted in tokens.
 
 Budgets are lines, not estimates: `session_tokens`, `session_usd`,
-`day_usd`, from the global config (`overlord cost budget`), the policy rule
-for a folder (`"budget": {...}`) or the account (`overlord users budget`),
-the most restrictive of each winning. A conversation is checked **before
-every call** and stops with reason `budget` at the first line it has
-reached — the work done so far stays in the transaction for review, the
-stop is in the transcript and on the audit log. Second-model reviews are
-on the ledger too.
+`day_usd`, `month_usd`, from the global config (`overlord cost budget`),
+the policy rule for a folder (`"budget": {...}`) or the account (`overlord
+users budget`), the most restrictive of each winning. A conversation is
+checked **before every call** and stops with reason `budget` at the first
+line it has reached — the work done so far stays in the transaction for
+review, the stop is in the transcript and on the audit log. Second-model
+reviews are on the ledger too.
+
+**The usage meter** in the workspace rail shows what is left, from two
+honest sources rather than a guess. The provider states its own rate-limit
+headroom on every reply — tokens and requests per minute, how many remain
+and when the bucket refills — and OVERLORD keeps the latest reading per
+provider (`~/.overlord/ratelimit.json`, from the `anthropic-ratelimit-*`
+and `x-ratelimit-*` headers, a 429's `retry-after` too). The meter reads
+that against the per-minute limit, and your ledger spend against the
+`day_usd` and `month_usd` lines. Set `month_usd` to your provider's
+monthly spend cap: the API never reports the cap, so that is the one number
+you supply for the monthly bar to mean "how much of my plan is left". The
+bar turns amber under a quarter left and red under a tenth; with no key
+having replied yet, the rate rows say so instead of inventing a number.
 
 ## Audit
 
@@ -965,7 +978,10 @@ grants are absent.
   train of thought, `incomplete` and `refusal` mapped to the stop reasons the
   agent already checks (chat completions' `length` and `content_filter` now
   map too). `--api` / Settings → Generation → OpenAI API picks the shape per
-  endpoint; compatible servers and Azure keep chat completions. `--audit`
+  endpoint; compatible servers and Azure keep chat completions. A usage
+  meter in the rail shows the provider's own rate-limit headroom and spend
+  against the daily and monthly budget lines; `month_usd` budget; current
+  Claude 5-family list prices. `--audit`
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

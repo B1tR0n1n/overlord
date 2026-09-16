@@ -12,7 +12,11 @@ line per call, and enforces budgets before the next call is made:
            model, in, out, usd. `overlord cost` sums it by model, account, day.
   budgets  most restrictive of: the global config ("budget" in cost.json),
            the policy rule for the target ("budget": {...}), the account
-           (users.json "budget"). Keys: session_tokens, session_usd, day_usd.
+           (users.json "budget"). Keys: session_tokens, session_usd, day_usd,
+           month_usd (set it to your provider's monthly cap: the API does not
+           report the cap, so the meter measures against the number you give).
+  ~/.overlord/ratelimit.json  the provider's own rate-limit headers from its
+           last reply — the only live statement of headroom a key can get.
            A session that crosses a line stops with reason "budget" before
            the next call; the stop is in the transcript and the audit log.
 
@@ -31,12 +35,21 @@ import overlord as core
 
 CONFIG_FILE = os.path.join(core.OVERLORD_HOME, "cost.json")
 LEDGER_FILE = os.path.join(core.OVERLORD_HOME, "ledger.jsonl")
-BUDGET_KEYS = ("session_tokens", "session_usd", "day_usd")
+BUDGET_KEYS = ("session_tokens", "session_usd", "day_usd", "month_usd")
+RATE_FILE = os.path.join(core.OVERLORD_HOME, "ratelimit.json")
 
 # USD per million tokens, list prices; substring match, longest key wins.
 # Override in cost.json — a contract price, a gateway, a model not listed.
 DEFAULT_PRICES = {
-    "claude-opus-4": {"in": 15.0, "out": 75.0},
+    "claude-fable-5": {"in": 10.0, "out": 50.0},
+    "claude-mythos-5": {"in": 10.0, "out": 50.0},
+    "claude-opus-5": {"in": 5.0, "out": 25.0},
+    "claude-opus-4": {"in": 15.0, "out": 75.0},      # 4 and 4.1
+    "claude-opus-4-5": {"in": 5.0, "out": 25.0},
+    "claude-opus-4-6": {"in": 5.0, "out": 25.0},
+    "claude-opus-4-7": {"in": 5.0, "out": 25.0},
+    "claude-opus-4-8": {"in": 5.0, "out": 25.0},
+    "claude-sonnet-5": {"in": 2.0, "out": 10.0},
     "claude-sonnet-4": {"in": 3.0, "out": 15.0},
     "claude-haiku-4": {"in": 1.0, "out": 5.0},
     "gpt-5": {"in": 1.25, "out": 10.0},
@@ -173,6 +186,96 @@ def spent_today(owner=None):
     return t
 
 
+def spent_month(owner=None):
+    """This calendar month, which is what a provider's spend cap counts."""
+    month = time.strftime("%Y-%m")
+    t = {"in": 0, "out": 0, "usd": 0.0, "calls": 0}
+    for r in ledger_rows(days=32, owner=owner):
+        if (r.get("ts") or "")[:7] != month:
+            continue
+        t["in"] += r.get("in", 0)
+        t["out"] += r.get("out", 0)
+        t["calls"] += 1
+        t["usd"] += r.get("usd") or 0.0
+    return t
+
+
+# ---------------------------------------------------------------- rate limits
+# Every provider reply carries its rate-limit state: what the limit is, what
+# is left, when it refills. Recorded per provider from the last reply seen.
+# It is a lower bound between calls (the bucket refills), which the meter says.
+
+_RATE_KEYS = ("requests", "tokens", "input-tokens", "output-tokens")
+
+
+def _provider_of(url):
+    host = (url.split("//", 1)[-1].split("/", 1)[0] or "").lower()
+    if "anthropic.com" in host:
+        return "anthropic"
+    if "openai.com" in host:
+        return "azure" if "azure" in host else "openai"
+    if "googleapis.com" in host:
+        return "gemini"
+    return "openai-compatible"
+
+
+def note_ratelimit(url, headers):
+    """providers.RESPONSE_HOOK: fold one reply's headers into the store."""
+    get = headers.get if hasattr(headers, "get") else (lambda k, d=None: d)
+    found = {}
+    for key in _RATE_KEYS:
+        for prefix in (f"anthropic-ratelimit-{key}-", f"x-ratelimit-{{}}-{key}"):
+            if "{}" in prefix:
+                limit, rem, reset = (get(prefix.format(w)) for w in ("limit", "remaining", "reset"))
+            else:
+                limit, rem, reset = (get(prefix + w) for w in ("limit", "remaining", "reset"))
+            if limit is not None or rem is not None:
+                found[key.replace("-", "_")] = {"limit": _num(limit), "remaining": _num(rem), "reset": reset}
+                break
+    retry = get("retry-after")
+    if not found and retry is None:
+        return None
+    entry = {"seen": time.time(), "at": time.strftime(core.TS_FORMAT), "url": url.split("?", 1)[0],
+             **found}
+    if retry is not None:
+        entry["retry_after"] = _num(retry)
+    with _LOCK:
+        store = ratelimits()
+        prov = _provider_of(url)
+        # a 429 carries only retry-after; keep the last reply's limit numbers
+        # rather than erase them, and clear a stale retry-after once a normal
+        # reply reports headroom again
+        merged = {**store.get(prov, {}), **entry}
+        if found and "retry_after" not in entry:
+            merged.pop("retry_after", None)
+        store[prov] = merged
+        try:
+            os.makedirs(core.OVERLORD_HOME, exist_ok=True)
+            tmp = RATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(store, f)
+            os.replace(tmp, RATE_FILE)
+        except OSError:
+            pass
+    return entry
+
+
+def _num(v):
+    try:
+        return float(v) if v is not None and "." in str(v) else (int(v) if v is not None else None)
+    except (TypeError, ValueError):
+        return None
+
+
+def ratelimits():
+    try:
+        with open(RATE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 # ---------------------------------------------------------------- budgets
 
 
@@ -221,6 +324,12 @@ def check(meta):
             who = owner or "this machine"
             raise BudgetExceeded(f"budget: {who} has spent ${today:.4f} today, the daily limit is "
                                  f"${limits['day_usd']:.2f} ({source['day_usd']})")
+    if "month_usd" in limits:
+        month = spent_month(owner)["usd"]
+        if month >= limits["month_usd"]:
+            who = owner or "this machine"
+            raise BudgetExceeded(f"budget: {who} has spent ${month:.4f} this month, the monthly limit is "
+                                 f"${limits['month_usd']:.2f} ({source['month_usd']})")
     return limits
 
 
@@ -319,4 +428,6 @@ def add_cost_parser(sub):
     pb.add_argument("--session-tokens", dest="session_tokens", type=int)
     pb.add_argument("--session-usd", dest="session_usd", type=float)
     pb.add_argument("--day-usd", dest="day_usd", type=float)
+    pb.add_argument("--month-usd", dest="month_usd", type=float,
+                    help="this calendar month; match it to your provider's spend cap")
     pc.set_defaults(fn=cmd_cost)

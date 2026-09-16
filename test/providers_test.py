@@ -53,7 +53,45 @@ def fake_open(url, headers, body, timeout, method="POST"):
     return FakeResp(CAPTURED.get("stream", b""))
 
 
+_ORIG_OPEN = P._open                      # the genuine transport, for the hook test
 P._open = fake_open
+
+# ------------------------------------------------------------ the response hook
+# every reply's headers reach RESPONSE_HOOK, an error reply's too (that is
+# where retry-after lives); the hook never breaks the call
+import email.message  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+seen = []
+
+
+class HdrResp(FakeResp):
+    headers = {"anthropic-ratelimit-tokens-remaining": "7"}
+
+
+def fake_urlopen(req, timeout=None):
+    if "fail" in req.full_url:
+        h = email.message.Message(); h["retry-after"] = "9"
+        raise urllib.error.HTTPError(req.full_url, 429, "slow down", h, io.BytesIO(b'{"error":"rl"}'))
+    return HdrResp(b"{}")
+
+
+P._open = _ORIG_OPEN
+urllib.request.urlopen, P.RESPONSE_HOOK = fake_urlopen, lambda url, h: seen.append((url, dict(h.items()) if hasattr(h, "items") else h))
+P._post("https://x/ok", {}, {})
+try:
+    P._post("https://x/fail", {}, {})
+    fail("429 did not raise")
+except P.ProviderError as e:
+    if "429" not in str(e):
+        fail(f"429 message: {e}")
+if seen != [("https://x/ok", {"anthropic-ratelimit-tokens-remaining": "7"}), ("https://x/fail", {"retry-after": "9"})]:
+    fail(f"response hook calls: {seen}")
+P.RESPONSE_HOOK = lambda url, h: 1 / 0
+P._post("https://x/ok", {}, {})                       # a broken hook is not the call's problem
+P.RESPONSE_HOOK = None
+P._open = fake_open                                    # restore for the streaming tests below
+ok("response hook: every reply's headers, error replies included; never on the call's path")
 
 # ------------------------------------------------------------ anthropic streaming
 sse = b"""event: message_start

@@ -157,6 +157,47 @@ try:
         fail("users list does not show the budget")
     ok("global daily limit and an account's own limit; the most restrictive line wins")
 
+    # 4b. the provider's rate-limit headers are the live statement of headroom
+    e = cost.note_ratelimit("https://api.anthropic.com/v1/messages", {
+        "anthropic-ratelimit-tokens-limit": "500000", "anthropic-ratelimit-tokens-remaining": "412000",
+        "anthropic-ratelimit-tokens-reset": "2026-09-16T21:00:42Z",
+        "anthropic-ratelimit-requests-limit": "1000", "anthropic-ratelimit-requests-remaining": "997",
+        "anthropic-ratelimit-requests-reset": "2026-09-16T21:00:01Z",
+        "anthropic-ratelimit-input-tokens-limit": "500000", "anthropic-ratelimit-input-tokens-remaining": "410000",
+        "anthropic-ratelimit-input-tokens-reset": "2026-09-16T21:00:42Z"})
+    if e["tokens"] != {"limit": 500000, "remaining": 412000, "reset": "2026-09-16T21:00:42Z"} \
+            or e["requests"]["remaining"] != 997 or e["input_tokens"]["remaining"] != 410000:
+        fail(f"anthropic rate headers: {e}")
+    cost.note_ratelimit("https://api.openai.com/v1/responses", {
+        "x-ratelimit-limit-tokens": "30000", "x-ratelimit-remaining-tokens": "29500", "x-ratelimit-reset-tokens": "1s",
+        "x-ratelimit-limit-requests": "500", "x-ratelimit-remaining-requests": "499", "x-ratelimit-reset-requests": "120ms"})
+    cost.note_ratelimit("https://api.openai.com/v1/responses", {"retry-after": "12"})
+    cost.note_ratelimit("http://127.0.0.1:11434/v1/chat/completions", {"content-type": "application/json"})
+    rl = cost.ratelimits()
+    if rl["anthropic"]["tokens"]["remaining"] != 412000 or rl["openai"]["tokens"]["remaining"] != 29500 \
+            or rl["openai"]["retry_after"] != 12 or "openai-compatible" in rl or not rl["anthropic"].get("seen"):
+        fail(f"rate store: {rl}")
+    # a later normal reply clears the stale retry-after
+    cost.note_ratelimit("https://api.openai.com/v1/responses", {
+        "x-ratelimit-limit-tokens": "30000", "x-ratelimit-remaining-tokens": "30000", "x-ratelimit-reset-tokens": "0s"})
+    if "retry_after" in cost.ratelimits()["openai"] or cost.ratelimits()["openai"]["tokens"]["remaining"] != 30000:
+        fail(f"retry-after not cleared by a normal reply: {cost.ratelimits()['openai']}")
+    ok("rate-limit headers from Anthropic and OpenAI replies are kept per provider; a 429's retry-after too, then cleared")
+
+    # 4c. a monthly line, measured on the calendar month like a provider's cap
+    r = cli("cost", "budget", "--month-usd", "0.05")
+    if r.returncode != 0 or cost.load_config()["budget"] != {"month_usd": 0.05}:
+        fail(f"month budget: {r.stdout} {r.stderr} {cost.load_config()}")
+    if cost.spent_month()["usd"] < 0.05:
+        fail(f"expected the month's ledger to be past $0.05 by now: {cost.spent_month()}")
+    sid, changes, ev = run()
+    done = [e for e in ev if e["type"] == "done"][-1]
+    if done["reason"] != "budget" or "this month" not in [e for e in ev if e["type"] == "error"][-1]["text"]:
+        fail(f"monthly limit: {done}")
+    ov.rollback_session(sid)
+    cli("cost", "budget", "--month-usd", "0")
+    ok("a monthly limit stops the next call; `overlord cost budget --month-usd` sets it")
+
     # 5. the review's tokens are on the ledger too; `overlord cost` sums it
     import review
     live = ov.open_session(target, BACKEND, grants, capture=True, agent="scripted:scripted")
@@ -202,7 +243,12 @@ try:
         code, d = req("/api/cost")
         if code != 200 or d["month"]["calls"] < 10 or d["scope"] != "everyone" or "scripted" not in d["prices"]:
             fail(f"cost GET: {code} {d}")
-        code, d = req("/api/cost", {"budget": {"session_tokens": 4000, "day_usd": ""}}, "PUT")
+        if d["rate"]["anthropic"]["tokens"]["remaining"] != 412000 or d["mtd"]["calls"] < 10 or not d.get("now"):
+            fail(f"cost GET lacks the meter's sources: rate={d.get('rate')} mtd={d.get('mtd')}")
+        code, d = req("/api/cost", {"budget": {"month_usd": "40"}}, "PUT")
+        if code != 200 or d["budget"].get("month_usd") != 40.0:
+            fail(f"month budget via API: {code} {d}")
+        code, d = req("/api/cost", {"budget": {"session_tokens": 4000, "day_usd": "", "month_usd": ""}}, "PUT")
         if code != 200 or d["budget"] != {"session_tokens": 4000}:
             fail(f"cost PUT: {code} {d}")
         code, d = req("/api/cost", {"budget": {"session_usd": -1}}, "PUT")

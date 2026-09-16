@@ -117,18 +117,36 @@ class ModelConfig:
 # ---------------------------------------------------------------- transport
 
 
+# Called with (url, response headers) after every provider reply, including
+# an error reply: the rate-limit headers are the provider's own statement of
+# how much headroom is left. Set by the engine (cost.note_ratelimit).
+RESPONSE_HOOK = None
+
+
+def _notify(url, headers):
+    if RESPONSE_HOOK is None or headers is None:
+        return
+    try:
+        RESPONSE_HOOK(url, headers)
+    except Exception:                    # noqa: BLE001 — never on the call's path
+        pass
+
+
 def _open(url, headers, body, timeout, method="POST"):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": "overlord/0.9", **headers})
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
+        _notify(url, e.headers)
         detail = e.read().decode(errors="replace")[:2000]
         raise ProviderError(f"error: provider HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
         raise ProviderError(f"error: provider unreachable: {e.reason}")
+    _notify(url, resp.headers)
+    return resp
 
 
 def _post(url, headers, body, timeout=600):

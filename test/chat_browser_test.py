@@ -230,6 +230,10 @@ try:
         page.locator("#whoami").get_by_text("alice").wait_for(timeout=5000)
         if page.locator("#logout").evaluate("e => e.classList.contains('hide')"):
             fail("sign-out button hidden while signed in")
+        rows = page.locator("#meters .meter")
+        if rows.count() < 2 or "today" not in page.locator("#meters").inner_text().lower() \
+                or "this month" not in page.locator("#meters").inner_text().lower():
+            fail(f"usage meter missing from the rail: {rows.count()} row(s): {page.locator('#meters').inner_text()[:200]!r}")
         boxes = [page.locator(sel).bounding_box() for sel in ("#opensettings", ".consolelink", "#logout")]
         if any(b is None for b in boxes) or any(boxes[i + 1]["y"] < boxes[i]["y"] + boxes[i]["height"]
                                                  for i in range(2)):

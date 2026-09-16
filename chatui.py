@@ -805,6 +805,15 @@ button{font-family:inherit;cursor:pointer}
 .dot.pending{background:var(--accent)}.dot.committed{background:var(--green)}
 .dot.thinking{background:var(--accent);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.3}}
+.meters{border-top:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+.meter .lbl{display:flex;justify-content:space-between;gap:8px;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim)}
+.meter .val{color:var(--text);letter-spacing:0;text-transform:none;font-size:10px;white-space:nowrap}
+.meter .track{height:5px;margin-top:4px;border-radius:3px;background:var(--glow);overflow:hidden}
+.meter .fill{height:100%;border-radius:3px;background:var(--accent);transition:width .35s}
+.meter.warn .fill{background:#b5702a}.meter.crit .fill{background:var(--red)}
+.meter.warn .track{background:rgba(181,112,42,.18)}.meter.crit .track{background:rgba(166,61,47,.2)}
+.meter .note{font-size:9px;color:var(--dim);margin-top:2px;letter-spacing:.5px}
+.meter.crit .note,.meter.warn .note{color:var(--text)}
 .railfoot{border-top:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;align-items:flex-start;gap:6px}
 .railnav{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
 .railnav .gear,.railnav .consolelink{display:block;text-align:left}
@@ -991,6 +1000,7 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="sub">agent workspace</div></div>
     <button class="newbtn" id="new">+ New conversation</button>
     <div class="convs" id="convs"></div>
+    <div class="meters" id="meters" title="What is left: the provider's own rate-limit headers from its last reply, and your spend against the budget lines you set"></div>
     <div class="railfoot">
       <div class="railnav">
         <button class="gear" id="opensettings">Settings</button>
@@ -1182,7 +1192,11 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label>Session limit (tokens)</label><input id="b-tokens" type="number" min="0" placeholder="none"></div>
       <div class="field"><label>Session limit (USD)</label><input id="b-session" type="number" min="0" step="0.01" placeholder="none"></div>
     </div>
-    <div class="field" id="cost-day-row"><label>Daily limit for the machine (USD)</label><input id="b-day" type="number" min="0" step="0.01" placeholder="none"></div>
+    <div class="row2" id="cost-day-row">
+      <div class="field"><label>Daily limit for the machine (USD)</label><input id="b-day" type="number" min="0" step="0.01" placeholder="none"></div>
+      <div class="field"><label>Monthly limit (USD)</label><input id="b-month" type="number" min="0" step="1" placeholder="none">
+        <div class="desc">Set this to your provider's monthly spend cap. The API never reports the cap, so the meter measures against the number you give it.</div></div>
+    </div>
     <div class="ap-acts" id="cost-acts"><button class="act act-review" id="b-save">Save budget</button>
       <span class="act-msg" id="b-msg"></span></div>
     </details>
@@ -1425,7 +1439,7 @@ async function poll(){
   d.events.forEach(e=>{ if(e.type==='idle'){idle=true;} else renderMsg(e); });
   if(d.inspector) $('inspector').innerHTML = d.inspector;
   scroll();
-  if(!d.running){ setThinking(false); stopPoll(); loadConvs(); }
+  if(!d.running){ setThinking(false); stopPoll(); loadConvs(); loadMeters(); }
 }
 
 function stop(){ if(SEL) fetch('/api/chats/'+encodeURIComponent(SEL)+'/cancel',{method:'POST',body:'{}'}); }
@@ -1518,6 +1532,7 @@ async function openSettings(msg){
   loadMemory();
   $('account-section').classList.toggle('hide', !ME.auth);
   loadCost();
+  setInterval(loadMeters, 20000);
   loadSkills();
   $('hooks-section').classList.toggle('hide', !isAdmin());
   if(isAdmin()) loadHooks();
@@ -1686,10 +1701,56 @@ async function loadCost(){
     + (Object.keys(r.limits||{}).length ? `\nlimits in effect: ${Object.entries(r.limits).map(([k,v])=>k+'='+v).join(', ')}` : '');
   const b = r.budget||{};
   $('b-tokens').value = b.session_tokens||''; $('b-session').value = b.session_usd||''; $('b-day').value = b.day_usd||'';
-  const ro = !isAdmin(); ['b-tokens','b-session','b-day','b-save'].forEach(id=>{ $(id).disabled = ro; });
+  $('b-month').value = b.month_usd||'';
+  const ro = !isAdmin(); ['b-tokens','b-session','b-day','b-month','b-save'].forEach(id=>{ $(id).disabled = ro; });
+  renderMeters(r);
 }
+// ---- the usage meter: what is left, from two real sources ----------------
+// 1. the provider's rate-limit headers on its last reply (tokens and requests
+//    per minute: limit, remaining, refill time). A lower bound between calls.
+// 2. spend from the ledger against the budget lines in effect (today, month).
+function fmtK(n){ if(n==null) return '—'; n=Number(n); return n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:1)+'M' : n>=1e3 ? Math.round(n/1e3)+'k' : String(Math.round(n)); }
+function meterRow(box, title, used, limit, valueText, note){
+  const left = limit>0 ? Math.max(0, 1 - used/limit) : null;
+  const d = el('div', 'meter' + (left==null ? '' : left < .1 ? ' crit' : left < .25 ? ' warn' : ''));
+  const l = el('div','lbl'); l.appendChild(el('span', null, title)); l.appendChild(el('span','val', valueText)); d.appendChild(l);
+  if(limit>0){ const t = el('div','track'); const f = el('div','fill'); f.style.width = Math.min(100, Math.max(0, used/limit*100)).toFixed(1)+'%'; t.appendChild(f); d.appendChild(t); }
+  const n = note + (left==null ? '' : left < .1 ? ' · nearly exhausted' : left < .25 ? ' · running low' : '');
+  if(n) d.appendChild(el('div','note', n));
+  box.appendChild(d);
+}
+function untilText(reset, now){
+  if(!reset) return '';
+  const t = Date.parse(reset); if(isNaN(t)) return 'refills in '+reset;
+  const s = Math.round((t - now*1000)/1000); return s <= 0 ? 'refilled' : 'refills in '+(s>=60? Math.floor(s/60)+'m'+(s%60)+'s' : s+'s');
+}
+function renderMeters(r){
+  const box = $('meters'); if(!box) return; box.innerHTML='';
+  const prov = SETTINGS.provider, rate = (r.rate||{})[prov];
+  if(rate){
+    const age = Math.max(0, Math.round((r.now||Date.now()/1000) - (rate.seen||0)));
+    const stale = age > 90 ? ' · as of '+(age>=3600? Math.floor(age/3600)+'h' : Math.floor(age/60)+'m')+' ago' : '';
+    const tk = rate.tokens || rate.input_tokens;
+    if(tk && tk.limit) meterRow(box, 'tokens / min · '+prov, tk.limit - (tk.remaining||0), tk.limit,
+      fmtK(tk.remaining)+' of '+fmtK(tk.limit)+' left', untilText(tk.reset, r.now) + stale);
+    if(rate.output_tokens && rate.output_tokens.limit && tk !== rate.output_tokens) meterRow(box, 'output / min', rate.output_tokens.limit - (rate.output_tokens.remaining||0), rate.output_tokens.limit,
+      fmtK(rate.output_tokens.remaining)+' of '+fmtK(rate.output_tokens.limit)+' left', untilText(rate.output_tokens.reset, r.now));
+    if(rate.requests && rate.requests.limit) meterRow(box, 'requests / min', rate.requests.limit - (rate.requests.remaining||0), rate.requests.limit,
+      fmtK(rate.requests.remaining)+' of '+fmtK(rate.requests.limit)+' left', untilText(rate.requests.reset, r.now));
+    if(rate.retry_after) meterRow(box, 'rate limited', 1, 1, 'retry in '+rate.retry_after+'s', 'the provider refused the last call');
+  } else if(prov && prov!=='scripted') {
+    meterRow(box, 'rate limit · '+prov, 0, 0, 'no reply yet', 'the provider states its headroom on every reply; send a message');
+  }
+  const lim = r.limits||{}, t = r.today||{}, m = r.mtd||{};
+  if(lim.day_usd) meterRow(box, 'today', t.usd||0, lim.day_usd, '$'+(t.usd||0).toFixed(2)+' of $'+lim.day_usd.toFixed(2), (t.calls||0)+' call(s)');
+  else meterRow(box, 'today', 0, 0, '$'+(t.usd||0).toFixed(2), (t.calls||0)+' call(s) · no daily limit set');
+  if(lim.month_usd) meterRow(box, 'this month', m.usd||0, lim.month_usd, '$'+(m.usd||0).toFixed(2)+' of $'+lim.month_usd.toFixed(0), fmtK(m.in)+' in / '+fmtK(m.out)+' out');
+  else meterRow(box, 'this month', 0, 0, '$'+(m.usd||0).toFixed(2), 'set a monthly limit in Settings → Cost to meter against your provider\'s cap');
+  if(r.month && r.month.unpriced) box.appendChild(el('div','note', r.month.unpriced+' call(s) on unpriced models are not in the dollars'));
+}
+async function loadMeters(){ try { const r = await j('/api/cost'); if(!r.error) renderMeters(r); } catch(e) {} }
 async function saveBudget(){
-  const body = {budget:{session_tokens:$('b-tokens').value||0, session_usd:$('b-session').value||0, day_usd:$('b-day').value||0}};
+  const body = {budget:{session_tokens:$('b-tokens').value||0, session_usd:$('b-session').value||0, day_usd:$('b-day').value||0, month_usd:$('b-month').value||0}};
   const r = await j('/api/cost',{method:'PUT',body:JSON.stringify(body)});
   const m=$('b-msg'); m.textContent = r.error||'saved'; m.className='act-msg '+(r.error?'bad':'ok');
   if(!r.error) loadCost();

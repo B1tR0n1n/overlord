@@ -153,6 +153,8 @@ def save_key(provider, key):
 
 import providers as _providers  # noqa: E402
 
+_providers.RESPONSE_HOOK = cost_mod.note_ratelimit   # every reply's headroom, recorded
+
 Reply = _providers.Reply
 ModelConfig = _providers.ModelConfig
 AnthropicProvider = _providers.AnthropicProvider

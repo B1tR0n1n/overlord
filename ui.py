@@ -1205,6 +1205,9 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = cost_mod.load_config()
                 self._send({"today": cost_mod.spent_today(owner),
                             "month": cost_mod.spent(30, owner),
+                            "mtd": cost_mod.spent_month(owner),
+                            "rate": cost_mod.ratelimits(),
+                            "now": time.time(),
                             "scope": owner or "everyone",
                             "budget": cfg["budget"], "prices": cfg["prices"],
                             "limits": cost_mod.budget_for(None, p["user"] if p else None)[0]})

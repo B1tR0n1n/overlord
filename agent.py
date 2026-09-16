@@ -2,8 +2,10 @@
 """OVERLORD agent — the reference harness: a model thinks on the host, its
 hands act inside a live transactional session.
 
-    overlord agent -t <dir> [grants] [--provider anthropic|openai]
-                   [--model M] [--max-turns N] [--no-jail] "<task>"
+    overlord agent -t <dir> [grants] [--provider anthropic|openai|azure|
+                   openai-compatible|gemini] [--model M] [--base-url URL]
+                   [--effort E] [--max-tokens N] [--max-turns N] [--no-jail] "<task>"
+    overlord models [--provider P] [--base-url URL]
 
 The model loop runs in the overlord process with network access to the
 provider API. Every tool it calls (list_dir / read_file / write_file / shell)
@@ -26,8 +28,10 @@ transcript are cut at the same savepoint, `overlord rewind` followed by
 `overlord resume` puts the model back in a world that matches what it
 remembers, with an optional operator note injected at that point.
 
-Providers are stdlib-only (urllib). Keys come from the environment
-(ANTHROPIC_API_KEY / OPENAI_API_KEY) or ~/.overlord/keys.json (mode 0600):
+Providers (providers.py) are stdlib-only (urllib): anthropic, openai, azure,
+openai-compatible, gemini — each behind a base URL with extra headers, each
+streaming. Keys come from the environment (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+AZURE_OPENAI_API_KEY, GEMINI_API_KEY) or ~/.overlord/keys.json (mode 0600):
     {"anthropic": "sk-ant-...", "openai": "sk-..."}
 """
 
@@ -36,18 +40,11 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 
 import overlord as ov
 
-# Checked 2026-09-11. claude-sonnet-5 is current. gpt-5 was the alias for the
-# gpt-5-2025-08-07 snapshot, deprecated 2026-06-11 and removed 2026-12-11;
-# gpt-5.5 is the replacement OpenAI published for it, served on the Chat
-# Completions endpoint this client uses. Newer families exist (gpt-5.6, and
-# gpt-6-astra as flagship) — re-check with `GET /v1/models` before bumping, and
-# do not guess an id from a release announcement.
-DEFAULT_MODELS = {"anthropic": "claude-sonnet-5", "openai": "gpt-5.5"}
+import providers as _providers_defaults  # noqa: E402
+DEFAULT_MODELS = _providers_defaults.DEFAULT_MODELS
 MAX_TOOL_OUTPUT = 32_000       # chars fed back to the model per tool result
 DEFAULT_MAX_TURNS = 40
 
@@ -94,7 +91,10 @@ TOOLS = [
 
 
 def load_key(provider):
-    env = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}[provider]
+    import providers as _p
+    env = _p.KEY_ENV.get(provider)
+    if env is None:
+        raise ov.OverlordError(f"error: unknown provider: {provider}")
     if os.environ.get(env):
         return os.environ[env]
     path = os.path.join(ov.OVERLORD_HOME, "keys.json")
@@ -125,158 +125,48 @@ def save_key(provider, key):
 
 # ---------------------------------------------------------------- providers
 #
-# Neutral message form (what the loop keeps):
-#   {"role": "user", "content": str}
-#   {"role": "assistant", "content": str, "tool_calls": [{"id", "name", "input"}]}
-#   {"role": "tool", "tool_call_id": str, "content": str}
-# Each provider translates to its wire format and back to a Reply.
+# The adapters live in providers.py (anthropic, openai, azure, openai-compatible,
+# gemini, scripted). These names stay importable here for callers and tests.
+
+import providers as _providers  # noqa: E402
+
+Reply = _providers.Reply
+ModelConfig = _providers.ModelConfig
+AnthropicProvider = _providers.AnthropicProvider
+OpenAIProvider = _providers.OpenAIProvider
+AzureOpenAIProvider = _providers.AzureOpenAIProvider
+GeminiProvider = _providers.GeminiProvider
+ScriptedProvider = _providers.ScriptedProvider
+PROVIDERS = _providers.PROVIDERS
 
 
-class Reply:
-    def __init__(self, text, tool_calls, stop, usage):
-        self.text, self.tool_calls, self.stop, self.usage = text, tool_calls, stop, usage
-
-
-def _post(url, headers, body, timeout=600):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json", **headers})
+def make_provider(provider, model=None, key=None, script_env="OVERLORD_AGENT_SCRIPT",
+                  base_url=None, headers=None, config=None, azure_api_version=None):
+    """Build a provider; stored keys come from the engine's 0600 key store
+    when no key is given and the environment has none."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:2000]
-        raise ov.OverlordError(f"error: provider HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        raise ov.OverlordError(f"error: provider unreachable: {e.reason}")
+        return _providers.make(provider, model=model, key=key, base_url=base_url,
+                               headers=headers, config=config,
+                               azure_api_version=azure_api_version, script_env=script_env,
+                               key_loader=_stored_key)
+    except _providers.ProviderError as e:
+        raise ov.OverlordError(str(e))
 
 
-class AnthropicProvider:
-    name = "anthropic"
-    url = "https://api.anthropic.com/v1/messages"
-
-    def __init__(self, model, key):
-        self.model, self.key = model, key
-
-    def _wire(self, messages):
-        out = []
-        for m in messages:
-            if m["role"] == "user":
-                out.append({"role": "user", "content": m["content"]})
-            elif m["role"] == "assistant":
-                blocks = []
-                if m.get("content"):
-                    blocks.append({"type": "text", "text": m["content"]})
-                for tc in m.get("tool_calls", []):
-                    blocks.append({"type": "tool_use", "id": tc["id"],
-                                   "name": tc["name"], "input": tc["input"]})
-                out.append({"role": "assistant", "content": blocks})
-            elif m["role"] == "tool":
-                block = {"type": "tool_result", "tool_use_id": m["tool_call_id"],
-                         "content": m["content"]}
-                # consecutive tool results merge into one user turn
-                if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
-                    out[-1]["content"].append(block)
-                else:
-                    out.append({"role": "user", "content": [block]})
-        return out
-
-    def complete(self, system, messages, tools=None):
-        body = {"model": self.model, "max_tokens": 8192, "system": system,
-                "messages": self._wire(messages), "tools": tools or TOOLS}
-        data = _post(self.url, {"x-api-key": self.key,
-                                "anthropic-version": "2023-06-01"}, body)
-        text, calls = "", []
-        for block in data.get("content", []):
-            if block["type"] == "text":
-                text += block["text"]
-            elif block["type"] == "tool_use":
-                calls.append({"id": block["id"], "name": block["name"],
-                              "input": block.get("input") or {}})
-        u = data.get("usage", {})
-        return Reply(text, calls, data.get("stop_reason"),
-                     {"in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0)})
+def _stored_key(provider):
+    try:
+        return load_key(provider)
+    except (ov.OverlordError, SystemExit):
+        return None
 
 
-class OpenAIProvider:
-    name = "openai"
-    url = "https://api.openai.com/v1/chat/completions"
-
-    def __init__(self, model, key):
-        self.model, self.key = model, key
-
-    def _wire(self, system, messages):
-        out = [{"role": "system", "content": system}]
-        for m in messages:
-            if m["role"] == "user":
-                out.append({"role": "user", "content": m["content"]})
-            elif m["role"] == "assistant":
-                msg = {"role": "assistant", "content": m.get("content") or None}
-                if m.get("tool_calls"):
-                    msg["tool_calls"] = [
-                        {"id": tc["id"], "type": "function",
-                         "function": {"name": tc["name"],
-                                      "arguments": json.dumps(tc["input"])}}
-                        for tc in m["tool_calls"]]
-                out.append(msg)
-            elif m["role"] == "tool":
-                out.append({"role": "tool", "tool_call_id": m["tool_call_id"],
-                            "content": m["content"]})
-        return out
-
-    def complete(self, system, messages, tools=None):
-        tools = [{"type": "function",
-                  "function": {"name": t["name"], "description": t["description"],
-                               "parameters": t["input_schema"]}} for t in (tools or TOOLS)]
-        body = {"model": self.model, "messages": self._wire(system, messages),
-                "tools": tools}
-        data = _post(self.url, {"Authorization": f"Bearer {self.key}"}, body)
-        choice = data["choices"][0]
-        msg = choice["message"]
-        calls = []
-        for tc in msg.get("tool_calls") or []:
-            try:
-                args = json.loads(tc["function"].get("arguments") or "{}")
-            except ValueError:
-                args = {"_raw": tc["function"].get("arguments")}
-            calls.append({"id": tc["id"], "name": tc["function"]["name"], "input": args})
-        u = data.get("usage", {})
-        return Reply(msg.get("content") or "", calls, choice.get("finish_reason"),
-                     {"in": u.get("prompt_tokens", 0), "out": u.get("completion_tokens", 0)})
-
-
-class ScriptedProvider:
-    """Deterministic stand-in for tests: replays a list of Reply-like dicts."""
-    name = "scripted"
-
-    def __init__(self, script):
-        self.script, self.i, self.seen = list(script), 0, []
-
-    def complete(self, system, messages, tools=None):
-        self.seen.append(json.loads(json.dumps(messages)))
-        if self.i >= len(self.script):
-            return Reply("(script exhausted)", [], "end_turn", {"in": 0, "out": 0})
-        step = self.script[self.i]
-        self.i += 1
-        calls = [{"id": f"call_{self.i}_{n}", "name": c["name"], "input": c["input"]}
-                 for n, c in enumerate(step.get("tool_calls", []))]
-        return Reply(step.get("text", ""), calls,
-                     "tool_use" if calls else "end_turn", {"in": 0, "out": 0})
-
-
-def make_provider(provider, model=None, key=None, script_env="OVERLORD_AGENT_SCRIPT"):
-    if provider == "anthropic":
-        return AnthropicProvider(model or DEFAULT_MODELS[provider], key or load_key(provider))
-    if provider == "openai":
-        return OpenAIProvider(model or DEFAULT_MODELS[provider], key or load_key(provider))
-    if provider == "scripted":      # tests: OVERLORD_AGENT_SCRIPT=<json file of replies>
-        path = os.environ.get(script_env)
-        if not path:
-            raise ov.OverlordError(f"error: scripted provider needs {script_env}")
-        with open(path) as f:
-            p = ScriptedProvider(json.load(f))
-        p.model = model or "scripted"
-        return p
-    raise ov.OverlordError(f"error: unknown provider: {provider}")
+def list_models(provider, base_url=None, headers=None, azure_api_version=None):
+    try:
+        return _providers.list_models(provider, base_url=base_url, headers=headers,
+                                      azure_api_version=azure_api_version,
+                                      key_loader=_stored_key)
+    except _providers.ProviderError as e:
+        raise ov.OverlordError(str(e))
 
 
 # ---------------------------------------------------------------- tools → session
@@ -465,6 +355,14 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
     live.meta["agent"] = f"{provider.name}:{getattr(provider, 'model', '-')}"
     live.meta["task"] = task
     live.meta.setdefault("usage", {"in": 0, "out": 0})
+    cfg = getattr(provider, "config", None)
+    if cfg is not None and "model_config" not in live.meta:
+        live.meta["model_config"] = cfg.to_dict()
+    if "provider_opts" not in live.meta:
+        live.meta["provider_opts"] = {
+            "base_url": getattr(provider, "base_url", None),
+            "headers": getattr(provider, "headers", None) or {},
+            "azure_api_version": getattr(provider, "api_version", None)}
     ov.save_meta(live.sid, live.meta)
 
     tools = ToolRunner(live)
@@ -482,7 +380,10 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             if should_stop and should_stop():
                 record({"type": "done", "reason": "cancelled", "turn": turn})
                 return final
-            reply = provider.complete(SYSTEM_PROMPT, messages)
+            reply = provider.complete(
+                SYSTEM_PROMPT, messages, tools=TOOLS,
+                on_delta=lambda t, _turn=turn: emit({"type": "assistant_delta",
+                                                     "turn": _turn, "text": t}))
             live.meta["usage"]["in"] += reply.usage.get("in", 0)
             live.meta["usage"]["out"] += reply.usage.get("out", 0)
             ov.save_meta(live.sid, live.meta)
@@ -491,9 +392,28 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             if reply.text:
                 final = reply.text
                 record({"type": "assistant", "turn": turn, "text": reply.text})
+            if reply.stop == "refusal":
+                # a safety decline: the turn's tool calls are never run
+                record({"type": "error", "turn": turn,
+                        "text": "the model declined this request"
+                                + (f" ({reply.refusal.get('category')})"
+                                   if isinstance(reply.refusal, dict) and reply.refusal.get("category")
+                                   else "")})
+                record({"type": "done", "reason": "refusal", "turn": turn,
+                        "usage": live.meta["usage"]})
+                return final
             if not reply.tool_calls:
                 record({"type": "done", "reason": reply.stop or "end_turn",
                         "turn": turn, "usage": live.meta["usage"]})
+                return final
+            if reply.stop == "max_tokens":
+                # a cut-off can truncate a tool input into a valid-looking
+                # partial object; never run those — stop and say so
+                record({"type": "error", "turn": turn,
+                        "text": "the reply was cut off at max_tokens before its tool "
+                                "calls completed; raise Max tokens in Settings"})
+                record({"type": "done", "reason": "max_tokens", "turn": turn,
+                        "usage": live.meta["usage"]})
                 return final
             for tc in reply.tool_calls:
                 record({"type": "tool_call", "turn": turn, "id": tc["id"],
@@ -501,14 +421,21 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                 label = f"turn{turn}:{tc['id']}:{tc['name']}"
                 cause = {"turn": turn, "tool_call_id": tc["id"], "tool": tc["name"],
                          "summary": _summarize(tc)}
-                out, rc = tools.run(tc["name"], tc["input"], label, cause)
-                touched = attribution.attribute(cause)
+                if tc.get("invalid_json"):
+                    # streamed tool input that did not parse strictly: hand it
+                    # back as an error so the model can retry, never run it
+                    out, rc = json.dumps({"INVALID_JSON": tc["invalid_json"][:4000]}), 1
+                    touched = []
+                else:
+                    out, rc = tools.run(tc["name"], tc["input"], label, cause)
+                    touched = attribution.attribute(cause)
                 if len(out) > MAX_TOOL_OUTPUT:
                     out = (out[:MAX_TOOL_OUTPUT // 2] + "\n...[truncated]...\n"
                            + out[-MAX_TOOL_OUTPUT // 2:])
                 content = out if rc == 0 else f"{out}\n[exit code {rc}]"
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                 "content": content or "(no output)"})
+                                 "content": content or "(no output)",
+                                 "is_error": bool(tc.get("invalid_json"))})
                 record({"type": "tool_result", "turn": turn, "id": tc["id"],
                         "tool": tc["name"], "exit_code": rc, "output": out,
                         "touched": touched, "layer": live.current_layer})
@@ -553,7 +480,10 @@ def cmd_agent(args):
               "user can. Writes outside the target land on the real filesystem, "
               "outside the transaction, and cannot be rolled back.",
               file=sys.stderr)
-    provider = make_provider(args.provider, args.model)
+    provider = make_provider(args.provider, args.model, base_url=args.base_url,
+                             headers=_headers_arg(args.header),
+                             config=config_from_args(args),
+                             azure_api_version=args.azure_api_version)
     live = ov.open_session(args.target, args.backend, grants, trace=args.trace,
                            wait=args.wait, stack=args.stack, capture=True,
                            agent=f"{provider.name}:{provider.model}")
@@ -570,13 +500,31 @@ def cmd_agent(args):
 
 
 def provider_for(meta, provider=None, model=None):
-    """The provider a session ran with (meta['agent'] is 'name:model'),
-    unless overridden."""
+    """The provider a session ran with (meta['agent'] is 'name:model', and
+    meta['model_config'] / meta['provider_opts'] carry the knobs and the
+    endpoint it used), unless overridden."""
     recorded = (meta.get("agent") or ":").split(":", 1)
     name = provider or recorded[0] or "anthropic"
     if not provider and not model and len(recorded) > 1 and recorded[1] not in ("", "-"):
         model = recorded[1] if name != "scripted" else None
-    return make_provider(name, model)
+    opts = meta.get("provider_opts") or {}
+    return make_provider(name, model, base_url=opts.get("base_url"),
+                         headers=opts.get("headers"), config=meta.get("model_config"),
+                         azure_api_version=opts.get("azure_api_version"))
+
+
+def cmd_models(args):
+    rows = list_models(args.provider, base_url=args.base_url,
+                       headers=_headers_arg(args.header),
+                       azure_api_version=args.azure_api_version)
+    if not rows:
+        print("no models listed")
+        return 1
+    for m in rows:
+        ctx = f"  ctx {m['context']:,}" if m.get("context") else ""
+        out = f"  out {m['max_output']:,}" if m.get("max_output") else ""
+        print(f"{m['id']:40s} {m.get('name') or ''}{ctx}{out}")
+    return 0
 
 
 def cmd_resume(args, meta):
@@ -597,10 +545,24 @@ def cmd_resume(args, meta):
     return 0
 
 
+_STREAMED = {"n": 0}
+
+
 def _show(ev):
     t = ev["type"]
+    if t == "assistant_delta":
+        if _STREAMED["n"] == 0:
+            print()
+        print(ev["text"], end="", flush=True)
+        _STREAMED["n"] += len(ev["text"])
+        return
     if t == "assistant":
-        print(f"\n{ev['text']}\n")
+        if _STREAMED["n"]:
+            print("\n")          # the text already streamed; close the paragraph
+        else:
+            print(f"\n{ev['text']}\n")
+        _STREAMED["n"] = 0
+        return
     elif t == "tool_call":
         print(f"  → {ev['tool']}  {_summarize({'name': ev['tool'], 'input': ev['input']})}")
     elif t == "tool_result":
@@ -619,23 +581,75 @@ def _show(ev):
         print(f"\n[error] {ev['text']}", file=sys.stderr)
 
 
+def _headers_arg(items):
+    out = {}
+    for h in items or []:
+        if ":" not in h:
+            raise ov.OverlordError(f"error: --header wants 'Name: value', got {h!r}")
+        k, v = h.split(":", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def config_from_args(args):
+    return ModelConfig.from_dict({
+        "max_tokens": getattr(args, "max_tokens", None),
+        "temperature": getattr(args, "temperature", None),
+        "top_p": getattr(args, "top_p", None),
+        "stop": getattr(args, "stop", None),
+        "effort": getattr(args, "effort", None),
+        "thinking": getattr(args, "thinking", None),
+        "system_extra": getattr(args, "system", None),
+        "stream": not getattr(args, "no_stream", False),
+        "fallbacks": not getattr(args, "no_fallbacks", False)})
+
+
+def add_model_flags(p):
+    """The model-configuration surface, shared by agent / resume / review."""
+    p.add_argument("--provider", choices=PROVIDERS + ["scripted"], default=None)
+    p.add_argument("--model", help=f"model id (defaults: {DEFAULT_MODELS})")
+    p.add_argument("--base-url", help="endpoint override: a gateway, a proxy, a local server")
+    p.add_argument("--header", action="append", metavar="'Name: value'",
+                   help="extra request header (repeatable)")
+    p.add_argument("--azure-api-version", help="azure only (default 2024-10-21)")
+    p.add_argument("--max-tokens", type=int)
+    p.add_argument("--temperature", type=float,
+                   help="sent only when given; the current Claude family rejects it")
+    p.add_argument("--top-p", type=float)
+    p.add_argument("--stop", action="append", help="stop sequence (repeatable)")
+    p.add_argument("--effort", choices=[e for e in _providers.EFFORTS if e],
+                   help="reasoning depth (anthropic output_config.effort / openai reasoning_effort)")
+    p.add_argument("--thinking", choices=["summarized", "off"],
+                   help="anthropic: stream a thinking summary, or disable thinking")
+    p.add_argument("--system", help="text appended to the system prompt")
+    p.add_argument("--no-stream", action="store_true", help="one-shot responses instead of SSE")
+    p.add_argument("--no-fallbacks", action="store_true",
+                   help="anthropic native: do not opt into server-side refusal fallbacks")
+
+
 def add_agent_parser(sub, add_exec_flags):
     pa = sub.add_parser("agent", help="run a model as an agent inside a live session")
     add_exec_flags(pa)
     pa.add_argument("--no-jail", action="store_true",
                     help="run the agent's tools unjailed — they can then write "
                          "anywhere you can, outside the transaction and unrecorded")
-    pa.add_argument("--provider", choices=["anthropic", "openai", "scripted"],
-                    default="anthropic")
-    pa.add_argument("--model", help=f"model id (defaults: {DEFAULT_MODELS})")
+    add_model_flags(pa)
+    pa.set_defaults(provider="anthropic")
     pa.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS,
                     help="budget: model turns before the loop stops")
     pa.add_argument("--trace", nargs="?", const="strace", choices=["strace", "ebpf"])
     pa.add_argument("task", help="what the agent should do")
     pa.set_defaults(fn=cmd_agent)
 
+    pm = sub.add_parser("models", help="list the models a provider serves right now")
+    pm.add_argument("--provider", choices=PROVIDERS, default="anthropic")
+    pm.add_argument("--base-url")
+    pm.add_argument("--header", action="append")
+    pm.add_argument("--azure-api-version")
+    pm.set_defaults(fn=cmd_models)
+
     pk = sub.add_parser("keys", help="store a provider API key (mode 0600)")
-    pk.add_argument("provider", choices=["anthropic", "openai"])
+    pk.add_argument("provider", choices=PROVIDERS)
     pk.add_argument("key")
     pk.set_defaults(fn=lambda a: (save_key(a.provider, a.key),
                                   print(f"stored {a.provider} key"))[1] or 0)

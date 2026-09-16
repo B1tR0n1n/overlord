@@ -121,7 +121,11 @@ try:
             fail("the user's message was not shown")
         if not page.locator(".tool").count():
             fail("the tool call was not shown")
-        ok("a message runs the agent and its turn streams into the chat")
+        if page.locator(".bub.live").count():
+            fail("a bubble is still marked live after the run stopped")
+        if page.locator(".msg.assistant").count() < 2:
+            fail("streamed assistant turns did not each render as a bubble")
+        ok("a message runs the agent and its turns stream into the chat")
 
         # the inspector shows the change and a commit control (auto-retrying
         # locators tolerate the panel re-rendering on the next poll)
@@ -147,13 +151,24 @@ try:
             fail("after commit: " + "; ".join(errors))
         ok("Commit from the inspector applies the change to the folder")
 
-        # settings modal opens and reports the working folder
+        # settings modal opens and reports the working folder; the model
+        # configuration surface is present and the live model list loads
         page.locator("#opensettings").click()
         page.wait_for_selector(".modal.open", timeout=5000)
         if page.locator("#s-workdir").input_value() != os.path.realpath(target):
             fail("settings modal did not show the working folder")
+        for sel in ("#s-provider", "#s-model", "#s-baseurl", "#s-headers", "#g-maxtokens",
+                    "#g-effort", "#g-thinking", "#g-temperature", "#g-system", "#g-stream"):
+            if not page.locator(sel).count():
+                fail(f"settings missing control {sel}")
+        opts = page.locator("#s-provider option").count()
+        if opts != 5:
+            fail(f"provider choices: {opts}")
+        page.locator("#s-models-note").get_by_text("models available").wait_for(timeout=8000)
+        if page.locator("#s-models option").count() != 1:
+            fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()
-        ok("Settings opens and shows the current configuration")
+        ok("Settings shows provider, endpoint, generation knobs, and a live model list")
 
         # a phone width must not overflow horizontally
         page.set_viewport_size({"width": 390, "height": 850})

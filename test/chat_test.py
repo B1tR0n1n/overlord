@@ -213,6 +213,64 @@ try:
         fail(f"cross-origin settings write: expected 403, got {code}")
     ok("the chat and settings routes sit behind the same origin guard as the console")
 
+    # 11. model configuration: provider profiles, generation knobs, validation, live listing
+    code, sp = req("/api/settings", {"provider": "openai-compatible",
+                                     "provider_opts": {"model": "llama3", "base_url": "http://127.0.0.1:11434/v1",
+                                                       "headers": '{"X-Team": "a"}'},
+                                     "gen": {"max_tokens": 2048, "effort": "high", "temperature": "0.3",
+                                             "stop": "END, STOP", "stream": False}}, "PUT")
+    if code != 200 or sp["provider_opts"]["model"] != "llama3" or sp["provider_opts"]["headers"] != {"X-Team": "a"} \
+            or sp["gen"]["max_tokens"] != 2048 or sp["gen"]["temperature"] != 0.3 or sp["gen"]["stream"] is not False:
+        fail(f"model settings round-trip: {code} {sp}")
+    if not sp["provider_ready"]:
+        fail("a keyless provider must count as ready")
+    ids = [p["id"] for p in sp["providers_available"]]
+    if ids != ["anthropic", "openai", "azure", "openai-compatible", "gemini"]:
+        fail(f"providers listed: {ids}")
+    for bad in ({"gen": {"effort": "extreme"}}, {"gen": {"temperature": "hot"}},
+                {"provider_opts": {"headers": "not json"}}, {"provider_opts": {"base_url": "ftp://x"}}):
+        code, r = req("/api/settings", bad, "PUT")
+        if code != 400:
+            fail(f"bad setting accepted: {bad}")
+    # switching provider keeps the other profile
+    code, sp = req("/api/settings", {"provider": "scripted"}, "PUT")
+    if sp["providers"]["openai-compatible"]["model"] != "llama3":
+        fail("provider profile lost on switch")
+    code, m = req("/api/models?provider=scripted")
+    if code != 200 or [x["id"] for x in m["models"]] != ["scripted"]:
+        fail(f"models endpoint: {code} {m}")
+    code, m = req("/api/models?provider=anthropic")
+    if code != 400 or "API key" not in m.get("error", ""):
+        fail(f"models without a key should fail clearly: {code} {m}")
+    ok("model configuration: per-provider profiles, generation knobs validated, live listing")
+
+    # 12. streaming: assistant text arrives as deltas before the final message; a
+    #     per-conversation provider/model override is recorded on the session
+    chatui.save_settings({"provider": "scripted", "workdir": target, "gen": {"stream": True},
+                          "jail": KERNEL, "net": "none" if KERNEL else "host"})
+    set_script([{"text": "Streamed reply for you.", "tool_calls": []}])
+    code, r = req("/api/chats", {"message": "say hi", "target": target,
+                                 "provider": "scripted", "model": "scripted-v2"}, "POST")
+    if code != 200:
+        fail(f"start with override: {r}")
+    sid3 = r["sid"]
+    events, _ = wait_idle(sid3)
+    types = [e["type"] for e in events]
+    deltas = [e["text"] for e in events if e["type"] == "assistant_delta"]
+    if len(deltas) < 2 or "".join(deltas) != "Streamed reply for you." or \
+            types.index("assistant_delta") < types.index("assistant") is False:
+        fail(f"streaming deltas: {types} {deltas}")
+    if types.index("assistant") < types.index("assistant_delta"):
+        fail("final assistant message arrived before its deltas")
+    m = core.load_meta(sid3)
+    if m["agent"] != "scripted:scripted-v2" or not m.get("model_config") or "provider_opts" not in m:
+        fail(f"per-conversation model not recorded: {m.get('agent')} {m.get('model_config')}")
+    code, conv = req(f"/api/chats/{sid3}")
+    if [x["type"] for x in conv["messages"]].count("assistant_delta"):
+        fail("deltas must not be persisted as messages")
+    req(f"/api/session/{sid3}/rollback", {}, "POST")
+    ok("streaming deltas precede the final message; per-conversation model recorded")
+
     print("PASS: workspace")
 finally:
     if server:

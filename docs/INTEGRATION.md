@@ -68,6 +68,24 @@ else:
     session.rollback()
 ```
 
+### Choosing and configuring the model
+
+```python
+s = ov.agent("/srv/app", "add a Makefile", jail=True, net="none",
+             provider="openai-compatible", model="llama3",
+             base_url="http://127.0.0.1:11434/v1",            # a local server or a gateway
+             headers={"X-Org": "team-a"},
+             config={"max_tokens": 8000, "effort": "high", "stop": ["END"]})
+for m in ov.models("anthropic"):                              # what the endpoint serves
+    print(m["id"], m["context"])
+```
+
+Providers: `anthropic`, `openai`, `azure` (deployment as `model`, plus
+`azure_api_version`), `openai-compatible`, `gemini`. Config keys: `max_tokens`,
+`temperature`, `top_p`, `stop`, `effort`, `thinking`, `system_extra`, `stream`,
+`fallbacks`; a blank knob is not sent, so a model that rejects it never sees it.
+`on_event` receives `assistant_delta` events while text streams.
+
 ### Savepoints from the SDK
 
 Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`

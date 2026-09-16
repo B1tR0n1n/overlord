@@ -64,6 +64,10 @@ overlord shell -t /srv/app                           # interactive transactional
 overlord agent -t /srv/app "add a Makefile with a test target"   # jailed by default
 overlord agent --net none -t /srv/app "<task>"       # ...and offline too
 overlord agent --no-jail -t /srv/app "<task>"        # opt out: tools reach the real fs
+overlord agent --provider openai-compatible --base-url http://127.0.0.1:11434/v1 \
+               --model llama3 -t /srv/app "<task>"   # a local model, same jail
+overlord agent --effort xhigh --max-tokens 64000 -t /srv/app "<task>"   # generation knobs
+overlord models --provider anthropic                 # what the endpoint serves right now
 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
@@ -91,6 +95,39 @@ snapshot fingerprints (size + mtime_ns of every file) and **refuses to clobber
 external changes** made while the session was pending. If the session was run
 with `--merge-base`, `commit --merge` three-way merges non-overlapping drift
 (git merge-file against the kept base) and still refuses overlapping edits.
+
+## Models
+
+The model thinks on your machine; only its hands are jailed. Every way to
+reach one is in `providers.py`, stdlib only, behind one contract, and the
+workspace, the CLI, the daemon and the SDK all share it:
+
+| provider | reaches | auth |
+|---|---|---|
+| `anthropic` | Claude, native Messages API: streaming, adaptive thinking, `effort`, refusal handling, opt-in server-side refusal fallbacks | `ANTHROPIC_API_KEY` or the key store |
+| `openai` | OpenAI Chat Completions: streaming, `reasoning_effort` | `OPENAI_API_KEY` |
+| `azure` | Azure OpenAI deployments (`--base-url https://<resource>.openai.azure.com`, deployment as the model, `--azure-api-version`) | `AZURE_OPENAI_API_KEY` |
+| `openai-compatible` | anything speaking the Chat Completions shape behind a base URL: Ollama, vLLM, LiteLLM, Groq, Together, your gateway | optional |
+| `gemini` | Google Gemini REST: streaming, function calling | `GEMINI_API_KEY` |
+
+Every provider takes a **base URL** and **extra headers**, which is how a
+proxy or an enterprise gateway sits in front of it. `overlord models` lists
+what an endpoint serves right now, and the workspace's Settings shows the same
+list. Keys live in `~/.overlord/keys.json` (mode 600); environment variables
+win over the store.
+
+**Generation knobs** — `--max-tokens`, `--temperature`, `--top-p`, `--stop`,
+`--effort low|medium|high|xhigh|max`, `--thinking summarized|off`,
+`--system` (appended instructions), `--no-stream`, `--no-fallbacks` — are
+model-aware: nothing is sent unless you set it. That matters because the
+current Claude family rejects `temperature` and `top_p` outright and takes
+its depth from `effort`; blank means the model's own default. Replies stream
+as they are generated (the CLI prints them live; the workspace renders them
+into the bubble), tool inputs that stream in are parsed strictly and handed
+back as an error rather than run when malformed, and a reply cut off at
+`max_tokens` or declined by a safety classifier never executes its tool
+calls. The knobs and the endpoint a conversation ran with are recorded on
+the session, so `resume` uses the same model the same way.
 
 ## Grants (the capability manifest)
 
@@ -207,9 +244,12 @@ byte-identical.
 
 - **Conversations** are listed on the left and selectable; each is a
   transaction you can come back to, commit, or discard.
-- **Settings** holds the model provider, the model, the API key (stored in
-  `~/.overlord/keys.json`, mode 600, never shown again), the working folder,
-  and the sandbox grants. On the kernel backend the agent's hands are jailed
+- **Settings** holds the model provider (Anthropic, OpenAI, Azure OpenAI,
+  OpenAI-compatible, Gemini), the model picked from the endpoint's live list,
+  the endpoint and extra headers for a gateway, the API key (stored in
+  `~/.overlord/keys.json`, mode 600, never shown again), the generation knobs,
+  the working folder, and the sandbox grants. Each provider keeps its own
+  profile when you switch. On the kernel backend the agent's hands are jailed
   and offline by default; the model still thinks on your machine with network,
   only its tools are confined.
 - **The inspector** is the review moment made friendly: the changed files, the
@@ -302,7 +342,8 @@ python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session asse
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions
 python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy assertions
-python3 test/chat_test.py         # 10 workspace assertions: settings, streaming, resume, commit
+python3 test/providers_test.py    # 10 provider adapter assertions: wire shapes, streaming, knobs, listing (offline)
+python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
 python3 test/chat_browser_test.py # 8 workspace DOM assertions (needs playwright)
@@ -402,3 +443,13 @@ grants are absent.
   loopback bind, origin guard and nonce CSP; no daemon required. Also hardened
   `save_meta` to write atomically, so a reader never sees a half-written record.
   119 assertions across ten suites, both backends.
+- 2026-09-16 — v0.9: model-configuration depth. `providers.py` — Anthropic
+  (streaming, adaptive thinking, effort, refusal handling, opt-in server-side
+  fallbacks), OpenAI, Azure OpenAI, OpenAI-compatible (Ollama, vLLM, LiteLLM,
+  gateways) and Gemini, stdlib only, every one behind a base URL with extra
+  headers; live model listing (`overlord models`, `/api/models`, SDK
+  `models()`); model-aware generation knobs that are never sent unless set;
+  streamed replies in the CLI and the workspace; strict parsing of streamed
+  tool inputs; cut-off and refusal never run tool calls; per-conversation
+  provider/model with the config recorded on the session. 131 assertions
+  across eleven suites.

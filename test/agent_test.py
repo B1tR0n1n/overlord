@@ -165,6 +165,8 @@ try:
         {"role": "tool", "tool_call_id": "c2", "content": "out2"},
     ]
     captured = {}
+    import providers as P
+    one_shot = P.ModelConfig(stream=False)
 
     def fake_post(url, headers, body, timeout=600):
         captured["url"], captured["headers"], captured["body"] = url, headers, body
@@ -178,10 +180,10 @@ try:
                     "content": None, "tool_calls": [{"id": "t1", "type": "function",
                     "function": {"name": "shell", "arguments": "{\"command\": \"pwd\"}"}}]}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
-    agent._post = fake_post
+    P._post = fake_post
 
-    a = agent.AnthropicProvider("m", "k")
-    r = a.complete("sys", neutral)
+    a = agent.AnthropicProvider("m", "k", config=one_shot)
+    r = a.complete("sys", neutral, tools=agent.TOOLS)
     b = captured["body"]
     if captured["headers"]["x-api-key"] != "k" or b["system"] != "sys" or b["tools"] != agent.TOOLS:
         fail("anthropic request")
@@ -193,8 +195,8 @@ try:
     if r.text != "hi" or r.tool_calls[0]["input"] != {"command": "pwd"} or r.usage["in"] != 10:
         fail("anthropic reply parse")
 
-    o = agent.OpenAIProvider("m", "k")
-    r = o.complete("sys", neutral)
+    o = agent.OpenAIProvider("m", "k", config=one_shot)
+    r = o.complete("sys", neutral, tools=agent.TOOLS)
     b = captured["body"]
     if captured["headers"]["Authorization"] != "Bearer k" or b["messages"][0]["role"] != "system":
         fail("openai request")

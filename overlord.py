@@ -2273,7 +2273,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2499,7 +2499,10 @@ def _api_agent(req, emit):
     requested = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
     requested.update(req.get("grants") or {})
     grants, _rule = resolve_policy(target, requested)
-    provider = agent_mod.make_provider(req.get("provider", "anthropic"), req.get("model"))
+    provider = agent_mod.make_provider(
+        req.get("provider", "anthropic"), req.get("model"), base_url=req.get("base_url"),
+        headers=req.get("headers"), config=req.get("config"),
+        azure_api_version=req.get("azure_api_version"))
     ls = open_session(target, req.get("backend"), grants, trace=req.get("trace"),
                       wait=bool(req.get("wait")), stack=bool(req.get("stack")),
                       capture=True, agent=f"{provider.name}:{provider.model}")
@@ -2559,6 +2562,9 @@ DAEMON_OPS = {
     "blame": lambda req: blame_path(req["path"]),
     "fork": lambda req: {"sid": fork_session(req["sid"], req.get("at")),
                          "forked_from": req["sid"]},
+    "models": lambda req: {"models": __import__("agent").list_models(
+        req.get("provider", "anthropic"), base_url=req.get("base_url"),
+        headers=req.get("headers"), azure_api_version=req.get("azure_api_version"))},
     "compare": lambda req: {"rows": compare_sessions(req["a"], req["b"])},
 }
 STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent, "resume": _api_resume,

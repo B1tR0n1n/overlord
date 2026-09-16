@@ -28,11 +28,21 @@ import time
 
 import overlord as core
 import agent as agent_mod
+import providers as prov
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
 DEFAULT_SETTINGS = {"provider": "anthropic", "model": "", "jail": True,
-                    "net": "none", "max_turns": 40, "workdir": ""}
+                    "net": "none", "max_turns": 40, "workdir": "",
+                    # per-provider endpoint + model, kept when you switch providers
+                    "providers": {},
+                    # generation knobs; blank means "do not send"
+                    "gen": {"max_tokens": 16000, "temperature": "", "top_p": "", "stop": "",
+                            "effort": "", "thinking": "", "system_extra": "",
+                            "stream": True, "fallbacks": True}}
+GEN_KEYS = ("max_tokens", "temperature", "top_p", "stop", "effort", "thinking",
+            "system_extra", "stream", "fallbacks")
+PROVIDER_KEYS = ("model", "base_url", "headers", "azure_api_version")
 GLYPH = {"added": "+", "modified": "~", "deleted": "−", "replaced-dir": "±"}
 MAX_TAIL = 1200                   # chars of a tool's output shown in the stream
 
@@ -48,15 +58,45 @@ def _esc(s):
 
 
 def load_settings():
-    s = dict(DEFAULT_SETTINGS)
+    s = json.loads(json.dumps(DEFAULT_SETTINGS))
     try:
         with open(SETTINGS_FILE) as f:
-            s.update({k: v for k, v in json.load(f).items() if k in DEFAULT_SETTINGS})
+            saved = json.load(f)
+        for k, v in saved.items():
+            if k == "gen" and isinstance(v, dict):
+                s["gen"].update({gk: gv for gk, gv in v.items() if gk in GEN_KEYS})
+            elif k == "providers" and isinstance(v, dict):
+                s["providers"] = {p: {pk: pv for pk, pv in (o or {}).items() if pk in PROVIDER_KEYS}
+                                  for p, o in v.items() if isinstance(o, dict)}
+            elif k in DEFAULT_SETTINGS:
+                s[k] = v
     except (OSError, ValueError):
         pass
     if not s.get("workdir"):
         s["workdir"] = LAUNCH_CWD
     return s
+
+
+def provider_opts(s, provider=None):
+    """Endpoint + model for a provider: the saved profile, else defaults."""
+    p = provider or s["provider"]
+    o = dict(s.get("providers", {}).get(p) or {})
+    o.setdefault("model", s.get("model") or "")
+    o.setdefault("base_url", "")
+    o.setdefault("headers", {})
+    o.setdefault("azure_api_version", "")
+    return o
+
+
+def build_provider(s, provider=None, model=None):
+    """The model the workspace talks to, from settings (or an override)."""
+    p = provider or s["provider"]
+    o = provider_opts(s, p)
+    return agent_mod.make_provider(
+        p, model or o.get("model") or None,
+        base_url=o.get("base_url") or None, headers=o.get("headers") or None,
+        config=prov.ModelConfig.from_dict(s.get("gen")),
+        azure_api_version=o.get("azure_api_version") or None)
 
 
 def save_settings(incoming):
@@ -66,11 +106,63 @@ def save_settings(incoming):
     key = incoming.get("key")
     provider = incoming.get("provider") or s["provider"]
     for k in DEFAULT_SETTINGS:
+        if k in ("gen", "providers"):
+            continue
         if k in incoming and incoming[k] is not None:
             s[k] = incoming[k]
     s["provider"] = provider
-    if s.get("provider") not in ("anthropic", "openai", "scripted"):
-        raise core.OverlordError("error: provider must be anthropic or openai")
+    if s.get("provider") not in prov.PROVIDERS + ["scripted"]:
+        raise core.OverlordError(f"error: provider must be one of {', '.join(prov.PROVIDERS)}")
+    # a provider profile: model, endpoint, headers (JSON object), azure version
+    po = incoming.get("provider_opts")
+    if isinstance(po, dict):
+        cur = dict(s["providers"].get(provider) or {})
+        for k in PROVIDER_KEYS:
+            if k in po and po[k] is not None:
+                cur[k] = po[k]
+        hdrs = cur.get("headers")
+        if isinstance(hdrs, str):
+            try:
+                hdrs = json.loads(hdrs) if hdrs.strip() else {}
+            except ValueError:
+                raise core.OverlordError("error: headers must be a JSON object")
+        if hdrs is not None and not isinstance(hdrs, dict):
+            raise core.OverlordError("error: headers must be a JSON object")
+        cur["headers"] = {str(k): str(v) for k, v in (hdrs or {}).items()}
+        for k in ("model", "base_url", "azure_api_version"):
+            cur[k] = str(cur.get(k) or "").strip()
+        if cur["base_url"] and not cur["base_url"].startswith(("http://", "https://")):
+            raise core.OverlordError("error: base URL must start with http:// or https://")
+        s["providers"][provider] = cur
+    gen = incoming.get("gen")
+    if isinstance(gen, dict):
+        g = dict(s["gen"])
+        for k in GEN_KEYS:
+            if k in gen:
+                g[k] = gen[k]
+        for k in ("temperature", "top_p"):
+            v = g.get(k)
+            if v in (None, ""):
+                g[k] = ""
+            else:
+                try:
+                    g[k] = float(v)
+                except (TypeError, ValueError):
+                    raise core.OverlordError(f"error: {k} must be a number or blank")
+        try:
+            g["max_tokens"] = int(g.get("max_tokens") or 16000)
+        except (TypeError, ValueError):
+            raise core.OverlordError("error: max_tokens must be a whole number")
+        if g.get("effort") not in prov.EFFORTS:
+            raise core.OverlordError("error: effort must be low, medium, high, xhigh, max or blank")
+        if g.get("thinking") not in ("", None, "summarized", "off"):
+            raise core.OverlordError("error: thinking must be summarized, off or blank")
+        g["thinking"] = g.get("thinking") or ""
+        g["stop"] = str(g.get("stop") or "")
+        g["system_extra"] = str(g.get("system_extra") or "")
+        g["stream"] = bool(g.get("stream", True))
+        g["fallbacks"] = bool(g.get("fallbacks", True))
+        s["gen"] = g
     if s.get("net") not in ("none", "host"):
         raise core.OverlordError("error: net must be none or host")
     try:
@@ -86,8 +178,8 @@ def save_settings(incoming):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(s, f, indent=2)
     if key:
-        if provider not in ("anthropic", "openai"):
-            raise core.OverlordError("error: a key can only be set for anthropic or openai")
+        if provider not in prov.PROVIDERS:
+            raise core.OverlordError("error: a key can only be set for a real provider")
         agent_mod.save_key(provider, key.strip())
     return s
 
@@ -103,17 +195,43 @@ def _has_key(provider):
 def settings_public():
     s = load_settings()
     backend = core.detect_backend()
-    if s["provider"] == "scripted":
+    p = s["provider"]
+    if p == "scripted":
         ready = bool(os.environ.get("OVERLORD_AGENT_SCRIPT"))
     else:
-        ready = _has_key(s["provider"])
+        ready = _has_key(p) or not prov.NEEDS_KEY.get(p, True)
     return {**s,
             "backend": backend or "none",
             "jail_available": backend == "kernel",
-            "keys": {p: _has_key(p) for p in ("anthropic", "openai")},
+            "keys": {q: _has_key(q) for q in prov.PROVIDERS},
             "provider_ready": ready,
-            "default_model": agent_mod.DEFAULT_MODELS.get(s["provider"], ""),
-            "models": agent_mod.DEFAULT_MODELS}
+            "provider_opts": provider_opts(s),
+            "default_model": prov.DEFAULT_MODELS.get(p, ""),
+            "models": prov.DEFAULT_MODELS,
+            "providers_available": [
+                {"id": q, "needs_key": prov.NEEDS_KEY[q], "key_env": prov.KEY_ENV[q],
+                 "default_base_url": prov.DEFAULT_BASE_URLS.get(q, ""),
+                 "default_model": prov.DEFAULT_MODELS.get(q, "")} for q in prov.PROVIDERS],
+            "efforts": [e for e in prov.EFFORTS if e]}
+
+
+_MODEL_CACHE = {}
+
+
+def models_for(provider=None, refresh=False):
+    """Live model catalog for a provider, cached five minutes per endpoint."""
+    s = load_settings()
+    p = provider or s["provider"]
+    o = provider_opts(s, p)
+    key = (p, o.get("base_url") or "")
+    hit = _MODEL_CACHE.get(key)
+    if hit and not refresh and time.time() - hit[0] < 300:
+        return {"provider": p, "models": hit[1], "cached": True}
+    rows = agent_mod.list_models(p, base_url=o.get("base_url") or None,
+                                 headers=o.get("headers") or None,
+                                 azure_api_version=o.get("azure_api_version") or None)
+    _MODEL_CACHE[key] = (time.time(), rows)
+    return {"provider": p, "models": rows, "cached": False}
 
 
 # ---------------------------------------------------------------- runtime
@@ -170,6 +288,8 @@ def _map_event(ev):
     """run_agent's transcript event -> a structured chat event. Text is never
     HTML; the browser renders it with textContent."""
     t = ev.get("type")
+    if t == "assistant_delta":
+        return {"type": "assistant_delta", "text": ev.get("text", "")}
     if t == "assistant":
         return {"type": "assistant", "text": ev.get("text", "")}
     if t == "tool_call":
@@ -221,7 +341,7 @@ def _run(sid, live, provider, message, first, max_turns):
         _emit(sid, {"type": "idle"})
 
 
-def start_conversation(message, target=None):
+def start_conversation(message, target=None, provider=None, model=None):
     """Open a fresh transaction and set the agent to work. Returns its sid."""
     s = load_settings()
     target = os.path.realpath(os.path.expanduser(target or s["workdir"]))
@@ -233,7 +353,9 @@ def start_conversation(message, target=None):
     if backend is None:
         raise core.OverlordError(
             "error: no sandbox backend available — run `overlord doctor`")
-    provider = agent_mod.make_provider(s["provider"], s["model"] or None)
+    if provider and provider not in prov.PROVIDERS + ["scripted"]:
+        raise core.OverlordError(f"error: unknown provider: {provider}")
+    provider = build_provider(s, provider or None, model or None)
     grants, note = _grants_for(s, backend)
     pend = core.pending_sessions_for(target)
     if pend:
@@ -619,6 +741,16 @@ button{font-family:inherit;cursor:pointer}
 .toggle{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--text)}
 .toggle input{width:auto}
 .keystate{font-size:10px;letter-spacing:1px;text-transform:uppercase}
+.linkbtn{background:none;border:0;color:var(--accent-dim);font-size:9px;letter-spacing:1px;
+  text-transform:uppercase;cursor:pointer;margin-left:8px}
+.linkbtn:hover{color:var(--accent)}
+.adv{border:1px solid var(--border);padding:10px 12px;margin-bottom:16px}
+.adv summary{cursor:pointer;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
+.adv[open] summary{margin-bottom:12px}
+.field textarea{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);
+  font-family:var(--mono);font-size:12px;padding:9px 10px;resize:vertical}
+#f-azure.hide{display:none}
+.msg.assistant .bub.live::after{content:"▍";color:var(--accent);animation:pulse 1s infinite}
 .keystate.set{color:var(--green)}.keystate.unset{color:var(--red)}
 .modal-acts{display:flex;gap:10px;justify-content:flex-end;margin-top:22px}
 .savebtn{background:var(--accent);color:var(--bg);border:0;padding:10px 22px;font-size:11px;
@@ -683,14 +815,56 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="lead">The model does the thinking on this machine; only its hands run in the sandbox.</div>
     <div class="row2">
       <div class="field"><label>Model provider</label>
-        <select id="s-provider"><option value="anthropic">Anthropic (Claude)</option>
-          <option value="openai">OpenAI</option></select></div>
-      <div class="field"><label>Model</label>
-        <input id="s-model" type="text" placeholder="default"></div>
+        <select id="s-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI</option>
+          <option value="azure">Azure OpenAI</option>
+          <option value="openai-compatible">OpenAI-compatible (Ollama, vLLM, LiteLLM, gateway)</option>
+          <option value="gemini">Google Gemini</option></select></div>
+      <div class="field"><label>Model <button type="button" class="linkbtn" id="s-models-refresh">refresh list</button></label>
+        <input id="s-model" type="text" list="s-models" placeholder="default" autocomplete="off">
+        <datalist id="s-models"></datalist>
+        <div class="desc" id="s-models-note"></div></div>
     </div>
     <div class="field"><label>API key <span class="keystate" id="keystate"></span></label>
       <input id="s-key" type="password" placeholder="paste to set — never shown again">
       <div class="desc">Stored on this machine only, in ~/.overlord/keys.json (mode 600).</div></div>
+    <div class="row2">
+      <div class="field"><label>Endpoint (base URL)</label>
+        <input id="s-baseurl" type="text" placeholder="default">
+        <div class="desc">A gateway, a proxy, a local server. Blank uses the provider's own.</div></div>
+      <div class="field" id="f-azure"><label>Azure API version</label>
+        <input id="s-azurever" type="text" placeholder="2024-10-21"></div>
+    </div>
+    <div class="field"><label>Extra headers (JSON object)</label>
+      <input id="s-headers" type="text" placeholder='{"X-Org": "team-a"}'></div>
+    <details class="adv"><summary>Generation</summary>
+    <div class="row2">
+      <div class="field"><label>Max tokens</label><input id="g-maxtokens" type="number" min="1"></div>
+      <div class="field"><label>Effort</label>
+        <select id="g-effort"><option value="">model default</option><option>low</option>
+          <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
+        <div class="desc">Reasoning depth. Claude: output_config.effort; OpenAI: reasoning_effort.</div></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>Thinking (Claude)</label>
+        <select id="g-thinking"><option value="">model default</option>
+          <option value="summarized">show a summary</option><option value="off">off</option></select></div>
+      <div class="field"><label>Stop sequences (comma-separated)</label><input id="g-stop" type="text"></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>Temperature</label><input id="g-temperature" type="text" placeholder="not sent">
+        <div class="desc">Sent only when set. The current Claude family rejects it.</div></div>
+      <div class="field"><label>Top-p</label><input id="g-topp" type="text" placeholder="not sent"></div>
+    </div>
+    <div class="field"><label>Added system instructions</label>
+      <textarea id="g-system" rows="3" placeholder="Appended to the agent's system prompt."></textarea></div>
+    <div class="row2">
+      <div class="field"><label class="toggle"><input type="checkbox" id="g-stream"> Stream replies</label></div>
+      <div class="field"><label class="toggle"><input type="checkbox" id="g-fallbacks"> Refusal fallbacks (Claude native)</label>
+        <div class="desc">If Claude declines, the API retries on a fallback model in the same call.</div></div>
+    </div>
+    </details>
     <div class="field"><label>Working folder</label>
       <input id="s-workdir" type="text">
       <div class="desc">The agent works on a sandboxed copy of this folder. Nothing changes until you Commit.</div></div>
@@ -737,14 +911,23 @@ async function loadConvs(){
   });
 }
 
+let LIVE = null;   // the assistant bubble currently receiving streamed text
 function renderMsg(m){
   const s = $('stream');
-  if(m.type==='user'||m.type==='assistant'){
+  if(m.type==='assistant_delta'){
+    if(!LIVE){ const w = el('div','msg assistant'); w.appendChild(el('div','who','agent'));
+      LIVE = el('div','bub live'); w.appendChild(LIVE); s.appendChild(w); }
+    LIVE.textContent += m.text||'';
+  } else if(m.type==='assistant' && LIVE){
+    LIVE.textContent = m.text||''; LIVE.classList.remove('live'); LIVE = null;
+  } else if(m.type==='user'||m.type==='assistant'){
+    LIVE = null;
     const w = el('div','msg '+m.type);
     w.appendChild(el('div','who', m.type==='user'?'you':'agent'));
     w.appendChild(el('div','bub', m.text||''));
     s.appendChild(w);
   } else if(m.type==='tool_call'){
+    LIVE = null;
     const t = el('div','tool'); t.dataset.id = m.id||'';
     const th = el('div','th');
     th.appendChild(el('span','arrow','↳'));
@@ -887,12 +1070,45 @@ document.addEventListener('click', e=>{
 });
 
 // settings modal
+function providerInfo(p){ return (SETTINGS.providers_available||[]).find(x=>x.id===p)||{}; }
+function fillProvider(p){
+  const o = (SETTINGS.providers||{})[p] || {};
+  const info = providerInfo(p);
+  $('s-model').value = o.model || '';
+  $('s-model').placeholder = info.default_model || 'as the server lists it';
+  $('s-baseurl').value = o.base_url || '';
+  $('s-baseurl').placeholder = info.default_base_url || 'required';
+  $('s-headers').value = o.headers && Object.keys(o.headers).length ? JSON.stringify(o.headers) : '';
+  $('s-azurever').value = o.azure_api_version || '';
+  $('f-azure').classList.toggle('hide', p!=='azure');
+  keystate();
+  loadModels(false);
+}
+async function loadModels(refresh){
+  const p = $('s-provider').value, note = $('s-models-note'), dl = $('s-models');
+  note.textContent = 'listing models…';
+  const r = await j('/api/models?provider='+encodeURIComponent(p)+(refresh?'&refresh=1':''));
+  dl.innerHTML = '';
+  if(r.error){ note.textContent = 'could not list models: '+r.error; return; }
+  (r.models||[]).forEach(m=>{ const o=document.createElement('option'); o.value=m.id;
+    o.label = m.name && m.name!==m.id ? m.name : ''; dl.appendChild(o); });
+  note.textContent = (r.models||[]).length + ' models available' + (r.cached?' (cached)':'');
+}
 async function openSettings(msg){
   await loadSettings();
   $('s-provider').value = SETTINGS.provider;
-  $('s-model').value = SETTINGS.model||'';
-  $('s-model').placeholder = SETTINGS.default_model||'default';
   $('s-workdir').value = SETTINGS.workdir||'';
+  const g = SETTINGS.gen || {};
+  $('g-maxtokens').value = g.max_tokens || 16000;
+  $('g-effort').value = g.effort || '';
+  $('g-thinking').value = g.thinking || '';
+  $('g-stop').value = g.stop || '';
+  $('g-temperature').value = (g.temperature===''||g.temperature==null) ? '' : g.temperature;
+  $('g-topp').value = (g.top_p===''||g.top_p==null) ? '' : g.top_p;
+  $('g-system').value = g.system_extra || '';
+  $('g-stream').checked = g.stream !== false;
+  $('g-fallbacks').checked = g.fallbacks !== false;
+  fillProvider(SETTINGS.provider);
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'
@@ -905,9 +1121,16 @@ async function openSettings(msg){
 function keystate(){ const has = SETTINGS.keys && SETTINGS.keys[$('s-provider').value];
   const k=$('keystate'); k.textContent = has?'set':'not set'; k.className='keystate '+(has?'set':'unset'); }
 async function saveSettings(){
-  const body = {provider:$('s-provider').value, model:$('s-model').value.trim(),
+  const body = {provider:$('s-provider').value,
     workdir:$('s-workdir').value.trim(), jail:$('s-jail').checked,
-    max_turns:Number($('s-maxturns').value)||40};
+    max_turns:Number($('s-maxturns').value)||40,
+    provider_opts:{model:$('s-model').value.trim(), base_url:$('s-baseurl').value.trim(),
+      headers:$('s-headers').value.trim(), azure_api_version:$('s-azurever').value.trim()},
+    gen:{max_tokens:Number($('g-maxtokens').value)||16000, effort:$('g-effort').value,
+      thinking:$('g-thinking').value, stop:$('g-stop').value,
+      temperature:$('g-temperature').value.trim(), top_p:$('g-topp').value.trim(),
+      system_extra:$('g-system').value, stream:$('g-stream').checked,
+      fallbacks:$('g-fallbacks').checked}};
   const key = $('s-key').value.trim(); if(key) body.key=key;
   const r = await j('/api/settings',{method:'PUT',body:JSON.stringify(body)});
   if(r.error){ $('setmsg').textContent=r.error; $('setmsg').className='act-msg bad'; return; }
@@ -925,7 +1148,8 @@ $('new').addEventListener('click',newChat);
 $('opensettings').addEventListener('click',()=>openSettings());
 $('closesettings').addEventListener('click',()=>$('settings').classList.remove('open'));
 $('savesettings').addEventListener('click',saveSettings);
-$('s-provider').addEventListener('change',()=>{ $('s-model').placeholder=(SETTINGS.models||{})[$('s-provider').value]||'default'; keystate(); });
+$('s-provider').addEventListener('change',()=>fillProvider($('s-provider').value));
+$('s-models-refresh').addEventListener('click',()=>loadModels(true));
 $('togglerail').addEventListener('click',()=>$('app').classList.toggle('show-rail'));
 $('toggleins').addEventListener('click',()=>$('app').classList.toggle('show-ins'));
 $('input').addEventListener('input',autosize);
@@ -948,6 +1172,10 @@ $('input').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.pr
 def handle_get(handler, path, query):
     if path == "/api/settings":
         handler._send(settings_public())
+        return True
+    if path == "/api/models":
+        handler._send(models_for((query.get("provider") or [None])[0] or None,
+                                 refresh=bool((query.get("refresh") or [""])[0])))
         return True
     if path == "/api/chats":
         s = load_settings()
@@ -974,7 +1202,9 @@ def handle_get(handler, path, query):
 def handle_post(handler, parts, req):
     # parts is self.path.strip('/').split('/')
     if parts == ["api", "chats"]:
-        sid = start_conversation(req.get("message", ""), req.get("target") or None)
+        sid = start_conversation(req.get("message", ""), req.get("target") or None,
+                                 provider=req.get("provider") or None,
+                                 model=req.get("model") or None)
         handler._send({"sid": sid})
         return True
     if len(parts) == 4 and parts[:2] == ["api", "chats"]:

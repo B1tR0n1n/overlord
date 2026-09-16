@@ -159,11 +159,17 @@ class OverlordClient:
 
     def agent(self, target, task, provider="anthropic", model=None, max_turns=None,
               jail=False, net="host", timeout=None, merge_base=False, trace=None,
-              wait=False, stack=False, on_event=None):
+              wait=False, stack=False, on_event=None, base_url=None, headers=None,
+              config=None, azure_api_version=None):
         """Run the built-in agent against target inside a live session, then
-        seal it. on_event receives transcript events (assistant, tool_call,
-        tool_result, done, error) and one initial {"type": "session", "sid"}.
-        Returns a Session plus the agent's final text."""
+        seal it. on_event receives transcript events (assistant_delta while
+        text streams, then assistant, tool_call, tool_result, done, error) and
+        one initial {"type": "session", "sid"}. provider is one of anthropic,
+        openai, azure, openai-compatible, gemini; base_url/headers reach a
+        gateway or a local server; config is a dict of generation knobs
+        (max_tokens, temperature, top_p, stop, effort, thinking, system_extra,
+        stream, fallbacks) — blank knobs are not sent. Returns a Session plus
+        the agent's final text."""
         def _ev(ev):
             if not on_event:
                 return
@@ -173,7 +179,8 @@ class OverlordClient:
                 on_event({k: v for k, v in ev.items() if k not in ("ok", "event")})
         res = self._call(
             "agent", on_event=_ev, target=str(target), task=task, provider=provider,
-            model=model, max_turns=max_turns,
+            model=model, max_turns=max_turns, base_url=base_url, headers=headers,
+            config=config, azure_api_version=azure_api_version,
             grants={"jail": jail, "net": net, "timeout": timeout, "merge_base": merge_base},
             trace=trace, wait=wait, stack=stack,
         )
@@ -204,6 +211,11 @@ class OverlordClient:
 
     def savepoints(self, sid):
         return self._call("savepoints", sid=sid)["savepoints"]
+
+    def models(self, provider="anthropic", base_url=None, headers=None, azure_api_version=None):
+        """The models a provider serves right now: [{id, name, context, max_output}]."""
+        return self._call("models", provider=provider, base_url=base_url, headers=headers,
+                          azure_api_version=azure_api_version)["models"]
 
     def review(self, sid, provider="anthropic", model=None, max_turns=None,
                same_model=False, on_event=None):

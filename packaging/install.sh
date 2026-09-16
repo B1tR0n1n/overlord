@@ -21,6 +21,7 @@ echo "== engine"
 install -d /usr/local/lib/overlord
 install -m 0644 "$HERE/overlord.py" /usr/local/lib/overlord/overlord.py
 install -m 0644 "$HERE/agent.py" /usr/local/lib/overlord/agent.py
+install -m 0644 "$HERE/providers.py" /usr/local/lib/overlord/providers.py
 install -m 0644 "$HERE/review.py" /usr/local/lib/overlord/review.py
 install -m 0644 "$HERE/ui.py" /usr/local/lib/overlord/ui.py
 install -m 0644 "$HERE/chatui.py" /usr/local/lib/overlord/chatui.py

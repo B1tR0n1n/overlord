@@ -754,10 +754,12 @@ button{font-family:inherit;cursor:pointer}
 .dot.pending{background:var(--accent)}.dot.committed{background:var(--green)}
 .dot.thinking{background:var(--accent);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.3}}
-.railfoot{border-top:1px solid var(--border);padding:10px 12px;display:flex;gap:10px;align-items:center}
-.gear{background:none;border:0;color:var(--dim);font-size:11px;letter-spacing:2px;text-transform:uppercase}
+.railfoot{border-top:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+.railnav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
+.railfoot .backend{white-space:nowrap}
+.gear{background:none;border:0;padding:0;color:var(--dim);font-size:11px;letter-spacing:2px;text-transform:uppercase;cursor:pointer}
 .gear:hover{color:var(--accent)}
-.backend{margin-left:auto;font-size:9px;color:var(--dim);letter-spacing:1px}
+.backend{font-size:9px;color:var(--dim);letter-spacing:1px}
 
 /* center */
 .chat{display:flex;flex-direction:column;min-width:0;background:var(--bg)}
@@ -938,11 +940,13 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <button class="newbtn" id="new">+ New conversation</button>
     <div class="convs" id="convs"></div>
     <div class="railfoot">
-      <button class="gear" id="opensettings">Settings</button>
-      <a class="consolelink" href="/console">Console</a>
+      <div class="railnav">
+        <button class="gear" id="opensettings">Settings</button>
+        <a class="consolelink" href="/console">Console</a>
+        <button class="gear hide" id="logout">Sign out</button>
+      </div>
       <span class="backend" id="backend"></span>
       <span class="backend" id="whoami"></span>
-      <button class="gear hide" id="logout">Sign out</button>
     </div>
   </nav>
   <main class="chat">

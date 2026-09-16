@@ -958,6 +958,8 @@ def start_ebpf(pid, sdir):
 
 def _copy_entry(src, dst):
     st = os.lstat(src)
+    if os.path.islink(dst):
+        os.remove(dst)
     if stat.S_ISLNK(st.st_mode):
         if os.path.lexists(dst):
             os.remove(dst)
@@ -998,6 +1000,19 @@ def _remove_target(path):
 def apply_upper(upper, target, backend=None):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
+    # Validate every destination first (the same strict join used below, which
+    # already refuses a symlinked ancestor), so a rejection leaves nothing
+    # half-replayed rather than mutating up to the offending entry.
+    for root, dirs, files in os.walk(upper):
+        for d in dirs:
+            _safe_join(target, os.path.relpath(os.path.join(root, d), upper))
+        for name in files:
+            if backend != "kernel" and name in _FUSE_MARKERS:
+                continue
+            fpath = os.path.join(root, name)
+            rel = _victim_rel(fpath, upper) if is_whiteout(fpath, backend) \
+                else os.path.relpath(fpath, upper)
+            _safe_join(target, rel)
     for root, dirs, files in os.walk(upper):
         for d in dirs:
             dpath = os.path.join(root, d)
@@ -1009,7 +1024,7 @@ def apply_upper(upper, target, backend=None):
                 os.makedirs(tpath)
                 shutil.copystat(dpath, tpath)
                 applied += 1
-            elif not os.path.isdir(tpath):
+            elif not (os.path.isdir(tpath) and not os.path.islink(tpath)):
                 _remove_target(tpath)
                 os.makedirs(tpath, exist_ok=True)
                 applied += 1

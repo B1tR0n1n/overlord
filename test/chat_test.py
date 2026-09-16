@@ -107,7 +107,19 @@ try:
         fail(f"settings not applied: {sp}")
     if agent.load_key("openai") != "sk-secret-123":
         fail("the key did not reach the engine key store")
-    ok("settings round-trip; API key stored in the engine, never echoed")
+    # the second model's key lands under the reviewer's provider, not the agent's
+    code, sp = req("/api/settings", {"review_provider": "gemini", "review_model": "gemini-2.5-flash",
+                                     "review_key": "gm-review-456"}, "PUT")
+    if code != 200 or sp["review_provider"] != "gemini" or sp["review_model"] != "gemini-2.5-flash" \
+            or not sp["keys"]["gemini"] or "gm-review" in json.dumps(sp):
+        fail(f"reviewer settings: {code} {sp.get('review_provider')} {sp.get('keys')}")
+    if agent.load_key("gemini") != "gm-review-456" or agent.load_key("openai") != "sk-secret-123":
+        fail("the reviewer's key went to the wrong store")
+    code, sp = req("/api/settings", {"review_provider": "nope"}, "PUT")
+    if code != 400:
+        fail("bad reviewer provider accepted")
+    req("/api/settings", {"review_provider": "", "review_model": ""}, "PUT")
+    ok("settings round-trip; API key stored in the engine, never echoed; the reviewer's key under its provider")
 
     # 3. switch to the scripted provider and start a conversation
     set_script([

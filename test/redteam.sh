@@ -131,6 +131,28 @@ if grep -qE 'CapEff: 0000000000000000;' <<< "$OUT" && grep -q 'NoNewPrivs: 1' <<
     hold "A14 capabilities zero, NoNewPrivs, seccomp: mount and unshare refused"
 else breach "A14 command still privileged in the jail: $OUT"; fi
 
+# --- A15: resource exhaustion — a bounded probe: with a small process grant a
+# spawn burst must be refused, and a write past the file-size grant cut. The
+# probe caps itself (40 short sleeps, a 4 MiB write): it checks the wall, it
+# does not throw itself at the host
+reset_target
+OUT=$($OVERLORD run --jail --limit pids=16 --limit fsize_mb=1 -t "$TARGET" -- bash -c '
+python3 - <<EOF
+import subprocess
+ps, failed = [], 0
+for i in range(40):
+    try: ps.append(subprocess.Popen(["sleep", "2"]))
+    except OSError: failed += 1
+for p in ps: p.kill()
+print("SPAWN-REFUSED" if failed else "SPAWN-UNBOUNDED")
+EOF
+dd if=/dev/zero of=big bs=1M count=4 2>/dev/null; s=$(stat -c %s big 2>/dev/null || echo 0)
+[ "$s" -le 1048576 ] && echo FSIZE-CUT || echo FSIZE-UNBOUNDED' 2>/dev/null)
+SID15=$(grep -oP 'session \K\S+' <<< "$OUT" | head -1); [[ -n "$SID15" ]] && $OVERLORD rollback "$SID15" > /dev/null 2>&1
+if grep -q SPAWN-REFUSED <<< "$OUT" && grep -q FSIZE-CUT <<< "$OUT"; then
+    hold "A15 resource grants bound processes and file size inside the jail"
+else breach "A15 resource exhaustion unbounded: $(grep -oE 'SPAWN-[A-Z]+|FSIZE-[A-Z]+' <<< "$OUT" | tr '\n' ' ')"; fi
+
 # --- A10: in-jail mount games must not persist or reach out
 OUT=$(attack 'mkdir -p /mnt 2>/dev/null; mount -t tmpfs t /mnt 2>/dev/null; mount --bind / /mnt 2>/dev/null; ls /mnt/vault 2>/dev/null && echo REACHED || echo CONTAINED')
 if grep -q REACHED <<< "$OUT"; then breach "A10 mount tricks reached real fs"

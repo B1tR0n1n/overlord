@@ -200,6 +200,9 @@ try:
             fail("settings lacks the memory section")
         if not page.locator("#skills-section").count() or not page.locator("#sk-add").count():
             fail("settings lacks the skills section")
+        if not page.locator("#review-section").count() or not page.locator("#r-provider").count() \
+                or not page.locator("#r-key").count():
+            fail("settings lacks the countersignature section (second model + its key)")
         if page.locator("#s-models option").count() != 1:
             fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()

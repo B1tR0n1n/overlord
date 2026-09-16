@@ -228,6 +228,12 @@ def save_settings(incoming):
         if provider not in prov.PROVIDERS:
             raise core.OverlordError("error: a key can only be set for a real provider")
         agent_mod.save_key(provider, key.strip())
+    rkey = incoming.get("review_key")
+    if rkey:
+        rprov = s.get("review_provider") or provider
+        if rprov not in prov.PROVIDERS:
+            raise core.OverlordError("error: the reviewer's key can only be set for a real provider")
+        agent_mod.save_key(rprov, rkey.strip())
     return s
 
 
@@ -1070,7 +1076,10 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label>Reviewer model</label>
         <input id="r-model" type="text" placeholder="that provider's default" autocomplete="off"></div>
     </div>
-    <div class="desc">Uses the provider's saved endpoint, headers and key from above. A review with a truncated diff never countersigns; harness files (and any policy-protected path) need a complete one.</div>
+    <div class="field"><label>API key for the reviewer's provider <span class="keystate" id="rkeystate"></span></label>
+      <input id="r-key" type="password" placeholder="paste to set — never shown again" autocomplete="off">
+      <div class="desc">Stored in the same key store as the agent's key, under the reviewer's provider. If the reviewer uses the agent's provider, its key is already in place. Endpoint and headers come from that provider's profile above.</div></div>
+    <div class="desc">A review with a truncated diff never countersigns; harness files (and any policy-protected path) need a complete one.</div>
     </details>
     <div class="field"><label>Working folder</label>
       <input id="s-workdir" type="text">
@@ -1477,6 +1486,7 @@ async function openSettings(msg){
   $('g-context').value = g.context_limit || '';
   $('r-provider').value = SETTINGS.review_provider || '';
   $('r-model').value = SETTINGS.review_model || '';
+  rkeystate();
   fillProvider(SETTINGS.provider);
   renderConnectors();
   loadMemory();
@@ -1502,6 +1512,9 @@ async function openSettings(msg){
   $('setmsg').textContent = msg||''; $('setmsg').className='act-msg'+(msg?' bad':'');
   $('settings').classList.add('open');
 }
+function rkeystate(){ const p = $('r-provider').value || $('s-provider').value;
+  const has = p==='scripted' || (SETTINGS.keys && SETTINGS.keys[p]) || (SETTINGS.providers_available||[]).some(x=>x.id===p && !x.needs_key);
+  const k=$('rkeystate'); k.textContent = has?'set':'not set'; k.className='keystate '+(has?'set':'unset'); }
 function keystate(){ const has = SETTINGS.keys && SETTINGS.keys[$('s-provider').value];
   const k=$('keystate'); k.textContent = has?'set':'not set'; k.className='keystate '+(has?'set':'unset'); }
 async function saveSettings(){
@@ -1517,9 +1530,10 @@ async function saveSettings(){
       system_extra:$('g-system').value, stream:$('g-stream').checked,
       fallbacks:$('g-fallbacks').checked, context_limit:$('g-context').value.trim()}};
   const key = $('s-key').value.trim(); if(key) body.key=key;
+  const rkey = $('r-key').value.trim(); if(rkey) body.review_key=rkey;
   const r = await j('/api/settings',{method:'PUT',body:JSON.stringify(body)});
   if(r.error){ $('setmsg').textContent=r.error; $('setmsg').className='act-msg bad'; return; }
-  $('s-key').value=''; SETTINGS=r; await loadSettings(); keystate();
+  $('s-key').value=''; $('r-key').value=''; SETTINGS=r; await loadSettings(); keystate(); rkeystate();
   $('setmsg').textContent='saved'; $('setmsg').className='act-msg ok';
   $('backend').textContent = SETTINGS.backend+' backend';
   if(!SEL) newChat();
@@ -1690,7 +1704,8 @@ $('new').addEventListener('click',newChat);
 $('opensettings').addEventListener('click',()=>openSettings());
 $('closesettings').addEventListener('click',()=>$('settings').classList.remove('open'));
 $('savesettings').addEventListener('click',saveSettings);
-$('s-provider').addEventListener('change',()=>fillProvider($('s-provider').value));
+$('s-provider').addEventListener('change',()=>{ fillProvider($('s-provider').value); rkeystate(); });
+$('r-provider').addEventListener('change',rkeystate);
 $('s-models-refresh').addEventListener('click',()=>loadModels(true));
 $('c-transport').addEventListener('change',()=>{ const h=$('c-transport').value==='http';
   $('c-http').classList.toggle('hide',!h); $('c-stdio').classList.toggle('hide',h); });

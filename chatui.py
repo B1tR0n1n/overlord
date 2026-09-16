@@ -329,28 +329,34 @@ def _approver(sid):
     c = _conv(sid)
 
     def approve(req):
-        gate = {"id": req["id"], "decided": threading.Event(), "allow": False}
+        gate = {"id": req["id"], "decided": threading.Event(), "allow": False, "who": None}
         with c["lock"]:
             c["pending"] = gate
         _emit(sid, {"type": "approval", "id": req["id"], "server": req["server"],
-                    "tool": req["tool"], "input": req["input"], "turn": req.get("turn")})
+                    "tool": req["tool"], "input": req["input"], "turn": req.get("turn"),
+                    "fingerprint": req.get("fingerprint")})
         gate["decided"].wait(APPROVAL_WAIT)
         with c["lock"]:
             c["pending"] = None
-        return bool(gate["allow"]) if gate["decided"].is_set() else False
+        allowed = bool(gate["allow"]) if gate["decided"].is_set() else False
+        if allowed:
+            req["approved_by"] = gate.get("who") or "workspace"
+        return allowed
     return approve
 
 
-def decide(sid, approval_id, allow):
+def decide(sid, approval_id, allow, approver=None):
     c = _conv(sid)
     with c["lock"]:
         gate = c["pending"]
         if not gate or gate["id"] != approval_id:
             raise core.OverlordError("error: nothing is waiting for that approval")
         gate["allow"] = bool(allow)
+        gate["who"] = approver
         gate["decided"].set()
     _emit(sid, {"type": "approval_decision", "id": approval_id,
-                "decision": "approved" if allow else "denied"})
+                "decision": "approved" if allow else "denied",
+                "approved_by": approver if allow else None})
     return {"ok": True}
 
 
@@ -1923,7 +1929,9 @@ def handle_post(handler, parts, req):
             return True
         if action == "approve":
             auth.require("act", core.load_meta(sid))
-            handler._send(decide(sid, str(req.get("id") or ""), bool(req.get("allow"))))
+            _p = auth.current()
+            _who = (f"{_p['user']}@{_p['via']}" if _p else "workspace")
+            handler._send(decide(sid, str(req.get("id") or ""), bool(req.get("allow")), _who))
             return True
         if action == "remember":
             auth.require("act", core.load_meta(sid))

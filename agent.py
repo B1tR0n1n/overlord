@@ -36,6 +36,8 @@ AZURE_OPENAI_API_KEY, GEMINI_API_KEY) or ~/.overlord/keys.json (mode 0600):
 """
 
 import base64
+import getpass
+import hashlib
 import json
 import os
 import sys
@@ -734,15 +736,26 @@ def _compact(live, provider, system_prompt, messages, task, turn, in_tokens, rec
 
 
 def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=None):
-    """A connector tool: outside the jail and the transaction, so gated.
-    Returns (output, rc) for the model; every decision is in the transcript."""
+    """A connector tool acts outside the jail and the transaction: its effect
+    is real and cannot be rolled back. So it is gated and, like a commit,
+    bound into the keyed audit chain — the call by a fingerprint of exactly
+    what it is, the approval by who gave it, and the result by its hash.
+    Returns (output, rc) for the model."""
+    import mcp as mcp_mod
     desc = registry.describe(tc["name"])
+    fp = mcp_mod.call_fingerprint(desc["server"], desc["tool"], tc["input"])
     req = {"id": tc["id"], "turn": turn, "tool": desc["tool"], "server": desc["server"],
-           "name": tc["name"], "input": tc["input"], "read_only": desc["read_only"]}
+           "name": tc["name"], "input": tc["input"], "read_only": desc["read_only"],
+           "fingerprint": fp}
+    # the call itself, recorded before it runs, against its fingerprint
+    audit_mod.record("connector.call", sid=sid, owner=owner, server=desc["server"],
+                     tool=desc["tool"], read_only=desc["read_only"], fingerprint=fp,
+                     args=json.dumps(tc["input"])[:200])
     decision = "read-only" if desc["read_only"] else None
+    approved_by = None
     if decision is None and mode == "ask" and approve:
         audit_mod.record("connector.approval_requested", sid=sid, owner=owner,
-                         server=desc["server"], tool=desc["tool"])
+                         server=desc["server"], tool=desc["tool"], fingerprint=fp)
     if not desc["read_only"]:
         if mode == "readonly":
             decision = "denied-by-policy"
@@ -751,11 +764,12 @@ def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=N
         else:
             record({"type": "approval", **req})
             allowed = bool(approve(req)) if approve else False
+            approved_by = req.get("approved_by") if allowed else None
             decision = "approved" if allowed else ("denied" if approve else "denied-no-approver")
     record({"type": "approval_decision", "id": tc["id"], "turn": turn, "decision": decision,
-            "server": desc["server"], "tool": desc["tool"]})
+            "server": desc["server"], "tool": desc["tool"], "approved_by": approved_by})
     audit_mod.record("connector.decision", sid=sid, owner=owner, server=desc["server"],
-                     tool=desc["tool"], decision=decision)
+                     tool=desc["tool"], decision=decision, fingerprint=fp, approved_by=approved_by)
     if decision.startswith("denied"):
         why = {"denied-by-policy": "connector approval mode is readonly",
                "denied-no-approver": "no one is available to approve external actions",
@@ -764,7 +778,14 @@ def _connector_call(registry, mode, approve, tc, turn, record, sid=None, owner=N
     try:
         out, is_error = registry.call(tc["name"], tc["input"])
     except ov.OverlordError as e:
+        audit_mod.record("connector.result", sid=sid, owner=owner, server=desc["server"],
+                         tool=desc["tool"], fingerprint=fp, error=True, bytes=0,
+                         result_sha256=hashlib.sha256(str(e).encode()).hexdigest())
         return f"error: {e}", 1
+    body = out if isinstance(out, str) else json.dumps(out)
+    audit_mod.record("connector.result", sid=sid, owner=owner, server=desc["server"],
+                     tool=desc["tool"], fingerprint=fp, error=bool(is_error),
+                     bytes=len(body), result_sha256=hashlib.sha256(body.encode()).hexdigest())
     return out, (1 if is_error else 0)
 
 
@@ -780,7 +801,13 @@ def cli_approve(req):
         ans = input("  allow this external action? [y/N] ")
     except EOFError:
         return False
-    return ans.strip().lower() in ("y", "yes")
+    allowed = ans.strip().lower() in ("y", "yes")
+    if allowed:
+        try:
+            req["approved_by"] = f"os:{getpass.getuser()}"
+        except (KeyError, OSError):
+            req["approved_by"] = "os:?"
+    return allowed
 
 
 def _summarize(tc):

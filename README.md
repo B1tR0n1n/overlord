@@ -200,6 +200,14 @@ Connectors are different from everything else here, and the design says so:
   workspace shows an approval card with the exact input, a brokered run with
   no one to ask is denied. `auto` allows, `readonly` refuses every action.
   Each decision is recorded in the transcript.
+- **The call is bound into the record, like a commit.** Because it cannot be
+  rolled back, each connector call is written to the keyed audit chain, not
+  only the transcript: `connector.call` names it by a fingerprint of the
+  server, tool and arguments; `connector.decision` carries that fingerprint
+  and, when a person approved, the account that approved it; `connector.result`
+  records the result's hash and size. So an approval authorizes one exact
+  call — a different call has a different fingerprint — and the whole effect
+  is tamper-evident under the audit key.
 - A stdio server gets only the environment you configure for it plus PATH,
   HOME and LANG, never the whole process environment, so one connector's
   token is not another's. `overlord mcp test <name>` connects and lists its
@@ -1061,6 +1069,16 @@ grants are absent.
   end on the kernel backend against a local upstream, plus an offline proxy
   suite. This closes the network half of the trust-kernel "complete
   mediation" gap; connectors remain host-side.
+- 2026-09-16 — v0.28: connectors brought inside the record. A connector acts
+  outside the transaction and cannot be rolled back, so — like a commit — each
+  call is now bound into the keyed audit chain: `connector.call` names the
+  call by a fingerprint of (server, tool, arguments), `connector.decision`
+  carries that fingerprint and, when a person approved, WHO approved (the
+  signed-in account), and `connector.result` records the result's hash and
+  byte size. An approval therefore authorizes one exact call, verifiably, and
+  the whole connector effect is tamper-evident under the audit key. This is
+  the last piece of the trust-kernel chain of custody: task → tool call →
+  diff → verdict → commit, and now external actions too.
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

@@ -25,6 +25,7 @@ HOME = tempfile.mkdtemp()
 os.environ["OVERLORD_HOME"] = HOME
 
 import overlord as ov      # noqa: E402
+import audit               # noqa: E402
 import agent               # noqa: E402
 import mcp                 # noqa: E402
 import review              # noqa: E402
@@ -217,8 +218,24 @@ try:
     prov = [json.loads(l) for l in open(ov.session_file(sid, "provenance.jsonl"))]
     if [r["path"] for r in prov] != ["note.txt"]:
         fail("connector calls must not appear as file provenance")
+    # every connector call, its decision and its result are bound into the keyed
+    # audit chain, the call by a fingerprint of exactly what it is
+    aud = [e for e in audit.entries(n=0) if e.get("sid") == sid and e["action"].startswith("connector.")]
+    call = [e for e in aud if e["action"] == "connector.call" and e["tool"] == "send"][0]
+    fp = mcp.call_fingerprint("fake", "send", {"to": "alice", "body": "hi"})
+    if call["fingerprint"] != fp:
+        fail(f"connector.call fingerprint does not bind the arguments: {call}")
+    dec = [e for e in aud if e["action"] == "connector.decision" and e["tool"] == "send"][0]
+    if dec["fingerprint"] != fp or dec["decision"] != "denied" or dec.get("approved_by"):
+        fail(f"connector.decision not bound to the call / a denial has no approver: {dec}")
+    res = [e for e in aud if e["action"] == "connector.result" and e["tool"] == "echo"][0]
+    if res["fingerprint"] != mcp.call_fingerprint("fake", "echo", {"text": "ping"}) \
+            or res["bytes"] <= 0 or "result_sha256" not in res:
+        fail(f"connector.result not recorded with a hash and size: {res}")
+    if not audit.verify()["ok"] or not audit.verify()["keyed"]:
+        fail("the connector records did not extend the signed audit chain")
     ov.rollback_session(sid)
-    ok("ask mode: read-only runs, the action waits for a person, a denial never runs; all recorded")
+    ok("ask mode: read-only runs, the action waits, a denial never runs; call/decision/result signed into the audit chain")
 
     # ask mode with no approver: denied; auto mode: runs; readonly mode: denied by policy
     sid, ev, _ = run(SCRIPT, ["fake"], approval="ask", approve=None)
@@ -228,6 +245,10 @@ try:
     sid, ev, _ = run(SCRIPT, ["fake"], approval="auto")
     if tool_outputs(ev)["mcp__fake__send"]["output"] != "sent: alice" or not os.path.exists(LOG):
         fail(f"auto mode did not run the action: {tool_outputs(ev)['mcp__fake__send']}")
+    autodec = [e for e in audit.entries(n=0) if e.get("sid") == sid
+               and e["action"] == "connector.decision" and e["tool"] == "send"][0]
+    if autodec["decision"] != "auto-approved" or "fingerprint" not in autodec:
+        fail(f"auto-approved decision not bound: {autodec}")
     if [json.loads(l)["to"] for l in open(LOG)] != ["alice"]:
         fail("the server did not receive the action")
     ov.rollback_session(sid)
@@ -361,6 +382,12 @@ try:
             time.sleep(0.05)
         if not os.path.exists(LOG) or json.loads(open(LOG).read())["to"] != "carol":
             fail("approved action did not run")
+        # the approval is bound to who gave it and to the exact call
+        dec = [e for e in audit.entries(n=0) if e.get("sid") == sid
+               and e["action"] == "connector.decision" and e["tool"] == "send"][0]
+        if dec["decision"] != "approved" or not dec.get("approved_by") \
+                or dec["fingerprint"] != mcp.call_fingerprint("fake", "send", {"to": "carol"}):
+            fail(f"workspace approval not bound to approver and call: {dec}")
         code, conv = req(f"/api/chats/{sid}")
         kinds = [m["type"] for m in conv["messages"]]
         if "approval_decision" not in kinds or not any(m.get("external") for m in conv["messages"]

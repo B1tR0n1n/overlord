@@ -30,6 +30,7 @@ environment you configure for it (plus PATH, HOME, LANG), never the whole
 process environment, so one connector's token is not another's.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -331,6 +332,14 @@ def _content_text(res):
     if not parts and res.get("structuredContent") is not None:
         parts.append(json.dumps(res["structuredContent"]))
     return "\n".join(parts)
+
+
+def call_fingerprint(server, tool, arguments):
+    """sha256 over exactly what a connector call is: the server, the tool and
+    its arguments. An approval names this fingerprint, so it authorizes that
+    call and no other; the call and its result are recorded against it."""
+    body = json.dumps([server, tool, arguments], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()
 
 
 def tool_name(server, tool):

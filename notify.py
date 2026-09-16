@@ -220,13 +220,18 @@ def payload_for(hook, entry, base_url):
     return json.dumps(body).encode()
 
 
+def signature(hook, body):
+    import vault as vault_mod
+    secret = vault_mod.resolve(hook["secret"])        # may be a secret:// reference
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def deliver(hook, entry, base_url="", attempts=ATTEMPTS):
     body = payload_for(hook, entry, base_url)
     headers = {"Content-Type": "application/json", "User-Agent": f"overlord/{core.VERSION}",
                "X-Overlord-Event": entry.get("action", "")}
     if hook.get("secret"):
-        sig = hmac.new(hook["secret"].encode(), body, hashlib.sha256).hexdigest()
-        headers["X-Overlord-Signature"] = f"sha256={sig}"
+        headers["X-Overlord-Signature"] = signature(hook, body)
     last, tries = None, 0
     for i in range(attempts):
         tries += 1

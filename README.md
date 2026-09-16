@@ -83,6 +83,7 @@ overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.over
 overlord skills add skills/python-testing            # packaged know-how, loaded when it fits
 overlord skills new release -t /srv/app              # a project skill: part of the tree, reviewed like code
 overlord webhooks add team https://hooks.slack.com/… # tell the channel when work waits for a person
+overlord secrets set-command 'vault kv get -field=value secret/overlord/{name}'   # then secret://NAME anywhere
 overlord cost                                        # what the models spent, by model / account / day
 overlord cost budget --day-usd 20                    # a line no conversation crosses
 overlord audit verify                                # the hash chain of every consequential act
@@ -283,6 +284,21 @@ itself a transcript event (`compaction`: the note, what was kept, the
 tokens that triggered it), the note's call is on the ledger, and a resume
 rebuilds exactly the view the model had — nothing the model was told is
 lost from the record, only from its context.
+
+## Secrets: bring your own vault
+
+Anywhere OVERLORD stores a secret — a provider key, a connector's env or
+headers, the SSO client secret, a webhook's signing secret — the value may
+be a reference, `secret://NAME`, resolved at the moment of use by a
+command you configure (`vault.py`): `overlord secrets set-command 'vault kv
+get -field=value secret/overlord/{name}'`, or `pass`, or `aws
+secretsmanager …`. The command runs without a shell, its stdout is the
+secret, values are cached for a configurable while, and `overlord secrets
+test NAME` reports a length, never a value. Provider keys also have a
+convention: with a resolver configured and no key in any file,
+`providers/<provider>` is asked for — so a fresh machine needs no key file
+at all. Whole values only: a reference inside a longer string is left as
+it is.
 
 ## Notifications
 
@@ -580,6 +596,7 @@ python3 test/skills_test.py       # 6 skills assertions: catalogue + shadowing, 
 python3 test/sso_test.py          # 5 SSO assertions against a fake provider: config, PKCE round-trip, role mapping + domains, password refusal, audit
 python3 test/session_test.py      # 5 long-conversation assertions: compaction + record, exact resume replay, the window setting, durable logins, rate limit
 python3 test/webhook_test.py      # 5 webhook assertions against a local receiver: config, needs-review + link + signature, approval gate + budget, retries, API
+python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -748,3 +765,9 @@ grants are absent.
   `connector.approval_requested` become audited acts; `overlord webhooks`;
   a Notifications panel; `?sid=` deep links. 184 assertions across twenty
   suites.
+- 2026-09-16 — v0.18: bring your own vault. `vault.py`: `secret://NAME`
+  references resolved at the point of use by a configured command, for
+  provider keys (and a `providers/<name>` convention), connector env and
+  headers, the SSO secret and webhook signatures; cached, audited without
+  values; `overlord secrets set-command|show|test|off`. 189 assertions
+  across twenty-one suites.

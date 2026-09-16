@@ -1433,8 +1433,8 @@ async function openSettings(msg){
   if(ME.auth && ME.role==='admin') loadUsers();
   $('c-add').disabled = !isAdmin(); $('c-approval').disabled = !isAdmin();
   $('keydesc').textContent = ME.auth
-    ? 'Stored for your account only (mode 600). If you set none, the machine\'s shared key is used.'
-    : 'Stored on this machine only, in ~/.overlord/keys.json (mode 600).';
+    ? 'Stored for your account only (mode 600). If you set none, the machine\'s shared key is used. A secret://NAME reference is resolved through your vault.'
+    : 'Stored on this machine only, in ~/.overlord/keys.json (mode 600). A secret://NAME reference is resolved through your vault (overlord secrets).';
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
   $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'

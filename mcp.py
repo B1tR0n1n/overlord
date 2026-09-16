@@ -133,8 +133,9 @@ def public_config():
 class _Stdio:
     def __init__(self, name, spec):
         self.name = name
+        import vault as vault_mod
         env = {k: os.environ[k] for k in _SAFE_ENV if k in os.environ}
-        env.update({str(k): str(v) for k, v in (spec.get("env") or {}).items()})
+        env.update(vault_mod.resolve_map(spec.get("env") or {}))     # secret:// resolved here
         try:
             self.proc = subprocess.Popen(
                 [spec["command"], *spec.get("args", [])], cwd=spec.get("cwd") or None, env=env,
@@ -208,8 +209,9 @@ class _Http:
     stream carrying the response; Mcp-Session-Id is kept once issued."""
 
     def __init__(self, name, spec):
+        import vault as vault_mod
         self.name, self.url = name, spec["url"]
-        self.headers = {str(k): str(v) for k, v in (spec.get("headers") or {}).items()}
+        self.headers = vault_mod.resolve_map(spec.get("headers") or {})   # secret:// resolved here
         self.session, self._next, self._lock = None, 0, threading.Lock()
 
     def _post(self, obj, timeout):

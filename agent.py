@@ -101,10 +101,12 @@ def load_key(provider):
     env = _p.KEY_ENV.get(provider)
     if env is None:
         raise ov.OverlordError(f"error: unknown provider: {provider}")
+    import vault as vault_mod
     if os.environ.get(env):
-        return os.environ[env]
+        return vault_mod.resolve(os.environ[env])
     # the person's own key store first (accounts on), then the machine's
-    # shared one — an admin can provision a key for everyone
+    # shared one — an admin can provision a key for everyone; a stored value
+    # may be a secret:// reference resolved through the configured vault
     shared = os.path.join(ov.OVERLORD_HOME, "keys.json")
     for path in dict.fromkeys((_keys_file(), shared)):
         if os.path.isfile(path):
@@ -114,8 +116,15 @@ def load_key(provider):
             with open(path) as f:
                 key = json.load(f).get(provider)
             if key:
-                return key
-    raise ov.OverlordError(f"error: no API key for {provider}: set {env} or add it to {shared}")
+                return vault_mod.resolve(key)
+    if vault_mod.configured():
+        try:
+            return vault_mod.provider_key(provider)
+        except vault_mod.VaultError as e:
+            raise ov.OverlordError(f"error: no API key for {provider}: set {env}, add it to {shared}, "
+                                   f"or put it in the vault as providers/{provider} ({e})")
+    raise ov.OverlordError(f"error: no API key for {provider}: set {env} or add it to {shared}"
+                           " (or configure a vault: overlord secrets set-command)")
 
 
 def _keys_file():

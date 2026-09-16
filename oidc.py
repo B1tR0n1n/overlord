@@ -179,7 +179,9 @@ def finish(code, state):
             "client_id": c["client_id"], "code_verifier": st["verifier"]}
     headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
     if c.get("client_secret"):
-        basic = base64.b64encode(f"{c['client_id']}:{c['client_secret']}".encode()).decode()
+        import vault as vault_mod
+        cs = vault_mod.resolve(c["client_secret"])
+        basic = base64.b64encode(f"{c['client_id']}:{cs}".encode()).decode()
         headers["Authorization"] = f"Basic {basic}"
     tokens = _get_json(doc["token_endpoint"], headers, urllib.parse.urlencode(form).encode())
     access = tokens.get("access_token")

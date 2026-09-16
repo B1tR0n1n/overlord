@@ -32,6 +32,7 @@ install -m 0644 "$HERE/retention.py" /usr/local/lib/overlord/retention.py
 install -m 0644 "$HERE/skills.py" /usr/local/lib/overlord/skills.py
 install -m 0644 "$HERE/oidc.py" /usr/local/lib/overlord/oidc.py
 install -m 0644 "$HERE/notify.py" /usr/local/lib/overlord/notify.py
+install -m 0644 "$HERE/vault.py" /usr/local/lib/overlord/vault.py
 install -m 0644 "$HERE/ui.py" /usr/local/lib/overlord/ui.py
 install -m 0644 "$HERE/chatui.py" /usr/local/lib/overlord/chatui.py
 install -m 0644 "$HERE/packaging/ebpf/provenance.bt" /usr/local/lib/overlord/provenance.bt

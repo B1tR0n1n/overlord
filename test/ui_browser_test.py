@@ -126,7 +126,7 @@ try:
             if errors:
                 fail(f"{step}: " + "; ".join(errors))
 
-        page.goto(BASE + "/", wait_until="networkidle")
+        page.goto(BASE + "/console", wait_until="networkidle")
         clean("page load")
 
         if page.locator(".reg-item").count() != 2:

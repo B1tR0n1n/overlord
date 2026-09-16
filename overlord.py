@@ -384,8 +384,13 @@ def load_meta(sid):
 
 
 def save_meta(sid, meta):
-    with open(session_file(sid, META_FILE), "w") as f:
+    # atomic: a reader (the UI polling during a live run, a second session,
+    # the daemon) must never see a truncated meta.json mid-write
+    path = session_file(sid, META_FILE)
+    tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+    with open(tmp, "w") as f:
         json.dump(meta, f, indent=2)
+    os.replace(tmp, path)
 
 
 def list_sessions():
@@ -2268,7 +2273,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 

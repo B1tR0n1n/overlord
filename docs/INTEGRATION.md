@@ -2,6 +2,22 @@
 
 Three ways in, from zero-effort to embedded.
 
+## 0. The workspace (no integration, for people)
+
+For someone who just wants to use it, not wire it in:
+
+```bash
+overlord ui        # open http://127.0.0.1:7777
+```
+
+A chat window. Set the model provider, API key and working folder in
+Settings, then talk to the agent. Every conversation is a transaction on a
+sandboxed copy of the folder; the panel on the right shows what changed;
+nothing touches the real folder until Commit. The console (the document of
+record, with savepoints, forks, blame and the countersignature) is one click
+away at `/console`. The model runs in-process, so this is the whole product —
+no daemon, no build.
+
 ## 1. Wrap any agent CLI (zero integration)
 
 Any agent binary, any vendor, unmodified:

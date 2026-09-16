@@ -10,7 +10,9 @@ run. Then review every change it made as a hashed, attributed manifest and
 and arbitration for untrusted execution — in dependency-free Python, on the
 kernel's own primitives. It ships with a built-in agent (`overlord agent`) that
 runs a model with its hands jailed, so you can watch the whole loop happen
-inside the transaction and sign off on the diff.
+inside the transaction and sign off on the diff. For people who just want to
+use it, `overlord ui` opens a chat workspace where you talk to that agent and
+press Commit when you like what it did — nothing on disk changes until you do.
 
 ## Thesis
 
@@ -185,10 +187,43 @@ the agent (`--same-model` overrides, and the record says so). The review has
 provenance of its own: `review.jsonl` is the reviewer's transcript, and every
 verdict ever given stays in the session record.
 
-## Mission control (web UI)
+## Workspace (the chat, for everyone)
 
 ```bash
 overlord ui          # http://127.0.0.1:7777 — localhost only
+                     #   /          the workspace (chat)
+                     #   /console   the document of record
+```
+
+![OVERLORD workspace — a chat with the agent on the left and centre: the person's message, the agent's reply, and each tool call it made (read_file, write_file, shell) with its output; on the right the Transaction panel shows the working folder, the sandbox grants (sandboxed, offline), the five changed files, the three steps, and Commit / Discard / second-model-check controls](assets/workspace.png)
+
+The friendly face: a chat window, like the assistants people already know.
+**One conversation is one transaction.** The first message opens a sandboxed,
+offline copy of a folder and sets the agent to work; each later message
+resumes it on the same copy; the panel on the right shows the running diff.
+**Nothing on disk changes until you press Commit** — so you let it run, read
+what it did, and decide. Discard throws the copy away and the folder is
+byte-identical.
+
+- **Conversations** are listed on the left and selectable; each is a
+  transaction you can come back to, commit, or discard.
+- **Settings** holds the model provider, the model, the API key (stored in
+  `~/.overlord/keys.json`, mode 600, never shown again), the working folder,
+  and the sandbox grants. On the kernel backend the agent's hands are jailed
+  and offline by default; the model still thinks on your machine with network,
+  only its tools are confined.
+- **The inspector** is the review moment made friendly: the changed files, the
+  steps that made them, Commit, Discard, and a one-click second-model check
+  (the countersignature). Committed sessions link back into the console.
+
+The model runs in-process, so `overlord ui` is the whole product — no daemon,
+no build step, one file of stdlib Python, loopback only, with the same origin
+guard and nonce CSP as the console.
+
+## Mission control (the console)
+
+```bash
+overlord ui          # then open /console
 ```
 
 ![OVERLORD mission control — a pending agent session's savepoint chain: one row per tool call that wrote, each with its paths, a keep checkbox that drops it from the commit when unticked, rewind-here and fork-here controls; below it the countersignature block (unsigned, with a request control) and the disposition; the sidebar carries the blame lookup](assets/ui.png)
@@ -267,13 +302,17 @@ python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session asse
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions
 python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy assertions
+python3 test/chat_test.py         # 10 workspace assertions: settings, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
+python3 test/chat_browser_test.py # 8 workspace DOM assertions (needs playwright)
 ```
 
 `savepoint_test.py` and `review_fork_test.py` run on whichever backend is
 live; `OVERLORD_TEST_BACKEND=fuse` forces the cooperative one, so both
-stacking implementations are exercised.
+stacking implementations are exercised. `chat_test.py` drives the workspace
+HTTP API with the scripted provider (no network); `chat_browser_test.py`
+loads the chat in Chromium and drives it as a person would.
 
 `ui_test.py` drives the HTTP API; `ui_browser_test.py` loads the page in
 Chromium and asserts on the rendered DOM — console errors, the dossier
@@ -353,3 +392,13 @@ grants are absent.
   two continuations diverge. Mission control gets the countersignature
   block, fork-here, and a per-line blame sheet reachable from any committed
   path. 101 assertions across eight suites, both backends.
+- 2026-09-16 — v0.8: the workspace. `overlord ui` now opens a chat front door
+  at `/` (the console moves to `/console`): a conversation is a transaction, the
+  first message opens a sandboxed offline session and runs the built-in agent
+  in-process, follow-ups resume it, and the inspector shows the live diff with
+  Commit / Discard and a one-click second-model check. Conversations are listed
+  and selectable; a Settings panel holds the provider, model, API key (stored
+  600, never echoed), working folder and sandbox grants. Shares the console's
+  loopback bind, origin guard and nonce CSP; no daemon required. Also hardened
+  `save_meta` to write atomically, so a reader never sees a half-written record.
+  119 assertions across ten suites, both backends.

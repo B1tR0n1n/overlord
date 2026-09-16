@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import overlord as core
+import chatui
 
 # Field Systems Division tokens. Dark ground is foundational; gold is earned.
 PALETTE = dict(
@@ -943,6 +944,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             parsed = urlparse(self.path)
             path, query = parsed.path, parse_qs(parsed.query)
+            if path == "/":
+                nonce = secrets.token_urlsafe(16)
+                self._send(None, raw=chatui.chat_shell(nonce).encode(),
+                           ctype="text/html; charset=utf-8", nonce=nonce)
+                return
+            if chatui.handle_get(self, path, query):
+                return
             if path == "/api/view":
                 self._send(self._views((query.get("sel") or [None])[0] or None))
                 return
@@ -958,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"dossier": '<div class="sheet">'
                             + _render_dossier(_session_payload(sid)) + "</div>"})
                 return
-            if self.path == "/":
+            if path == "/console":
                 metas = [core.load_meta(s) for s in core.list_sessions()]
                 pending = [m for m in metas if m.get("status") == "pending"]
                 sel = pending[-1]["id"] if pending else None
@@ -1003,6 +1011,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._guard(state_changing=True):
                 return
             parts = self.path.strip("/").split("/")
+            if parts[:2] == ["api", "chats"]:
+                if chatui.handle_post(self, parts, self._body()):
+                    return
+                self._send({"error": "not found"}, 404)
+                return
             if len(parts) == 4 and parts[:2] == ["api", "session"]:
                 sid, action = _sid(parts[2]), parts[3]
                 req = self._body()
@@ -1048,6 +1061,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._guard(state_changing=True):
                 return
+            if self.path == "/api/settings":
+                n = int(self.headers.get("Content-Length") or 0)
+                chatui.handle_put(self, self.path, self.rfile.read(n).decode())
+                return
             if self.path == "/api/policy":
                 n = int(self.headers.get("Content-Length") or 0)
                 text = self.rfile.read(n).decode()
@@ -1058,6 +1075,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send({"saved": True})
             else:
                 self._send({"error": "not found"}, 404)
+        except (core.OverlordError, SystemExit) as e:
+            self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 400)
 

@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Workspace e2e: the chat front door served by `overlord ui`. Settings round
+-trip with the API key never echoed; a conversation is one transaction — the
+first message opens a sandboxed session and runs the agent, the inspector
+shows the live diff and a Commit control, a follow-up message resumes the same
+transaction, Commit applies it and Discard leaves the folder untouched; the
+model runs in-process (no daemon); a missing key and a second conversation on
+a busy folder both fail friendly. Uses the scripted provider — no network."""
+
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE)
+OVERLORD_HOME = tempfile.mkdtemp()
+os.environ["OVERLORD_HOME"] = OVERLORD_HOME
+PORT = 7796
+BASE = f"http://127.0.0.1:{PORT}"
+
+import overlord as core        # noqa: E402
+import agent                   # noqa: E402
+import ui                      # noqa: E402
+import chatui                  # noqa: E402
+
+
+def fail(msg):
+    print(f"FAIL: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ok(msg):
+    print(f"  ok: {msg}")
+
+
+def req(path, data=None, method=None, headers=None):
+    body = json.dumps(data).encode() if data is not None else None
+    r = urllib.request.Request(BASE + path, data=body, method=method,
+                               headers={"Host": f"127.0.0.1:{PORT}", **(headers or {})})
+    try:
+        with urllib.request.urlopen(r, timeout=20) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def set_script(steps):
+    p = os.path.join(OVERLORD_HOME, "script.json")
+    with open(p, "w") as f:
+        json.dump(steps, f)
+    os.environ["OVERLORD_AGENT_SCRIPT"] = p
+
+
+def wait_idle(sid, timeout=30):
+    frm, deadline = 0, time.time() + timeout
+    seen = []
+    while time.time() < deadline:
+        code, d = req(f"/api/chats/{sid}/events?from={frm}")
+        if code != 200:
+            fail(f"events {code}: {d}")
+        frm = d["next"]
+        seen += d["events"]
+        if not d["running"]:
+            return seen, d["inspector"]
+        time.sleep(0.05)
+    fail("agent did not finish")
+
+
+target = tempfile.mkdtemp()
+with open(os.path.join(target, "lib.py"), "w") as f:
+    f.write("def a():\n    return 1\n")
+KERNEL = core.detect_backend() == "kernel"
+
+server = None
+try:
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), ui.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # 1. missing key: the workspace will not start a run it cannot serve
+    chatui.save_settings({"provider": "anthropic", "workdir": target,
+                          "jail": KERNEL, "net": "none" if KERNEL else "host"})
+    code, sp = req("/api/settings")
+    if code != 200 or sp["provider"] != "anthropic" or sp["provider_ready"] not in (True, False):
+        fail(f"settings: {sp}")
+    if sp.get("keys", {}).get("anthropic"):
+        # a stray key in the test env; not our concern, just skip the assertion
+        pass
+    elif sp["provider_ready"]:
+        fail("provider_ready true without a key")
+    ok("settings served; provider readiness reported")
+
+    # 2. settings round-trip; an API key is stored but never echoed
+    code, sp = req("/api/settings", {"provider": "openai", "key": "sk-secret-123",
+                                     "workdir": target, "max_turns": 7}, "PUT")
+    if code != 200:
+        fail(f"settings PUT: {sp}")
+    if "sk-secret" in json.dumps(sp):
+        fail("the API key was echoed back to the client")
+    if not sp["keys"]["openai"] or sp["max_turns"] != 7:
+        fail(f"settings not applied: {sp}")
+    if agent.load_key("openai") != "sk-secret-123":
+        fail("the key did not reach the engine key store")
+    ok("settings round-trip; API key stored in the engine, never echoed")
+
+    # 3. switch to the scripted provider and start a conversation
+    set_script([
+        {"text": "I'll add a greeting.", "tool_calls": [
+            {"name": "read_file", "input": {"path": "lib.py"}}]},
+        {"tool_calls": [{"name": "write_file", "input": {
+            "path": "lib.py", "content": "def a():\n    return 1\n\n\ndef greet():\n    return 'hi'\n"}}]},
+        {"text": "Added greet()."}])
+    chatui.save_settings({"provider": "scripted", "workdir": target,
+                          "jail": KERNEL, "net": "none" if KERNEL else "host"})
+    code, r = req("/api/chats", {"message": "add a greet function", "target": target}, "POST")
+    if code != 200 or "sid" not in r:
+        fail(f"start chat: {code} {r}")
+    sid = r["sid"]
+    events, inspector = wait_idle(sid)
+    types = [e["type"] for e in events]
+    if "assistant" not in types or "tool_result" not in types or types[-1] != "idle":
+        fail(f"stream types: {types}")
+    if "greet" not in json.dumps(events):
+        fail("the tool call the agent made is not in the stream")
+    if core.load_meta(sid)["status"] != "pending" or \
+            open(os.path.join(target, "lib.py")).read() == "" or "greet" in open(
+                os.path.join(target, "lib.py")).read():
+        fail("the real folder changed before commit")
+    ok("a message opens a sandboxed transaction and streams the agent's work")
+
+    # 4. the conversation view rebuilds from disk; inspector offers Commit
+    code, conv = req(f"/api/chats/{sid}")
+    roles = [m["type"] for m in conv["messages"]]
+    if roles[0] != "user" or "assistant" not in roles or "tool_result" not in roles:
+        fail(f"conversation messages: {roles}")
+    if conv["meta"]["title"] != "add a greet function":
+        fail(f"title: {conv['meta']}")
+    if "Commit changes" not in conv["inspector"] or "lib.py" not in conv["inspector"]:
+        fail("inspector lacks the diff or the commit control")
+    code, chats = req("/api/chats")
+    if not any(c["sid"] == sid and c["title"] == "add a greet function"
+               for c in chats["conversations"]):
+        fail("conversation not listed")
+    ok("conversation rebuilds from disk; inspector shows the diff and Commit; it is listed")
+
+    # 5. a second folder-mate conversation is refused with a friendly message
+    code, r = req("/api/chats", {"message": "another", "target": target}, "POST")
+    if code != 400 or "already has an open conversation" not in r.get("error", ""):
+        fail(f"pending-guard message: {code} {r}")
+    ok("a second conversation on the same folder is refused clearly")
+
+    # 6. a follow-up message resumes the SAME transaction
+    set_script([
+        {"tool_calls": [{"name": "write_file", "input": {
+            "path": "NOTES.md", "content": "# notes\n"}}]},
+        {"text": "Added NOTES.md."}])
+    code, r = req(f"/api/chats/{sid}/message", {"message": "also add a NOTES.md"}, "POST")
+    if code != 200:
+        fail(f"follow-up: {code} {r}")
+    wait_idle(sid)
+    code, conv = req(f"/api/chats/{sid}")
+    users = [m["text"] for m in conv["messages"] if m["type"] == "user"]
+    if users != ["add a greet function", "also add a NOTES.md"]:
+        fail(f"both human messages: {users}")
+    if "lib.py" not in conv["inspector"] or "NOTES.md" not in conv["inspector"]:
+        fail("the resumed transaction lost the earlier change")
+    ok("a follow-up message resumes the same transaction; both changes accumulate")
+
+    # 7. Commit applies via the shared engine endpoint; folder now changed
+    code, res = req(f"/api/session/{sid}/commit", {}, "POST")
+    if code != 200 or not res.get("committed"):
+        fail(f"commit: {res}")
+    if "greet" not in open(os.path.join(target, "lib.py")).read() or \
+            not os.path.exists(os.path.join(target, "NOTES.md")):
+        fail("commit did not apply the accumulated changes")
+    code, conv = req(f"/api/chats/{sid}")
+    if "Committed" not in conv["inspector"]:
+        fail("committed state not shown")
+    ok("Commit applies the whole conversation to the real folder")
+
+    # 8. Discard leaves the folder untouched
+    set_script([{"tool_calls": [{"name": "shell", "input": {"command": "rm lib.py"}}]},
+                {"text": "removed it"}])
+    code, r = req("/api/chats", {"message": "delete lib.py", "target": target}, "POST")
+    sid2 = r["sid"]
+    wait_idle(sid2)
+    before = open(os.path.join(target, "lib.py")).read()
+    code, res = req(f"/api/session/{sid2}/rollback", {}, "POST")
+    if code != 200 or not os.path.exists(os.path.join(target, "lib.py")) or \
+            open(os.path.join(target, "lib.py")).read() != before:
+        fail("discard did not leave the folder byte-identical")
+    ok("Discard throws the sandbox away; the folder is untouched")
+
+    # 9. sending to a committed conversation is refused clearly
+    code, r = req(f"/api/chats/{sid}/message", {"message": "more"}, "POST")
+    if code != 400 or "closed" not in r.get("error", ""):
+        fail(f"message to a closed conversation: {code} {r}")
+    ok("a message to a committed conversation is refused clearly")
+
+    # 10. cross-origin POST is refused (shared guard covers the chat routes)
+    code, r = req("/api/chats", {"message": "x", "target": target}, "POST",
+                  headers={"Origin": "https://evil.example"})
+    if code != 403:
+        fail(f"cross-origin chat start: expected 403, got {code}")
+    code, r = req("/api/settings", {"provider": "openai"}, "PUT",
+                  headers={"Sec-Fetch-Site": "cross-site"})
+    if code != 403:
+        fail(f"cross-origin settings write: expected 403, got {code}")
+    ok("the chat and settings routes sit behind the same origin guard as the console")
+
+    print("PASS: workspace")
+finally:
+    if server:
+        server.shutdown()
+    import subprocess
+    subprocess.run(["rm", "-rf", OVERLORD_HOME, target])

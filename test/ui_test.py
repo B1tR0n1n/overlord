@@ -65,9 +65,11 @@ try:
         except OSError:
             time.sleep(0.1)
 
-    if "OVERLORD" not in req("/") or "mission control" not in req("/"):
-        fail("page render")
-    ok("page renders")
+    if "OVERLORD" not in req("/") or "workspace" not in req("/"):
+        fail("workspace page render")
+    if "mission control" not in req("/console"):
+        fail("console page render")
+    ok("workspace and console pages render")
 
     sessions = json.loads(req("/api/sessions"))["sessions"]
     if not any(m["id"] == sid for m in sessions):

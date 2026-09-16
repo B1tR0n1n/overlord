@@ -972,4 +972,5 @@ grants are absent.
   a WSL2 host overlay rather than the session's, so it tested the wrong
   mount there; it now picks the overlay at the working folder. `doctor`
   inside a jail says it is inside one; state written from inside a jail
-  goes to the jail's `/tmp`, not the project.
+  goes to the jail's `/tmp`, not the project. Settings → Sandbox now has a
+  Network control (offline or host) independent of the jail.

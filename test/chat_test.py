@@ -241,7 +241,11 @@ try:
     ids = [p["id"] for p in sp["providers_available"]]
     if ids != ["anthropic", "openai", "azure", "openai-compatible", "gemini"]:
         fail(f"providers listed: {ids}")
-    for bad in ({"gen": {"effort": "extreme"}}, {"gen": {"temperature": "hot"}}, {"gen": {"api": "grpc"}},
+    code, sp = req("/api/settings", {"net": "host"}, "PUT")
+    if code != 200 or sp["net"] != "host" or chatui.load_settings()["net"] != "host":
+        fail(f"net setting round-trip: {code} {sp.get('net')}")
+    req("/api/settings", {"net": "none"}, "PUT")
+    for bad in ({"gen": {"effort": "extreme"}}, {"gen": {"temperature": "hot"}}, {"gen": {"api": "grpc"}}, {"net": "vpn"},
                 {"provider_opts": {"headers": "not json"}}, {"provider_opts": {"base_url": "ftp://x"}}):
         code, r = req("/api/settings", bad, "PUT")
         if code != 400:

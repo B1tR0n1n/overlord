@@ -187,7 +187,7 @@ try:
         if page.locator("#s-workdir").input_value() != os.path.realpath(target):
             fail("settings modal did not show the working folder")
         for sel in ("#s-provider", "#s-model", "#s-baseurl", "#s-headers", "#g-maxtokens",
-                    "#g-effort", "#g-thinking", "#g-api", "#g-temperature", "#g-system", "#g-stream"):
+                    "#g-effort", "#g-thinking", "#g-api", "#g-temperature", "#g-system", "#g-stream", "#s-jail", "#s-net"):
             if not page.locator(sel).count():
                 fail(f"settings missing control {sel}")
         opts = page.locator("#s-provider option").count()

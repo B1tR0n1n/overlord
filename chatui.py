@@ -1110,7 +1110,8 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="desc">The agent works on a sandboxed copy of this folder. Nothing changes until you Commit.</div></div>
     <div class="row2">
       <div class="field"><label>Sandbox</label>
-        <label class="toggle"><input type="checkbox" id="s-jail"> Jail + offline (kernel backend)</label>
+        <label class="toggle"><input type="checkbox" id="s-jail"> Jail (kernel backend)</label>
+        <select id="s-net"><option value="none">Network: offline</option><option value="host">Network: host</option></select>
         <div class="desc" id="jailnote"></div></div>
       <div class="field"><label>Max steps per message</label>
         <input id="s-maxturns" type="number" min="1" max="200"></div>
@@ -1530,8 +1531,11 @@ async function openSettings(msg){
     : 'Stored on this machine only, in ~/.overlord/keys.json (mode 600). A secret://NAME reference is resolved through your vault (overlord secrets).';
   $('s-jail').checked = !!SETTINGS.jail;
   $('s-jail').disabled = !SETTINGS.jail_available;
-  $('jailnote').textContent = SETTINGS.jail_available ? 'Full containment is available.'
-    : 'This machine has the cooperative backend; the jail is unavailable.';
+  $('s-net').value = SETTINGS.net || 'none';
+  $('s-net').disabled = !SETTINGS.jail_available;
+  $('jailnote').textContent = SETTINGS.jail_available
+    ? 'Jail: namespaces, no capabilities, seccomp, the host tree read-only. Network: with host access the agent can fetch packages and call APIs; every connection it makes is on the record, and OVERLORD\'s own UI still needs the launch token.'
+    : 'This machine has the cooperative backend; the jail and the offline grant are unavailable.';
   $('s-maxturns').value = SETTINGS.max_turns;
   keystate();
   $('setmsg').textContent = msg||''; $('setmsg').className='act-msg'+(msg?' bad':'');
@@ -1545,7 +1549,7 @@ function keystate(){ const has = SETTINGS.keys && SETTINGS.keys[$('s-provider').
 async function saveSettings(){
   const body = {provider:$('s-provider').value,
     review_provider:$('r-provider').value, review_model:$('r-model').value.trim(),
-    workdir:$('s-workdir').value.trim(), jail:$('s-jail').checked,
+    workdir:$('s-workdir').value.trim(), jail:$('s-jail').checked, net:$('s-net').value,
     max_turns:Number($('s-maxturns').value)||40,
     provider_opts:{model:$('s-model').value.trim(), base_url:$('s-baseurl').value.trim(),
       headers:$('s-headers').value.trim(), azure_api_version:$('s-azurever').value.trim()},

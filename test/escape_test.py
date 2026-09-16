@@ -37,6 +37,9 @@ if ov.detect_backend() != "kernel":
 target = tempfile.mkdtemp()
 with open(os.path.join(target, "lib.py"), "w") as f:
     f.write("def a():\n    return 1\n")
+for name in os.listdir(HERE):                 # OVERLORD's own source, as when it audits itself
+    if name.endswith(".py"):
+        subprocess.run(["cp", os.path.join(HERE, name), target])
 with open(os.path.join(HOME, "keys.json"), "w") as f:
     f.write('{"anthropic": "sk-ant-FILE-MARKER"}')
 os.chmod(os.path.join(HOME, "keys.json"), 0o600)
@@ -50,6 +53,10 @@ ATTEMPTS = [
     ("write-out", "echo escaped > /../escaped; echo escaped > /etc/escaped; echo escaped > /root/escaped"),
     ("privs", "grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status | tr '\\n' ' '; "
               "mount -t tmpfs t /mnt 2>&1; unshare -r true 2>&1"),
+    # OVERLORD run from inside its own jail: it knows where it is, says so,
+    # and keeps its state off the project tree
+    ("self", "env | grep -c '^OVERLORD_JAIL='; PYTHONDONTWRITEBYTECODE=1 python3 overlord.py doctor 2>&1 | head -4; "
+             "ls -d .overlord 2>&1; ls -d /tmp/overlord-in-jail 2>&1"),
 ]
 script = [{"text": "probing", "tool_calls": [{"name": "shell", "input": {"command": cmd}}
                                                for _n, cmd in ATTEMPTS]},
@@ -101,9 +108,18 @@ try:
     for name in ("escaped",):
         if os.path.exists(os.path.join(target, name)) or os.path.exists("/etc/escaped") or os.path.exists("/root/escaped"):
             fail("an escaped file appeared on the host")
+    sf = results["self"][1]
+    lines = sf.rstrip("\n").split("\n")
+    if not sf.startswith("1") or "inside an OVERLORD jail" not in sf or "blocked" not in sf:
+        fail(f"overlord inside its own jail does not say where it is: {sf[:400]}")
+    if "No such file" not in lines[-2] or os.path.isdir(os.path.join(target, ".overlord")):
+        fail(f"overlord run inside the jail put its state dir in the project tree: {sf[-300:]}")
+    if "/tmp/overlord-in-jail" not in lines[-1] or os.path.isdir("/tmp/overlord-in-jail"):
+        fail(f"in-jail state not on the jail's private /tmp: {sf[-300:]}")
     if changes:
         fail(f"the probes changed the tree: {changes}")
-    ok("environment, key store, home, pid 1, network, writes outside: every probe failed; no caps, NNP, seccomp")
+    ok("environment, key store, home, pid 1, network, writes outside: every probe failed; no caps, NNP, seccomp; "
+       "OVERLORD inside its own jail says so and leaves no state in the tree")
 
     # 3. every probe is on the record
     tr = [json.loads(l) for l in open(ov.session_file(sid, "transcript.jsonl"))]

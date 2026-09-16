@@ -98,10 +98,17 @@ OUT=$(attack 'cat /mnt/vault/CLAUDE.md 2>/dev/null && echo READ || echo NOENT; l
 if grep -qE 'READ|^HOME$' <<< "$OUT"; then breach "A7 real filesystem readable from jail"
 else hold "A7 /mnt and /home do not exist"; fi
 
-# --- A8: upperdir direct access — overlay internals must be unreachable
-OUT=$(attack 'U=$(grep -oP "upperdir=\K[^,]+" /proc/mounts | head -1); [ -n "$U" ] && ls "$U" 2>/dev/null && echo UPPER-OPEN || echo UPPER-SEALED')
+# --- A8: upperdir direct access — overlay internals must be unreachable.
+# The session's own overlay is the one mounted at the working folder; a host
+# (WSL2 for one) can show overlays of its own in the table, so pick by mount
+# point rather than taking the first upperdir seen.
+OUT=$(attack 'M=$(awk -v p="$PWD" "\$2==p && \$3==\"overlay\" {print \$4}" /proc/mounts | head -1);
+              [ -z "$M" ] && { echo UPPER-NOMOUNT; exit 0; };
+              U=$(grep -oP "upperdir=\K[^,]+" <<< "$M");
+              { ls "$U" 2>/dev/null || ls "/$U" 2>/dev/null; } && echo UPPER-OPEN || echo UPPER-SEALED')
 if grep -q UPPER-OPEN <<< "$OUT"; then breach "A8 overlay upperdir reachable (session forgeable)"
-else hold "A8 overlay internals unreachable"; fi
+elif grep -q UPPER-NOMOUNT <<< "$OUT"; then breach "A8 no overlay found at the working folder (check cannot see the session mount)"
+else hold "A8 overlay internals unreachable (the session's own overlay, picked by mount point)"; fi
 
 # --- A9: inherited fd leak — no fd may point at the real fs
 OUT=$(attack 'for f in /proc/self/fd/*; do readlink "$f"; done 2>/dev/null | grep -E "/(home|mnt|overlord)" && echo FD-LEAK || echo FD-CLEAN')

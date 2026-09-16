@@ -78,7 +78,11 @@ import sys
 import time
 import uuid
 
-OVERLORD_HOME = os.environ.get("OVERLORD_HOME", os.path.expanduser("~/.overlord"))
+# Inside a jail HOME is the working folder, so the default state dir would
+# land in the project tree (and in its diff); state written from inside a
+# jail goes to the jail's private /tmp instead and vanishes with it.
+OVERLORD_HOME = os.environ.get("OVERLORD_HOME") or (
+    "/tmp/overlord-in-jail" if os.environ.get("OVERLORD_JAIL") else os.path.expanduser("~/.overlord"))
 SESSIONS_DIR = os.path.join(OVERLORD_HOME, "sessions")
 LOCKS_DIR = os.path.join(OVERLORD_HOME, "locks")
 # content-addressed copies of every committed file version (before and after),
@@ -132,6 +136,11 @@ def _kernel_backend_available():
 
 def _fuse_backend_available():
     return bool(shutil.which("fuse-overlayfs")) and bool(shutil.which("fusermount3"))
+
+
+def in_jail():
+    """True when this process runs inside an OVERLORD jail."""
+    return bool(os.environ.get("OVERLORD_JAIL"))
 
 
 def detect_backend():
@@ -271,6 +280,7 @@ if spec.get("jail"):
     libc.umount2(b"/oldroot", MNT_DETACH)
     os.environ["HOME"] = "/" + tgt_rel
     os.environ["TMPDIR"] = "/tmp"
+    os.environ["OVERLORD_JAIL"] = "1"       # so a command can tell where it is
     os.chdir(os.path.join("/", tgt_rel, cwd))
     # red team A14: inside the user namespace the command held every
     # capability (over the namespace's own resources) with no seccomp policy
@@ -2667,6 +2677,11 @@ def cmd_blame(args):
 
 
 def cmd_doctor(args):
+    if in_jail():
+        print("inside an OVERLORD jail: no capabilities, no new privileges, a seccomp policy — a\n"
+              "nested session cannot be opened here by design, so the backends below read as\n"
+              "blocked. That is this jail holding, not a missing backend; the host's own\n"
+              "`overlord doctor` and red-team suite are the view that counts.\n")
     k = _kernel_backend_available()
     fu = _fuse_backend_available()
     checks = [

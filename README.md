@@ -670,6 +670,16 @@ needs the jail (there is nothing to audit without one), flags the session
 `audit: true`, and an optional task narrows the focus. A clean audit is a
 result too: the model is told to say so rather than invent a finding.
 
+Reading an audit: from inside, `overlord doctor` reports the kernel backend
+as blocked, because a jail cannot be nested (no capabilities, no new
+privileges, seccomp). That is the jail holding, and `doctor` now says so
+first; a command can tell where it is by `OVERLORD_JAIL=1` in its
+environment, and OVERLORD run inside a jail keeps its state on the jail's
+private `/tmp`, never in the project tree. The mount table names the real
+project path on purpose: the agent is told it works at that path so
+absolute paths in builds resolve. A finding is a gap between what the
+conditions block claims and what the probe shows, not the claim itself.
+
 ## Backends
 
 Two overlay backends, auto-detected, kernel preferred. `overlord doctor` names
@@ -958,3 +968,8 @@ grants are absent.
   endpoint; compatible servers and Azure keep chat completions. `--audit`
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
+  From the first audit: A8 picked the first `upperdir` in the mount table,
+  a WSL2 host overlay rather than the session's, so it tested the wrong
+  mount there; it now picks the overlay at the working folder. `doctor`
+  inside a jail says it is inside one; state written from inside a jail
+  goes to the jail's `/tmp`, not the project.

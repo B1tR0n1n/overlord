@@ -102,6 +102,9 @@ def wait_done(c, sid):
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: auth (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 target = tempfile.mkdtemp()
 with open(os.path.join(target, "lib.py"), "w") as f:

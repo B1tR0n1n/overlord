@@ -128,14 +128,34 @@ def _now():
 
 
 def _kernel_backend_available():
-    probe = subprocess.run(
-        ["unshare", "--map-root-user", "--mount", "true"], capture_output=True
-    )
+    try:
+        probe = subprocess.run(
+            ["unshare", "--map-root-user", "--mount", "true"], capture_output=True
+        )
+    except OSError:                       # no unshare(1) on this host at all
+        return False
     return probe.returncode == 0
 
 
+def _fuse_backend_reason():
+    """Why the fuse backend cannot mount here, or None when it can. The
+    binaries on PATH are not the backend: a mount needs /dev/fuse, which a
+    container started without --device /dev/fuse lacks, and a jail never
+    has (found by an agent running the suite inside its own jail: doctor
+    said available, every session died on the mount)."""
+    for tool in ("fuse-overlayfs", "fusermount3"):
+        if not shutil.which(tool):
+            return f"missing {tool}"
+    if not os.path.exists("/dev/fuse"):
+        return "no /dev/fuse" + (" (inside a jail)" if in_jail()
+                                 else " (a container needs --device /dev/fuse)")
+    if not os.access("/dev/fuse", os.R_OK | os.W_OK):
+        return "/dev/fuse not accessible to this user"
+    return None
+
+
 def _fuse_backend_available():
-    return bool(shutil.which("fuse-overlayfs")) and bool(shutil.which("fusermount3"))
+    return _fuse_backend_reason() is None
 
 
 def in_jail():
@@ -2709,7 +2729,7 @@ def cmd_doctor(args):
         ("kernel backend (userns overlay; jail + net grants)",
          "available" if k else "blocked", k),
         ("fuse backend (fuse-overlayfs, cooperative)",
-         "available" if fu else "missing", fu),
+         "available" if fu else _fuse_backend_reason(), fu),
         ("syscall trace (--trace, strace)",
          "available" if shutil.which("strace") else "missing",
          bool(shutil.which("strace"))),

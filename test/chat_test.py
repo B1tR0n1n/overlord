@@ -76,6 +76,9 @@ target = tempfile.mkdtemp()
 with open(os.path.join(target, "lib.py"), "w") as f:
     f.write("def a():\n    return 1\n")
 KERNEL = core.detect_backend() == "kernel"
+if core.detect_backend() is None:
+    print("SKIP: chat (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 
 server = None
 try:

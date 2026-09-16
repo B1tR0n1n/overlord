@@ -45,6 +45,9 @@ def events_of(sid):
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: mcp (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 grants = {"net": "none" if KERNEL else "host", "jail": KERNEL, "timeout": None, "merge_base": False}
 FAKE = os.path.join(HERE, "test", "fake_mcp_server.py")

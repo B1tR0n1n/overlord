@@ -17,6 +17,10 @@ OVERLORD_HOME = tempfile.mkdtemp()
 os.environ["OVERLORD_HOME"] = OVERLORD_HOME
 sys.path.insert(0, HERE)
 import ui  # noqa: E402  (the launch token: open mode's credential)
+import overlord as _core  # noqa: E402
+if _core.detect_backend() is None:
+    print("SKIP: ui (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 PORT = 7791
 BASE = f"http://127.0.0.1:{PORT}"
 

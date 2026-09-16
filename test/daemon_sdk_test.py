@@ -17,6 +17,11 @@ os.environ["OVERLORD_HOME"] = OVERLORD_HOME
 SOCK = os.path.join(OVERLORD_HOME, "overlordd.sock")
 
 from overlord_client import OverlordClient, OverlordError  # noqa: E402
+sys.path.insert(1, HERE)
+import overlord as _core  # noqa: E402
+if _core.detect_backend() is None:
+    print("SKIP: daemon_sdk (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 
 
 def fail(msg):

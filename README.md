@@ -703,7 +703,12 @@ read-only, only when the network is granted; `net=none` binds nothing.
 ## Backends
 
 Two overlay backends, auto-detected, kernel preferred. `overlord doctor` names
-the active one — read it before you trust a session.
+the active one — read it before you trust a session. The fuse backend counts
+as available only when a mount can actually happen: the binaries on PATH
+*and* `/dev/fuse` this user can open. A container started without
+`--device /dev/fuse`, or a jail, gets the reason instead of a session that
+dies on its first mount; every test suite says `SKIP` with that reason
+rather than failing when no backend exists.
 
 | | containment | privileges |
 |---|---|---|
@@ -994,7 +999,8 @@ grants are absent.
   against the daily and monthly budget lines; `month_usd` budget; current
   Claude 5-family list prices. A `net=host` jail resolves names: the
   resolver behind a symlink out of `/etc` (WSL2, systemd-resolved) is bound
-  at its real path, read-only. `--audit`
+  at its real path, read-only. The fuse probe requires `/dev/fuse` and
+  `doctor` names the missing piece; suites SKIP without a backend. `--audit`
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

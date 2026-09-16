@@ -43,6 +43,9 @@ def cli(*args):
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: skills (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 grants = {"net": "none" if KERNEL else "host", "jail": KERNEL, "timeout": None, "merge_base": False}
 target = tempfile.mkdtemp()

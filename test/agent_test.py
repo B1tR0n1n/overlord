@@ -17,6 +17,9 @@ sys.path.insert(0, HERE)
 os.environ["OVERLORD_HOME"] = tempfile.mkdtemp()
 
 import overlord as ov          # noqa: E402
+if ov.detect_backend() is None:
+    print("SKIP: agent (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 import agent                   # noqa: E402
 
 

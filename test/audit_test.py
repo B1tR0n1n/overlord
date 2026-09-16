@@ -49,6 +49,9 @@ def actions():
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: audit (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 grants = {"net": "none" if KERNEL else "host", "jail": KERNEL, "timeout": None, "merge_base": False}
 target = tempfile.mkdtemp()
@@ -279,6 +282,22 @@ try:
     if "audit chain: intact" not in out or "records on disk" not in out or "accounts" not in out:
         fail(f"doctor:\n{out}")
     ok("--log-json request lines; doctor reports accounts, TLS, the audit chain and disk")
+
+    # 6. the fuse probe checks the device a mount needs, not just the binaries:
+    #    doctor names the reason, and detect_backend never offers a backend that
+    #    cannot mount (found by an agent running the suite inside its jail)
+    from unittest import mock
+    with mock.patch.object(ov.shutil, "which", lambda t: "/usr/bin/" + t), \
+            mock.patch.object(ov.os.path, "exists", lambda p: p != "/dev/fuse"):
+        if ov._fuse_backend_reason() != "no /dev/fuse (a container needs --device /dev/fuse)" or ov._fuse_backend_available():
+            fail(f"fuse probe without /dev/fuse: {ov._fuse_backend_reason()!r}")
+        with mock.patch.dict(ov.os.environ, {"OVERLORD_JAIL": "1"}):
+            if "inside a jail" not in ov._fuse_backend_reason():
+                fail("fuse probe inside a jail does not say so")
+    with mock.patch.object(ov.shutil, "which", lambda t: None):
+        if ov._fuse_backend_reason() != "missing fuse-overlayfs":
+            fail(f"fuse probe without the binary: {ov._fuse_backend_reason()!r}")
+    ok("fuse backend counts as available only with /dev/fuse; doctor says which piece is missing")
 
     print("PASS: audit")
 finally:

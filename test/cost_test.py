@@ -43,6 +43,9 @@ def cli(*args, stdin=None):
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: cost (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 grants = {"net": "none" if KERNEL else "host", "jail": KERNEL, "timeout": None, "merge_base": False}
 target = tempfile.mkdtemp()

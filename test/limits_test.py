@@ -38,6 +38,9 @@ def ok(msg):
 
 
 BACKEND = ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: limits (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 if BACKEND != "kernel":
     print("SKIP: limits (rlimits are not enforced for a privileged user outside the jail)")
     sys.exit(0)

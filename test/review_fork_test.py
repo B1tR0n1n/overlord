@@ -66,6 +66,9 @@ def events_of(sid, name="transcript.jsonl"):
 
 
 BACKEND = os.environ.get("OVERLORD_TEST_BACKEND") or ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: review_fork (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 if BACKEND is None:
     print("SKIP: no overlay backend")

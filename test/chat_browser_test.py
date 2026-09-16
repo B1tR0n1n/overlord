@@ -73,6 +73,9 @@ sys.path.insert(0, HERE)
 import chatui  # noqa: E402
 import ui  # noqa: E402
 import overlord as core  # noqa: E402
+if core.detect_backend() is None:
+    print("SKIP: chat_browser (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 chatui.save_settings({"provider": "scripted", "workdir": target,
                       "jail": core.detect_backend() == "kernel",
                       "net": "none" if core.detect_backend() == "kernel" else "host"})

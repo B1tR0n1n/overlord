@@ -64,6 +64,10 @@ os.environ["OVERLORD_HOME"] = OVERLORD_HOME
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import ui  # noqa: E402  (the launch token: open mode's credential)
+import overlord as _core  # noqa: E402
+if _core.detect_backend() is None:
+    print("SKIP: ui_browser (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 target = tempfile.mkdtemp()
 with open(os.path.join(target, "calc.py"), "w") as f:
     f.write("def add(a, b):\n    return a + b\n")

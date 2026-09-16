@@ -66,6 +66,9 @@ def events_of(sid):
 
 
 BACKEND = os.environ.get("OVERLORD_TEST_BACKEND") or ov.detect_backend()
+if BACKEND is None:
+    print("SKIP: savepoint (no sandbox backend here — see `overlord doctor`)")
+    sys.exit(0)
 KERNEL = BACKEND == "kernel"
 if BACKEND is None:
     print("SKIP: no overlay backend")

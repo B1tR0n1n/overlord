@@ -113,6 +113,8 @@ overlord cost budget --day-usd 20 --month-usd 500    # lines no conversation cro
 overlord audit verify                                # walk the signed chain
 overlord audit checkpoint pin.json                   # witness the head off-box
 overlord audit verify --pin pin.json                 # prove the live log still carries it
+overlord audit witness https://witness.example/log --auto   # send a signed head off-box on every act
+overlord audit verify --witness                      # check the live log against the witnessed head
 overlord audit verify                                # the hash chain of every consequential act
 overlord gc --dry-run                                # what retention would prune
 
@@ -439,9 +441,20 @@ holder-as-attacker case, **witness the head**: `overlord audit checkpoint`
 emits `{seq, hash}`, you store it somewhere the host cannot reach, and
 `overlord audit verify --pin <file>` proves the live log still carries that
 entry — catching a truncation or rewrite at or below it even by someone
-with the key. A remote witness (another host, a timestamp authority, a
-transparency log) is the same idea; the checkpoint token is what you feed
-it.
+with the key.
+
+OVERLORD can do the witnessing for you against a remote endpoint the host
+does not control. `overlord audit witness <url> --auto` points it at an
+append-only receiver; from then on it POSTs a **signed** head (the `{seq,
+hash}` plus a MAC keyed by the audit key) after each consequential act,
+throttled. `overlord audit verify --witness` fetches the head the witness
+holds and checks the live log still carries it — so a truncation or rewrite
+below the witnessed point is caught even when the attacker holds the key,
+because the witness keeps the higher sequence they would have to retract.
+The MAC proves the witnessed head came from this OVERLORD, so a third party
+who can write to the witness cannot plant a head it would accept. The
+witness only stores and serves the latest `{seq, hash}`; it never sees the
+log's contents.
 
 ## Retention and deployment
 
@@ -1079,6 +1092,15 @@ grants are absent.
   the whole connector effect is tamper-evident under the audit key. This is
   the last piece of the trust-kernel chain of custody: task → tool call →
   diff → verdict → commit, and now external actions too.
+- 2026-09-16 — v0.29: an off-box witness for the audit head. A local key stops
+  a forger who lacks it but not the key's holder; `overlord audit witness
+  <url> --auto` sends a signed head (`{seq, hash}` + a MAC) to an append-only
+  endpoint after each consequential act, and `audit verify --witness` checks
+  the live log still carries it — catching a truncation or rewrite below the
+  witnessed point even by the key holder, because the witness keeps the
+  sequence they cannot retract. `checkpoint --send`, a doctor row. This makes
+  the last trust-kernel boundary — the local anchor — an operational setting
+  rather than a caveat.
   / `/audit`: the containment audit as a preset, authorized and scoped so
   the model takes it as assigned work. The rail footer stacks its controls.
   From the first audit: A8 picked the first `upperdir` in the mount table,

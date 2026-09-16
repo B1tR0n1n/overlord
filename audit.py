@@ -28,6 +28,8 @@ import os
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import overlord as core
 
@@ -146,6 +148,11 @@ def record(action, **fields):
     except Exception as e:              # noqa: BLE001 — never on the caller's path
         import sys
         print(f"audit: webhook dispatch: {e}", file=sys.stderr)
+    try:
+        maybe_auto_checkpoint(action)   # off-box witness of the head, when configured
+    except Exception as e:              # noqa: BLE001 — never on the caller's path
+        import sys
+        print(f"audit: witness: {e}", file=sys.stderr)
     return entry
 
 
@@ -229,6 +236,118 @@ def check_pin(pinned):
     return {"ok": False, "reason": f"entry {want_seq} is gone — the log was truncated below the pin"}
 
 
+# ---------------------------------------------------------------- witness
+# A local key stops a forger who lacks it; it does not stop the key's holder.
+# For that, send each checkpoint to an append-only witness the host does not
+# control. Verifying against the witness catches a truncation or rewrite even
+# by the key holder, because the witness keeps the higher sequence they would
+# have to retract — and a MAC over the head proves it came from this OVERLORD,
+# so a third party who can write to the witness cannot plant a head we accept.
+
+CONFIG_FILE = os.path.join(core.OVERLORD_HOME, "audit.json")
+_SENT = {"at": 0.0}                    # throttle for automatic checkpoints
+
+
+def config():
+    try:
+        with open(CONFIG_FILE) as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(c):
+    os.makedirs(core.OVERLORD_HOME, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(c, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def signed_head():
+    """The head plus a MAC over it, keyed by the audit key: what we send to a
+    witness. Without the key the MAC is absent and the head is unsigned."""
+    h = head()
+    key = audit_key(create=False)
+    if key is not None and h["hash"]:
+        h["mac"] = hmac.new(key, f"{h['seq']}:{h['hash']}".encode(), hashlib.sha256).hexdigest()
+    h["ts"] = time.strftime(core.TS_FORMAT)
+    return h
+
+
+def _witness_url(url=None):
+    return url or (config().get("witness") or {}).get("url")
+
+
+def send_checkpoint(url=None, headers=None, timeout=15):
+    """POST the signed head to the witness. Best-effort: returns a result dict,
+    never raises. Records the send locally so `witness --show` can report it."""
+    w = config().get("witness") or {}
+    url = url or w.get("url")
+    if not url:
+        return {"ok": False, "reason": "no witness configured (overlord audit witness <url>)"}
+    body = json.dumps(signed_head()).encode()
+    hdrs = {"Content-Type": "application/json", **(w.get("header") or {}), **(headers or {})}
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+            code = r.status
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "reason": f"witness HTTP {e.code}"}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "reason": f"witness unreachable: {getattr(e, 'reason', e)}"}
+    c = config()
+    c["last_sent"] = {**signed_head(), "code": code}
+    save_config(c)
+    return {"ok": True, "seq": c["last_sent"]["seq"], "code": code}
+
+
+def fetch_witness(url=None, headers=None, timeout=15):
+    """GET the latest head the witness holds: {'seq','hash'[, 'mac']}."""
+    w = config().get("witness") or {}
+    url = url or w.get("url")
+    if not url:
+        raise core.OverlordError("error: no witness configured")
+    hdrs = {**(w.get("header") or {}), **(headers or {})}
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def verify_against_witness(url=None):
+    """Check the live log still carries the head the witness holds, and that
+    that head was signed by this OVERLORD's key."""
+    try:
+        remote = fetch_witness(url)
+    except (urllib.error.URLError, OSError, ValueError, core.OverlordError) as e:
+        return {"ok": False, "reason": f"witness fetch failed: {getattr(e, 'reason', e)}"}
+    key = audit_key(create=False)
+    mac = remote.get("mac")
+    if key is not None and remote.get("hash") and mac is not None:
+        want = hmac.new(key, f"{remote['seq']}:{remote['hash']}".encode(), hashlib.sha256).hexdigest()
+        if mac != want:
+            return {"ok": False, "reason": "witnessed head is not signed by this audit key"}
+    p = check_pin(remote)
+    return {"ok": p["ok"], "reason": p["reason"], "seq": remote.get("seq")}
+
+
+def maybe_auto_checkpoint(action):
+    """Fire-and-forget checkpoint after a consequential act, throttled; only
+    when a witness is configured with auto. Never on the caller's path."""
+    w = config().get("witness") or {}
+    if not (w.get("url") and w.get("auto")):
+        return
+    if not action.split(".", 1)[0] in ("session", "users", "auth", "policy", "connector", "cost"):
+        return
+    now = time.time()
+    if now - _SENT["at"] < float(w.get("min_interval", 20)):
+        return
+    _SENT["at"] = now
+    threading.Thread(target=send_checkpoint, daemon=True).start()
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -254,8 +373,21 @@ def cmd_audit(args):
                 print(f"PIN MISMATCH: {p['reason']}")
                 return 1
             print(f"pin ok: head still carries witnessed entry {pinned.get('seq')}")
+        if getattr(args, "witness", False):
+            w = verify_against_witness()
+            if not w["ok"]:
+                print(f"WITNESS MISMATCH: {w['reason']}")
+                return 1
+            print(f"witness ok: the log still carries the head the witness holds (entry {w.get('seq')})")
         return 0
     if args.audit_cmd == "checkpoint":
+        if getattr(args, "send", False):
+            r = send_checkpoint()
+            if not r["ok"]:
+                print(f"checkpoint not sent: {r['reason']}")
+                return 1
+            print(f"checkpoint sent to the witness: entry {r['seq']} (HTTP {r['code']})")
+            return 0
         h = head()
         text = json.dumps(h)
         dest = getattr(args, "file", None)
@@ -265,6 +397,32 @@ def cmd_audit(args):
             print(f"checkpoint written: entry {h['seq']} → {dest} (store it off-box to witness the head)")
         else:
             print(text)
+        return 0
+    if args.audit_cmd == "witness":
+        if getattr(args, "off", False):
+            c = config(); c.pop("witness", None); save_config(c)
+            print("witness cleared")
+            return 0
+        if args.url:
+            headers = {}
+            for h in args.header or []:
+                if ":" not in h:
+                    raise core.OverlordError(f"error: --header wants 'Name: value', got {h!r}")
+                k, v = h.split(":", 1)
+                headers[k.strip()] = v.strip()
+            c = config()
+            c["witness"] = {"url": args.url, "header": headers, "auto": bool(args.auto)}
+            save_config(c)
+            print(f"witness set: {args.url}" + (" (auto)" if args.auto else ""))
+            return 0
+        w = config().get("witness") or {}
+        if not w:
+            print("no witness configured (overlord audit witness <url> [--auto])")
+            return 0
+        print(f"witness: {w.get('url')}" + (" (auto)" if w.get("auto") else ""))
+        last = config().get("last_sent")
+        if last:
+            print(f"  last sent: entry {last.get('seq')} at {last.get('ts')}")
         return 0
     if args.audit_cmd == "key":
         k = audit_key(create=False)
@@ -296,8 +454,15 @@ def add_audit_parser(sub):
     asub = pa.add_subparsers(dest="audit_cmd")
     pv = asub.add_parser("verify", help="walk the signed chain; optionally check a witnessed head")
     pv.add_argument("--pin", metavar="FILE", help="a prior `audit checkpoint` file to check the head against")
-    pc = asub.add_parser("checkpoint", help="print the chain head to witness off-box (or write it to a file)")
+    pv.add_argument("--witness", action="store_true", help="also check the live log against the configured witness")
+    pc = asub.add_parser("checkpoint", help="print the chain head to witness off-box (or write/send it)")
     pc.add_argument("file", nargs="?", help="write the head here instead of stdout")
+    pc.add_argument("--send", action="store_true", help="POST the signed head to the configured witness")
+    pw = asub.add_parser("witness", help="an append-only endpoint that holds the head off-box")
+    pw.add_argument("url", nargs="?", help="set the witness URL (omit to show the current one)")
+    pw.add_argument("--header", action="append", metavar="'Name: value'", help="a header sent to the witness")
+    pw.add_argument("--auto", action="store_true", help="send a checkpoint after each consequential act")
+    pw.add_argument("--off", action="store_true", help="clear the witness")
     asub.add_parser("key", help="where the chain-signing key lives; copy it off-box")
     pa.add_argument("-n", type=int, default=50)
     pa.add_argument("--action", help="only actions with this prefix (session., auth., users. ...)")

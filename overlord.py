@@ -2832,6 +2832,10 @@ def cmd_doctor(args):
     checks.append(("tls material (~/.overlord/tls)",
                    "cert.pem present" if has_tls else "none (overlord tls selfsign, or bring your own)",
                    True))
+    _w = audit_mod.config().get("witness") or {}
+    checks.append(("audit witness (off-box head)",
+                   (_w.get("url") + (" (auto)" if _w.get("auto") else "")) if _w.get("url") else "not set",
+                   bool(_w.get("url"))))
     v = audit_mod.verify()
     checks.append(("audit chain", (f"intact, {v['entries']} entries, "
                                     + ("signed" if v.get("keyed") else "UNSIGNED")) if v["ok"]
@@ -2854,7 +2858,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.28.0"
+VERSION = "0.29.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 

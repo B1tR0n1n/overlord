@@ -359,6 +359,70 @@ try:
             fail(f"fuse probe without the binary: {ov._fuse_backend_reason()!r}")
     ok("fuse backend counts as available only with /dev/fuse; doctor says which piece is missing")
 
+    # 7. the off-box witness: a signed checkpoint sent to an append-only endpoint,
+    #    verified back, catching a truncation the key holder could otherwise hide
+    import http.server as _hs
+    import threading as _th
+    HELD = []
+    class Witness(_hs.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            HELD.append(json.loads(self.rfile.read(n) or b"{}"))
+            self.send_response(200); self.end_headers()
+        def do_GET(self):
+            body = json.dumps(HELD[-1] if HELD else {}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    wsrv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), Witness)
+    WPORT = wsrv.server_address[1]
+    _th.Thread(target=wsrv.serve_forever, daemon=True).start()
+    try:
+        # rebuild a clean signed chain (earlier steps left it broken/removed)
+        for i in range(5):
+            audit.record("session.commit", sid=f"s{i}", files=1)
+        r = cli("audit", "witness", f"http://127.0.0.1:{WPORT}/hook")
+        if r.returncode != 0 or (audit.config().get("witness") or {}).get("url") != f"http://127.0.0.1:{WPORT}/hook":
+            fail(f"witness set: {r.stdout} {r.stderr}")
+        r = cli("audit", "checkpoint", "--send")
+        if r.returncode != 0 or not HELD or HELD[-1]["seq"] != audit.head()["seq"] or "mac" not in HELD[-1]:
+            fail(f"checkpoint --send did not deliver a signed head: {r.stdout} {HELD[-1:]}")
+        if cli("audit", "verify", "--witness").returncode != 0:
+            fail("verify --witness should pass against a fresh checkpoint")
+        witnessed_seq = HELD[-1]["seq"]
+        # more acts, then a truncation BELOW the witnessed head — self-consistent, but the witness catches it
+        for i in range(3):
+            audit.record("session.rollback", sid=f"r{i}")
+        lines = open(audit.AUDIT_FILE).read().splitlines()
+        open(audit.AUDIT_FILE, "w").write("\n".join(lines[:witnessed_seq - 1]) + "\n")
+        audit._STATE.update(seq=None, hash=None, size=None)
+        if audit.verify()["ok"] is not True:
+            fail("the truncated prefix should still verify on its own — that is why a witness is needed")
+        w = audit.verify_against_witness()
+        if w["ok"] or "truncated" not in w["reason"]:
+            fail(f"the witness did not catch the truncation below its head: {w}")
+        # a head not signed by our key is rejected even if the witness serves it
+        HELD.append({"seq": 99, "hash": "f" * 64, "mac": "0" * 64})
+        if audit.verify_against_witness()["ok"] or "not signed" not in audit.verify_against_witness()["reason"]:
+            fail("a witnessed head with a bad MAC was accepted")
+        # auto: with auto on, a consequential act sends a checkpoint on its own
+        HELD.clear()
+        open(audit.AUDIT_FILE, "w").write("\n".join(lines) + "\n")
+        audit._STATE.update(seq=None, hash=None, size=None)
+        cli("audit", "witness", f"http://127.0.0.1:{WPORT}/hook", "--auto")
+        audit._SENT["at"] = 0
+        audit.record("session.commit", sid="auto1", files=1)
+        for _ in range(50):
+            if HELD:
+                break
+            time.sleep(0.05)
+        if not HELD or "mac" not in HELD[-1]:
+            fail(f"auto witness did not send a signed checkpoint after a commit: {HELD}")
+        ok("off-box witness: a signed checkpoint is sent and verified; a truncation below it and a bad MAC are caught; auto sends on commit")
+    finally:
+        wsrv.shutdown()
+
     print("PASS: audit")
 finally:
     subprocess.run(["rm", "-rf", HOME, target])

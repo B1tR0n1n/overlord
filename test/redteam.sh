@@ -123,6 +123,14 @@ if grep -q WROTE <<< "$OUT" || [[ -e /etc/ovl-a12 || -e /usr/ovl-a12 || -e /opt/
     breach "A12 host system tree writable from jail"
 else hold "A12 /etc /usr /opt read-only in the jail"; fi
 
+# --- A14: no capabilities, no new privileges, a seccomp policy — the wide
+# surface a user namespace hands root by default is not a build's to have
+OUT=$(attack 'grep -E "^(CapEff|CapPrm|CapBnd|NoNewPrivs|Seccomp):" /proc/self/status | tr -s "\t" " " | tr "\n" ";"; mkdir -p /mnt 2>/dev/null; mount -t tmpfs t /mnt 2>/dev/null && echo MOUNTED || echo NOMOUNT; unshare -r true 2>/dev/null && echo UNSHARED || echo NOUNSHARE')
+if grep -qE 'CapEff: 0000000000000000;' <<< "$OUT" && grep -q 'NoNewPrivs: 1' <<< "$OUT" && grep -q 'Seccomp: 2' <<< "$OUT" \
+   && grep -q NOMOUNT <<< "$OUT" && grep -q NOUNSHARE <<< "$OUT"; then
+    hold "A14 capabilities zero, NoNewPrivs, seccomp: mount and unshare refused"
+else breach "A14 command still privileged in the jail: $OUT"; fi
+
 # --- A10: in-jail mount games must not persist or reach out
 OUT=$(attack 'mkdir -p /mnt 2>/dev/null; mount -t tmpfs t /mnt 2>/dev/null; mount --bind / /mnt 2>/dev/null; ls /mnt/vault 2>/dev/null && echo REACHED || echo CONTAINED')
 if grep -q REACHED <<< "$OUT"; then breach "A10 mount tricks reached real fs"

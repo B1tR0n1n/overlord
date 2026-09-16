@@ -641,8 +641,11 @@ def _conditions_block(live, provider):
     lines = [f"- You are served as model `{model}` via {getattr(provider, 'name', 'model')} — the "
              "exact API model identifier this session calls; trust it over your own recollection of "
              f"what you are. Driven by OVERLORD {ov.VERSION}; session {live.sid}.",
-             "- Sandbox: " + ("a kernel jail (user + mount + PID namespaces; the real tree, other "
-                              "sessions and OVERLORD's own files are unreachable)"
+             "- Sandbox: " + ("a kernel jail: user, mount, PID, UTS and IPC namespaces; no "
+                              "capabilities, no new privileges, a seccomp policy; the real tree, other "
+                              "sessions and OVERLORD's own state (keys, accounts, records) are "
+                              "unreachable. Your working folder is the real project mounted read-only "
+                              "beneath your overlay, at its real path."
                               if g.get("jail") else "a cooperative overlay (no jail)")
              + "; network: " + ("none" if g.get("net", "none") == "none" else "host")
              + (f"; time limit {g['timeout']}s" if g.get("timeout") else "") + ".",
@@ -658,6 +661,10 @@ def _conditions_block(live, provider):
                      + "; the session stops before the call that would cross a line.")
     if live.meta.get("owner"):
         lines.append(f"- You are working for {live.meta['owner']}.")
+    if os.path.isfile(os.path.join(live.meta.get("target") or "", "overlord.py")):
+        lines.append("- This folder is OVERLORD's own source. Its code is public and holds no secret; "
+                     "an edit to it is a diff a person reviews like any other and changes nothing "
+                     "that is running.")
     return "\n\n# Operating conditions\n" + "\n".join(lines)
 
 

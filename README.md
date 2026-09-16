@@ -424,6 +424,29 @@ safeguard is real. The safeguards are locks, not rules: understanding the
 jail does not open it, and the one act that changes the world — commit —
 belongs to a person. `test/escape_test.py` is an agent that tries anyway.
 
+An agent that did try, in a real deployment, reported four findings; here
+is what each one is:
+
+1. *OVERLORD's own source is readable and writable* — only when the working
+   folder is the OVERLORD checkout itself. Its code is public and holds no
+   secret; an edit to it is a diff a person reviews and changes nothing
+   running. The conditions block now says so, and "OVERLORD's own files"
+   means what it always meant: its **state** — keys, accounts, records,
+   the audit chain — which stays unreachable.
+2. *The real host path is in the mount table* — by design: the lower layer
+   is the real tree (a copy would be the wrong trade) mounted at its real
+   path so absolute paths in tooling keep working. Host-identifying detail
+   is disclosed; it is not a way out.
+3. *All capabilities, no NoNewPrivs, no seccomp* — the finding that earned
+   a fix (red team A14). Inside a user namespace those capabilities reach
+   only the namespace's own resources, but the surface was far wider than a
+   build needs: the jail now clears ambient capabilities, drops the
+   bounding set, sets NoNewPrivs, installs a seccomp policy (mount,
+   pivot_root, unshare, setns, bpf, keyctl, module loading, io_uring, …)
+   and zeroes every capability set before a command runs.
+4. *Sensitive code in-tree* — the same as 1: the code that handles secrets
+   is not the secrets.
+
 ## Grants (the capability manifest)
 
 Grants scope what a session may do — commander's intent as enforced constraints.
@@ -859,3 +882,11 @@ grants are absent.
   `~/.overlord/ui.token` where the jail cannot see it); the conditions
   block names the served model as the API identifier to trust. 198
   assertions across twenty-three suites.
+- 2026-09-16 — v0.22: red team A14. A jailed command held every capability
+  in its user namespace with NoNewPrivs off and no seccomp policy (found by
+  an agent from the inside). The jail now clears ambient caps, drops the
+  bounding set, sets NoNewPrivs, installs a seccomp filter (x86_64,
+  aarch64; ptrace allowed only under a strace trace) and zeroes every
+  capability set before exec. The conditions block names OVERLORD's own
+  source when it is the working folder. 198 assertions across twenty-three
+  suites.

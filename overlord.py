@@ -272,6 +272,55 @@ if spec.get("jail"):
     os.environ["HOME"] = "/" + tgt_rel
     os.environ["TMPDIR"] = "/tmp"
     os.chdir(os.path.join("/", tgt_rel, cwd))
+    # red team A14: inside the user namespace the command held every
+    # capability (over the namespace's own resources) with no seccomp policy
+    # and NoNewPrivs off — far more surface than a build needs. Mounts are
+    # done, so: ambient caps cleared, the bounding set dropped, NoNewPrivs
+    # set, a seccomp filter installed, then every capability set zeroed.
+    PR_CAPBSET_DROP, PR_SET_NO_NEW_PRIVS, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 24, 38, 47, 4
+    PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 22, 2
+    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+    for cap in range(64):
+        if libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0:
+            break                                   # EINVAL past the last capability
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        die("no_new_privs")
+    DENY = {"x86_64": [165, 166, 155, 272, 308, 246, 320, 169, 175, 313, 176, 250, 248, 249, 321, 298,
+                       323, 304, 425, 426, 427, 428, 429, 430, 431, 432, 433, 442, 167, 168, 163, 164,
+                       227, 305, 159, 103, 312, 180, 153, 171, 170, 172, 173, 179, 212, 256, 279],
+            "aarch64": [40, 39, 41, 97, 268, 104, 294, 142, 105, 273, 106, 219, 217, 218, 280, 241,
+                        282, 265, 425, 426, 427, 428, 429, 430, 431, 432, 433, 442, 224, 225, 89, 170,
+                        112, 266, 171, 116, 272, 42, 58, 162, 161, 60, 18, 238, 239]}
+    PTRACE = {"x86_64": [101, 310, 311], "aarch64": [117, 270, 271]}
+    ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
+    m = platform.machine()
+    if m in DENY:
+        deny = list(DENY[m]) + ([] if spec.get("trace_bind") else PTRACE[m])
+        class SockFilter(ctypes.Structure):
+            _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8), ("jf", ctypes.c_uint8),
+                        ("k", ctypes.c_uint32)]
+        class SockFprog(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(SockFilter))]
+        LD_ABS, JEQ, JGE, RET = 0x20, 0x15, 0x35, 0x06
+        KILL, ALLOW, EPERM_RET = 0x80000000, 0x7FFF0000, 0x00050001
+        prog = [(LD_ABS, 0, 0, 4), (JEQ, 1, 0, ARCH[m]), (RET, 0, 0, KILL),      # wrong ABI: kill
+                (LD_ABS, 0, 0, 0), (JGE, 0, 1, 0x40000000), (RET, 0, 0, KILL)]    # x32 numbers: kill
+        for nr in deny:
+            prog += [(JEQ, 0, 1, nr), (RET, 0, 0, EPERM_RET)]
+        prog.append((RET, 0, 0, ALLOW))
+        arr = (SockFilter * len(prog))(*[SockFilter(*p) for p in prog])
+        fprog = SockFprog(len(prog), arr)
+        if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) != 0:
+            die("seccomp")
+    class CapHdr(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+    class CapData(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                    ("inheritable", ctypes.c_uint32)]
+    hdr, data = CapHdr(0x20080522, 0), (CapData * 2)()
+    capset_nr = {"x86_64": 126, "aarch64": 91}.get(m)
+    if capset_nr is not None and libc.syscall(capset_nr, ctypes.byref(hdr), ctypes.byref(data)) != 0:
+        die("capset")
 else:
     os.chdir(sdir)
     mount("overlay", target, "overlay", 0, spec["opts"])
@@ -2384,7 +2433,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 

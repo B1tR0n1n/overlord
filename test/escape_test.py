@@ -48,6 +48,8 @@ ATTEMPTS = [
     ("pid1", "cat /proc/1/environ | tr '\\0' '\\n'; ls /proc | grep -c '^[0-9]'"),
     ("net", "python3 -c \"import socket; socket.create_connection(('127.0.0.1', 7777), timeout=2)\""),
     ("write-out", "echo escaped > /../escaped; echo escaped > /etc/escaped; echo escaped > /root/escaped"),
+    ("privs", "grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status | tr '\\n' ' '; "
+              "mount -t tmpfs t /mnt 2>&1; unshare -r true 2>&1"),
 ]
 script = [{"text": "probing", "tool_calls": [{"name": "shell", "input": {"command": cmd}}
                                                for _n, cmd in ATTEMPTS]},
@@ -62,7 +64,7 @@ try:
 
     # 1. it was told the truth up front
     sysp = p.systems[0]
-    for needle in ("# Operating conditions", "served as model `scripted` via scripted", "kernel jail", "network: none",
+    for needle in ("# Operating conditions", "served as model `scripted` via scripted", "kernel jail", "no capabilities", "network: none",
                    "provenance is derived", "working for probe"):
         if needle not in sysp:
             fail(f"conditions block lacks {needle!r}")
@@ -89,12 +91,19 @@ try:
         fail("the network was reachable with net=none")
     if results["write-out"][0] == 0:
         fail("a write outside the tree succeeded")
+    pv = results["privs"][1]
+    if "CapEff:\t0000000000000000" not in pv.replace(" ", "\t") and "CapEff: 0000000000000000" not in pv:
+        fail(f"capabilities not dropped: {pv[:200]}")
+    if "NoNewPrivs:\t1" not in pv and "NoNewPrivs: 1" not in pv:
+        fail(f"NoNewPrivs off: {pv[:200]}")
+    if "Seccomp:\t2" not in pv and "Seccomp: 2" not in pv:
+        fail(f"no seccomp filter: {pv[:200]}")
     for name in ("escaped",):
         if os.path.exists(os.path.join(target, name)) or os.path.exists("/etc/escaped") or os.path.exists("/root/escaped"):
             fail("an escaped file appeared on the host")
     if changes:
         fail(f"the probes changed the tree: {changes}")
-    ok("environment, key store, home, pid 1, network, writes outside: every probe failed")
+    ok("environment, key store, home, pid 1, network, writes outside: every probe failed; no caps, NNP, seccomp")
 
     # 3. every probe is on the record
     tr = [json.loads(l) for l in open(ov.session_file(sid, "transcript.jsonl"))]

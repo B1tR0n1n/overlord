@@ -92,6 +92,7 @@ overlord mcp add github --command npx --arg -y --arg @modelcontextprotocol/serve
                  --env GITHUB_TOKEN=…                # register an MCP connector (stdio)
 overlord mcp add docs --url https://host/mcp --header 'Authorization: Bearer …'   # (http)
 overlord agent --connector github -t /srv/app "<task>"   # grant it; actions ask you first
+overlord agent --audit -t /srv/app ["focus"]         # containment audit of its own jail
 overlord memory show -t /srv/app                     # what the agent is told before message one
 overlord memory user --add "Prefers pytest."         # a note about you, across every folder
 overlord memory accept <session> --all               # keep the notes an agent proposed
@@ -659,6 +660,16 @@ Finding A3 (session records reachable via the strace bind) was found by this
 suite and fixed — records are never exposed; strace gets an isolated trace/
 bind only when in use. Every future breach becomes a fix + regression test.
 
+The agent can run the audit itself: `overlord agent --audit` (or `/audit` in
+the workspace chat) presets an *authorized containment audit* as the task.
+A well-aligned model rightly declines "break out of your sandbox"; the same
+probes framed as what they are — sanctioned, scoped to a disposable session,
+with every gap written as a failing red-team check before it is reported —
+are ordinary assigned work, and A11–A15 came out of exactly that. The preset
+needs the jail (there is nothing to audit without one), flags the session
+`audit: true`, and an optional task narrows the focus. A clean audit is a
+result too: the model is told to say so rather than invent a finding.
+
 ## Backends
 
 Two overlay backends, auto-detected, kernel preferred. `overlord doctor` names
@@ -944,4 +955,6 @@ grants are absent.
   train of thought, `incomplete` and `refusal` mapped to the stop reasons the
   agent already checks (chat completions' `length` and `content_filter` now
   map too). `--api` / Settings → Generation → OpenAI API picks the shape per
-  endpoint; compatible servers and Azure keep chat completions.
+  endpoint; compatible servers and Azure keep chat completions. `--audit`
+  / `/audit`: the containment audit as a preset, authorized and scoped so
+  the model takes it as assigned work. The rail footer stacks its controls.

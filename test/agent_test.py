@@ -276,6 +276,34 @@ try:
             fail(f"--no-jail did not warn: {r.stderr[-200:]!r}")
         ok("agent jails by default; --no-jail escapes and says so")
 
+        # --- 9. --audit: the containment audit as a preset, jailed by construction
+        home, tgt = tempfile.mkdtemp(), tempfile.mkdtemp()
+        open(os.path.join(tgt, "f.txt"), "w").write("x\n")
+        spath = os.path.join(home, "s.json")
+        with open(spath, "w") as f:
+            json.dump(esc, f)
+        e = os.environ.copy()
+        e["OVERLORD_HOME"], e["OVERLORD_AGENT_SCRIPT"] = home, spath
+        argv = [sys.executable, os.path.join(HERE, "overlord.py"), "agent", "--provider", "scripted", "-t", tgt]
+        r = subprocess.run(argv + ["--audit", "seccomp only"], env=e, capture_output=True, text=True)
+        if r.returncode != 0 or "containment audit" not in r.stderr or os.path.exists(beacon):
+            fail(f"--audit run: rc={r.returncode} {r.stderr[-300:]!r} beacon={os.path.exists(beacon)}")
+        sids = os.listdir(os.path.join(home, "sessions"))
+        with open(os.path.join(home, "sessions", sids[0], "meta.json")) as f:
+            m = json.load(f)
+        if m.get("audit") is not True or not m["task"].startswith("Authorized containment audit") \
+                or "Focus for this run: seccomp only" not in m["task"] or "FAILING check" not in m["task"]:
+            fail(f"--audit task/meta: audit={m.get('audit')} task={m['task'][:80]!r}")
+        r = subprocess.run(argv + ["--audit", "--no-jail"], env=e, capture_output=True, text=True)
+        if r.returncode == 0 or "nothing to audit" not in r.stderr:
+            fail(f"--audit --no-jail accepted: rc={r.returncode} {r.stderr[-200:]!r}")
+        r = subprocess.run(argv, env=e, capture_output=True, text=True)
+        if r.returncode == 0 or "give the agent a task" not in r.stderr:
+            fail(f"agent without a task accepted: rc={r.returncode} {r.stderr[-200:]!r}")
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(tgt, ignore_errors=True)
+        ok("--audit presets the authorized containment audit; jailed only; a task narrows it")
+
     print("PASS: agent" + (" (jail + net:none)" if kernel else " (no kernel backend: unjailed)"))
 finally:
     subprocess.run(["rm", "-rf", os.environ["OVERLORD_HOME"], target])

@@ -285,6 +285,31 @@ try:
     req(f"/api/session/{sid3}/rollback", {}, "POST")
     ok("streaming deltas precede the final message; per-conversation model recorded")
 
+    # 13. "/audit [focus]" starts the containment-audit preset — the authorized
+    #     framing as the task, flagged on the session, refused without a jail
+    set_script([{"text": "Every claim holds.", "tool_calls": []}])
+    if KERNEL:
+        code, r = req("/api/chats", {"message": "/audit seccomp only", "target": target}, "POST")
+        if code != 200:
+            fail(f"/audit start: {r}")
+        sid4 = r["sid"]
+        events, _ = wait_idle(sid4)
+        m = core.load_meta(sid4)
+        if m.get("audit") is not True or not m["task"].startswith("Authorized containment audit") \
+                or "Focus for this run: seccomp only" not in m["task"]:
+            fail(f"/audit task/meta: {m.get('audit')} {m['task'][:60]!r}")
+        users = [e["text"] for e in events if e["type"] == "user"]
+        notes = [e["text"] for e in events if e["type"] == "note"]
+        if users != ["/audit seccomp only"] or not any("Containment audit" in n for n in notes):
+            fail(f"/audit bubble/note: {users} {notes}")
+        req(f"/api/session/{sid4}/rollback", {}, "POST")
+    chatui.save_settings({"jail": False, "net": "host"})
+    code, r = req("/api/chats", {"message": "/audit", "target": target}, "POST")
+    if code != 400 or "nothing to audit" not in r.get("error", ""):
+        fail(f"/audit without a jail accepted: {code} {r}")
+    chatui.save_settings({"jail": KERNEL, "net": "none" if KERNEL else "host"})
+    ok("/audit presets the containment audit in the workspace; jailed only")
+
     print("PASS: workspace")
 finally:
     if server:

@@ -477,6 +477,15 @@ def start_conversation(message, target=None, provider=None, model=None, connecto
     grants, note = _grants_for(s, backend)
     if connectors:
         grants["connectors"] = connectors
+    # "/audit [focus]" is the containment-audit preset (`overlord agent --audit`):
+    # the same authorized framing, and only ever against a real jail
+    audit = message.strip().split(None, 1)[0].lower() == "/audit"
+    task = message
+    if audit:
+        if not grants.get("jail"):
+            raise core.OverlordError("error: /audit needs the jail (Settings → Jail + offline, kernel "
+                                     "backend); there is nothing to audit without it")
+        task = agent_mod.audit_task(message.strip()[len("/audit"):])
     pend = core.pending_sessions_for(target)
     if pend:
         raise core.OverlordError(
@@ -486,10 +495,15 @@ def start_conversation(message, target=None, provider=None, model=None, connecto
                              agent=f"{provider.name}:{provider.model}", owner=auth.current_user())
     sid = live.sid
     _conv(sid)
+    if audit:
+        live.meta["audit"] = True
+        core.save_meta(sid, live.meta)
+        _emit(sid, {"type": "note", "text": "Containment audit: the agent is asked to check every "
+                    "claim about its jail against reality and write each gap as a failing red-team check."})
     if note:
         _emit(sid, {"type": "note", "text": note})
     _record_user(sid, message)
-    threading.Thread(target=_run, args=(sid, live, provider, message, True,
+    threading.Thread(target=_run, args=(sid, live, provider, task, True,
                                         int(s["max_turns"]), connectors or None),
                      daemon=True).start()
     return sid
@@ -997,7 +1011,7 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="stream" id="stream"></div>
     <div class="composer" id="composer">
       <div class="box">
-        <textarea id="input" rows="1" placeholder="Tell the agent what to do…"></textarea>
+        <textarea id="input" rows="1" placeholder="Tell the agent what to do… (/audit checks its own jail)"></textarea>
         <button class="stopbtn hide" id="stop">Stop</button>
         <button class="send" id="send">Send</button>
       </div>

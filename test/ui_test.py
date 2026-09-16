@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OVERLORD_HOME = tempfile.mkdtemp()
@@ -39,6 +40,11 @@ target = tempfile.mkdtemp()
 with open(os.path.join(target, "f.txt"), "w") as f:
     f.write("v1\n")
 
+# a scripted reviewer for the countersignature endpoint
+REVIEW_SCRIPT = os.path.join(OVERLORD_HOME, "approve.json")
+with open(REVIEW_SCRIPT, "w") as f:
+    json.dump([{"tool_calls": [{"name": "approve", "input": {"reason": "looks right"}}]}], f)
+os.environ["OVERLORD_REVIEW_SCRIPT"] = REVIEW_SCRIPT
 env = os.environ.copy()
 run = subprocess.run(
     [sys.executable, os.path.join(HERE, "overlord.py"), "run", "-t", target,
@@ -202,6 +208,73 @@ try:
     if 'class="n dropped">@0' not in page or "savepoints @0" not in page:
         fail("committed dossier does not show the dropped savepoint")
     ok("savepoints rendered; rewind and drop-on-commit act through the UI")
+
+    # --- blame view: a committed path resolves to its sheet; unknown paths do not ---
+    page = json.loads(req(f"/api/view/session/{sid}"))["dossier"]
+    if f'data-blame="{os.path.join(target, "f.txt")}"' not in page:
+        fail("committed manifest paths are not blame links")
+    sheet = json.loads(req("/api/view/blame?path=" + urllib.parse.quote(
+        os.path.join(target, "f.txt"))))["dossier"]
+    if "06 &mdash; Blame" not in sheet or "[0]" not in sheet or ">v2<" not in sheet or \
+            f'data-select="{sid}"' not in sheet or "own-0" not in sheet:
+        fail(f"blame sheet: {sheet[:600]}")
+    if "No committed session" not in json.loads(req("/api/view/blame?path=/nope"))["dossier"]:
+        fail("blame of an unrecorded path")
+    if json.loads(req("/api/blame?path=" + urllib.parse.quote(
+            os.path.join(target, "f.txt"))))["state"] != "current":
+        fail("blame JSON endpoint")
+    ok("blame view: per-line sheet from a committed path, links back to the session")
+
+    # --- countersignature and fork through the UI ---
+    live = core.open_session(target, None, {"net": "host", "jail": False,
+                                            "timeout": None, "merge_base": False})
+    live.exec(["bash", "-c", "echo one > r1.txt"])
+    live.exec(["bash", "-c", "echo two > r2.txt"])
+    sid4, _ = live.close()
+    page = json.loads(req(f"/api/view/session/{sid4}"))["dossier"]
+    if 'class="stamp">unsigned' not in page or 'data-review="' not in page or \
+            page.count('data-fork="') != 2 or 'id="countersigned"' not in page:
+        fail("pending dossier lacks countersignature / fork controls")
+    try:
+        req(f"/api/session/{sid4}/commit", data='{"countersigned": true}', method="POST")
+        fail("countersigned commit accepted without a review")
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            fail(f"unsigned countersigned commit: expected 400, got {e.code}")
+    res = json.loads(req(f"/api/session/{sid4}/review",
+                         data='{"provider": "scripted", "model": "rev-ui"}', method="POST"))
+    if res["review"]["verdict"] != "approve":
+        fail(f"ui review: {res}")
+    page = json.loads(req(f"/api/view/session/{sid4}"))["dossier"]
+    if 'class="stamp approve">approved' not in page or "looks right" not in page:
+        fail("approval not rendered")
+    forked = json.loads(req(f"/api/session/{sid4}/fork", data='{"at": 0}', method="POST"))["sid"]
+    fpage = json.loads(req(f"/api/view/session/{forked}"))["dossier"]
+    if "Forked from" not in fpage or f'data-select="{sid4}"' not in fpage or "r2.txt" in fpage:
+        fail("fork dossier")
+    page = json.loads(req(f"/api/view/session/{sid4}"))["dossier"]
+    if "Forks" not in page or f'data-select="{forked}"' not in page:
+        fail("origin dossier does not list its fork")
+    res = json.loads(req(f"/api/session/{sid4}/rewind", data='{"to": 0}', method="POST"))
+    page = json.loads(req(f"/api/view/session/{sid4}"))["dossier"]
+    if "stale" not in page:
+        fail("approval not shown stale after rewind")
+    try:
+        req(f"/api/session/{sid4}/commit", data='{"countersigned": true}', method="POST")
+        fail("stale approval satisfied countersigned commit")
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            fail(f"stale countersigned commit: expected 400, got {e.code}")
+    json.loads(req(f"/api/session/{sid4}/review",
+                   data='{"provider": "scripted", "model": "rev-ui"}', method="POST"))
+    res = json.loads(req(f"/api/session/{sid4}/commit", data='{"countersigned": true}', method="POST"))
+    if not res.get("committed") or not os.path.exists(os.path.join(target, "r1.txt")):
+        fail(f"countersigned commit via UI: {res}")
+    page = json.loads(req(f"/api/view/session/{sid4}"))["dossier"]
+    if "Countersigned" not in page or "scripted:rev-ui" not in page:
+        fail("committed dossier does not show the countersignature")
+    json.loads(req(f"/api/session/{forked}/rollback", data="{}", method="POST"))
+    ok("countersignature: request, stale-after-rewind, re-sign, commit; fork lineage rendered")
 
     print("PASS: mission control")
 finally:

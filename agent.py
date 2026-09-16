@@ -180,9 +180,9 @@ class AnthropicProvider:
                     out.append({"role": "user", "content": [block]})
         return out
 
-    def complete(self, system, messages):
+    def complete(self, system, messages, tools=None):
         body = {"model": self.model, "max_tokens": 8192, "system": system,
-                "messages": self._wire(messages), "tools": TOOLS}
+                "messages": self._wire(messages), "tools": tools or TOOLS}
         data = _post(self.url, {"x-api-key": self.key,
                                 "anthropic-version": "2023-06-01"}, body)
         text, calls = "", []
@@ -223,10 +223,10 @@ class OpenAIProvider:
                             "content": m["content"]})
         return out
 
-    def complete(self, system, messages):
+    def complete(self, system, messages, tools=None):
         tools = [{"type": "function",
                   "function": {"name": t["name"], "description": t["description"],
-                               "parameters": t["input_schema"]}} for t in TOOLS]
+                               "parameters": t["input_schema"]}} for t in (tools or TOOLS)]
         body = {"model": self.model, "messages": self._wire(system, messages),
                 "tools": tools}
         data = _post(self.url, {"Authorization": f"Bearer {self.key}"}, body)
@@ -251,7 +251,7 @@ class ScriptedProvider:
     def __init__(self, script):
         self.script, self.i, self.seen = list(script), 0, []
 
-    def complete(self, system, messages):
+    def complete(self, system, messages, tools=None):
         self.seen.append(json.loads(json.dumps(messages)))
         if self.i >= len(self.script):
             return Reply("(script exhausted)", [], "end_turn", {"in": 0, "out": 0})
@@ -263,15 +263,15 @@ class ScriptedProvider:
                      "tool_use" if calls else "end_turn", {"in": 0, "out": 0})
 
 
-def make_provider(provider, model=None, key=None):
+def make_provider(provider, model=None, key=None, script_env="OVERLORD_AGENT_SCRIPT"):
     if provider == "anthropic":
         return AnthropicProvider(model or DEFAULT_MODELS[provider], key or load_key(provider))
     if provider == "openai":
         return OpenAIProvider(model or DEFAULT_MODELS[provider], key or load_key(provider))
     if provider == "scripted":      # tests: OVERLORD_AGENT_SCRIPT=<json file of replies>
-        path = os.environ.get("OVERLORD_AGENT_SCRIPT")
+        path = os.environ.get(script_env)
         if not path:
-            raise ov.OverlordError("error: scripted provider needs OVERLORD_AGENT_SCRIPT")
+            raise ov.OverlordError(f"error: scripted provider needs {script_env}")
         with open(path) as f:
             p = ScriptedProvider(json.load(f))
         p.model = model or "scripted"

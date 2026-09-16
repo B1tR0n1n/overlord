@@ -69,7 +69,11 @@ overlord log <session>           # per-change sha256 before -> after, syscall co
 overlord savepoints <session>    # the layer stack: one savepoint per command that wrote
 overlord rewind <session> --to 3 # discard everything above savepoint @3
 overlord resume <session> --note "..."   # agent carries on from there, reading the note
+overlord fork <session> --at 3   # a second continuation of the same moment, as a new session
+overlord compare <sess-a> <sess-b>   # where two continuations diverge, per path
+overlord review <session> --provider openai   # a second model countersigns the diff
 overlord commit <session>        # verify no external drift, replay onto real tree
+overlord commit --countersigned <sess>       # ...only with a fresh approval on record
 overlord commit --drop tool:shell <sess>     # replay all but the shell tool's layers
 overlord commit --only turn:2-4 <sess>       # replay only what turns 2–4 did
 overlord commit --merge <sess>   # three-way merge non-overlapping drift (needs --merge-base)
@@ -147,11 +151,39 @@ overlord blame src/lib.py              # per line: session · turn · tool call 
   first produced it — `origin` for lines older than the record, `drift` for
   lines changed outside OVERLORD since the last commit.
 
+- **Fork a moment.** `fork <session> --at N` copies the stack up to a
+  savepoint into a new pending session on the same snapshot, transcript cut
+  to match, whiteouts and all. Resume both with different notes and
+  `compare a b` shows, per path, where the two continuations diverge before
+  either is committed. Committing one makes the other's snapshot stale, and
+  conflict detection says so.
+
 Layers are addressed relative to the session dir (the mount data page is
 4 KiB) and capped at 200 per session; past the cap the top layer keeps
 absorbing writes. On the fuse backend the merged view is remounted between
 commands; a lingering process that pins it makes the next savepoint coarser
 rather than failing. Rewind is refused while a command is running.
+
+## Countersignature: a two-person rule for machines
+
+```bash
+overlord review <session> --provider openai      # the agent ran on anthropic
+overlord commit --countersigned <session>
+```
+
+A pending diff is put in front of a second model that had no part in making
+it. The reviewer never touches the tree: it gets the task, the grant
+envelope, the agent's tool-call transcript and the full diff, plus one
+read-only tool (`read_file`, served from the session's own flattened view),
+and its only way to act is `approve` or `reject` with a reason. The verdict
+is bound to a fingerprint of exactly what was reviewed — every path's kind
+and before/after hash — so a rewind, a resume or a `--drop` makes it stale.
+A fresh rejection blocks `commit` unless `--force`; `--countersigned` refuses
+without a fresh approval; a policy rule `"require_review": true` makes the
+daemon demand it for a target. The reviewer must be a different model from
+the agent (`--same-model` overrides, and the record says so). The review has
+provenance of its own: `review.jsonl` is the reviewer's transcript, and every
+verdict ever given stays in the session record.
 
 ## Mission control (web UI)
 
@@ -159,14 +191,16 @@ rather than failing. Rewind is refused while a command is running.
 overlord ui          # http://127.0.0.1:7777 — localhost only
 ```
 
-![OVERLORD mission control — a pending agent session's savepoint chain: one row per tool call that wrote, each with its paths, a keep checkbox that drops it from the commit when unticked, and a rewind-here control; the disposition below commits or voids](assets/ui.png)
+![OVERLORD mission control — a pending agent session's savepoint chain: one row per tool call that wrote, each with its paths, a keep checkbox that drops it from the commit when unticked, rewind-here and fork-here controls; below it the countersignature block (unsigned, with a request control) and the disposition; the sidebar carries the blame lookup](assets/ui.png)
 
 The review moment for human eyes, rendered as a document of record rather than
 a dashboard. The register indexes sessions; the dossier is the instrument a
 human signs: the grant envelope the session ran under, a manifest of every
 changed path with its before → after hashes and the tool call that caused it,
-the savepoint chain (rewind to any row; untick a row and the commit drops it),
-and the disposition — commit or void. Zero dependencies (stdlib http server),
+the savepoint chain (rewind or fork at any row; untick a row and the commit
+drops it), the countersignature (request one, see whether it still binds),
+and the disposition — commit or void. Any committed path opens its blame
+sheet: every line, and the session, turn, tool call and task that put it there. Zero dependencies (stdlib http server),
 server-rendered first paint, binds 127.0.0.1 only.
 
 ## Resident mode: daemon, policy, SDK
@@ -232,12 +266,14 @@ bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
 python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions
-python3 test/ui_test.py           # 10 mission-control API + origin-guard + savepoint assertions
-python3 test/ui_browser_test.py   # 9 mission-control DOM assertions (needs playwright)
+python3 test/review_fork_test.py  # 6 countersignature / fork / compare / policy assertions
+python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
+python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
 ```
 
-`savepoint_test.py` runs on whichever backend is live; `OVERLORD_TEST_BACKEND=fuse`
-forces the cooperative one, so both stacking implementations are exercised.
+`savepoint_test.py` and `review_fork_test.py` run on whichever backend is
+live; `OVERLORD_TEST_BACKEND=fuse` forces the cooperative one, so both
+stacking implementations are exercised.
 
 `ui_test.py` drives the HTTP API; `ui_browser_test.py` loads the page in
 Chromium and asserts on the rendered DOM — console errors, the dossier
@@ -260,9 +296,9 @@ grants are absent.
 - token/cost budget grants for LLM-backed agents
 - eBPF recorder hardening (attach-race close, structured output)
 - multi-target sessions; cross-target atomic commit
-- forks: resume a rewound session as a new session so branches from one
-  savepoint can be compared before either is committed
-- blame across renames; a `blame` view in mission control
+- blame across renames
+- countersignature by a human-in-the-loop channel (a signed approval from
+  outside the machine, same fingerprint binding)
 
 ## Status
 
@@ -307,5 +343,13 @@ grants are absent.
   Mission control renders the chain with rewind-here and keep/drop controls;
   daemon ops and SDK methods for all of it. Also fixed: `log` printed its
   records twice; on the fuse backend a brand-new directory read as
-  `replaced-dir` and its marker files could reach the tree on commit. 92
-  assertions across seven suites, both backends.
+  `replaced-dir` and its marker files could reach the tree on commit.
+- 2026-09-16 — v0.7: the two-person rule, forks, blame in the UI. `review`
+  puts a pending diff before a second model (read-only `read_file`, verdict
+  bound to a fingerprint of the diff; a fresh rejection blocks commit,
+  `commit --countersigned` and policy `require_review` demand a fresh
+  approval; reviewer must differ from the agent). `fork --at N` copies a
+  stack to a savepoint as a new pending session and `compare` shows where
+  two continuations diverge. Mission control gets the countersignature
+  block, fork-here, and a per-line blame sheet reachable from any committed
+  path. 101 assertions across eight suites, both backends.

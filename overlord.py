@@ -9,7 +9,10 @@
     overlord savepoints <session>
     overlord rewind <session> --to <savepoint>
     overlord resume <session> [--note "..."] | [-- <cmd>]
-    overlord commit <session> [--merge] [--force] [--only SEL] [--drop SEL]
+    overlord fork <session> [--at <savepoint>]
+    overlord compare <session-a> <session-b>
+    overlord review <session> [--provider ...] [--model M]
+    overlord commit <session> [--merge] [--force] [--only SEL] [--drop SEL] [--countersigned]
     overlord rollback <session>
     overlord blame <path> [--json]
     overlord doctor
@@ -34,6 +37,12 @@ nothing is copied. That makes three things possible:
              tool:NAME, call:ID); undo a decision, not a path.
     blame    committed provenance plus retained content answer, per line,
              which session, turn, tool call and instruction put it there.
+    fork     copy the stack up to a savepoint into a new pending session, so
+             two continuations of one moment can be compared before either
+             is committed (compare).
+    review   a second model countersigns the diff (review.py); a fresh
+             rejection blocks commit, --countersigned demands a fresh
+             approval, and policy can require it per target.
 
 Grants (the capability manifest, via flags or --manifest file):
     --jail          pivot_root jail: the process sees system dirs + the target
@@ -1528,6 +1537,97 @@ def rewind_session(sid, to):
     return _write_provenance(sid, m)
 
 
+def _copy_tree(src, dst):
+    """cp -a --reflink=auto: keeps whiteouts (0:0 char devices; unprivileged
+    since Linux 5.8) and the overlay xattrs a layer depends on."""
+    r = subprocess.run(["cp", "-a", "--reflink=auto", src, dst], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise OverlordError(f"error: could not copy {src}: {r.stderr.strip()}")
+
+
+def fork_session(sid, at=None):
+    """Copy a pending session's stack up to savepoint `at` (default: the top)
+    into a new pending session on the same target and snapshot, transcript
+    cut to match. Two continuations of one moment can then be compared
+    (compare_sessions) before either is committed; committing one makes the
+    other's snapshot stale, which conflict detection reports as usual.
+    Returns the new session id."""
+    m = load_meta(sid)
+    if m.get("status") != "pending":
+        raise OverlordError(f"error: session is {m.get('status')}, not pending")
+    src = session_path(sid)
+    if not os.path.isdir(os.path.join(src, "upper")):
+        raise OverlordError("error: session layers are gone; nothing to fork")
+    layers = m.get("layers") or [{"n": 0}]
+    at = len(layers) - 1 if at is None else at
+    if not isinstance(at, int) or not 0 <= at < len(layers):
+        raise OverlordError(f"error: no savepoint {at} (session has 0..{len(layers) - 1})")
+    new = new_session_id()
+    while os.path.exists(session_path(new)):
+        new = new_session_id()
+    dst = session_path(new)
+    os.makedirs(dst)
+    try:
+        for name in ("upper", "work", "base", "tmp", MANIFEST_FILE, "transcript.jsonl"):
+            p = os.path.join(src, name)
+            if os.path.lexists(p):
+                _copy_tree(p, os.path.join(dst, name))
+        if at > 0:
+            os.makedirs(os.path.join(dst, LAYERS_DIR))
+            for i in range(1, at + 1):
+                _copy_tree(os.path.join(src, LAYERS_DIR, str(i)),
+                           os.path.join(dst, LAYERS_DIR, str(i)))
+        os.makedirs(os.path.join(dst, "merged"), exist_ok=True)
+        fm = json.loads(json.dumps(m))
+        fm.update(id=new, status="pending", started=_now(), trace=None,
+                  forked_from={"session": sid, "at": at, "ts": _now()},
+                  layers=json.loads(json.dumps(layers)))
+        for k in ("holder_pid", "reviews", "rewinds", "resumed", "exit_code", "finished",
+                  "timed_out", "layer_cap_hit", "layer_reuse", "forks"):
+            fm.pop(k, None)
+        fm["execs"] = [e for e in (m.get("execs") or []) if e.get("layer", 0) <= at]
+        save_meta(new, fm)
+        if at < len(layers) - 1:
+            # same cut as a rewind, applied to the copy: layers above `at`
+            # were never copied, so only the record and transcript need it
+            _rewind_layers(new, fm, at)
+            fm.pop("rewinds", None)
+            save_meta(new, fm)
+        _write_provenance(new, fm)
+    except BaseException:
+        _force_rmtree(dst)
+        raise
+    m.setdefault("forks", []).append({"session": new, "at": at, "ts": _now()})
+    save_meta(sid, m)
+    return new
+
+
+def compare_sessions(a, b):
+    """Where two stacks over the same target diverge: per path, 'same',
+    'differ', 'only-a' or 'only-b', by kind and after-hash."""
+    ma, mb = load_meta(a), load_meta(b)
+    if ma.get("target") != mb.get("target"):
+        raise OverlordError("error: sessions have different targets")
+
+    def view(sid, m):
+        changes, origin, _t, uppers = session_stack(sid, m)
+        if not uppers:
+            raise OverlordError(f"error: session {sid} is {m.get('status')}; layers discarded")
+        recs = build_provenance(changes, None, m["target"], origin, uppers)
+        return {r["path"]: (r["kind"], r.get("after_sha256")) for r in recs}
+    va, vb = view(a, ma), view(b, mb)
+    rows = []
+    for rel in sorted(set(va) | set(vb)):
+        if rel in va and rel in vb:
+            rows.append({"path": rel, "state": "same" if va[rel] == vb[rel] else "differ",
+                         "a": va[rel][0], "b": vb[rel][0]})
+        elif rel in va:
+            rows.append({"path": rel, "state": "only-a", "a": va[rel][0], "b": None})
+        else:
+            rows.append({"path": rel, "state": "only-b", "a": None, "b": vb[rel][0]})
+    return rows
+
+
 def session_savepoints(sid, meta=None):
     """One entry per layer: what ran, what it was for, what it changed."""
     meta = meta or load_meta(sid)
@@ -1688,6 +1788,12 @@ def _session_row(sid, m):
         what = f"{len(execs)} commands, first: {what}"
     if m.get("agent"):
         what = f"agent {m['agent']} — {what}"
+    if m.get("forked_from"):
+        what = f"fork of {m['forked_from']['session']}@{m['forked_from']['at']} — {what}"
+    rev = (m.get("reviews") or [None])[-1]
+    if rev:
+        verdict = {"approve": "approved", "reject": "rejected"}.get(rev.get("verdict"), "no-verdict")
+        tags += f" [{verdict}]"
     return (f"{sid}  {m.get('status', '?'):9s} exit={m.get('exit_code', '-')}{tags}  "
             f"{m.get('target', '')}  :: {what}")
 
@@ -1746,7 +1852,8 @@ def cmd_log(args):
     return 0
 
 
-def commit_session(sid, merge=False, force=False, only=None, drop=None):
+def commit_session(sid, merge=False, force=False, only=None, drop=None,
+                   countersigned=False):
     """Core commit. Returns a result dict; never prints.
 
     only/drop select layers (see select_layers): the replay applies just
@@ -1763,6 +1870,20 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None):
     all_layers = list(range(len(m.get("layers") or [{"n": 0}])))
     selected = select_layers(m, only, drop) if (only or drop) else all_layers
     changes, origin, touched, uppers = session_stack(sid, m, selected)
+    # countersignature: a verdict binds to a fingerprint of exactly what would
+    # be replayed; a fresh rejection stands unless forced, and --countersigned
+    # (or policy) demands a fresh approval
+    import review as review_mod
+    rev, fresh = review_mod.review_state(sid, m, selected if (only or drop) else None)
+    if countersigned and not (rev and fresh and rev.get("verdict") == "approve"):
+        why = ("no review recorded" if rev is None else
+               "the last review is stale — the diff changed since it was signed" if not fresh
+               else f"the last review {rev.get('verdict')}ed")
+        raise OverlordError(f"error: commit needs a fresh countersignature ({why}): "
+                            f"overlord review {sid}")
+    if rev and fresh and rev.get("verdict") == "reject" and not force:
+        return {"committed": False, "conflicts": [], "merged": [], "target": m["target"],
+                "layers": selected, "rejected": rev}
     bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
     if bad:  # would _remove_target(<tree root>); no --force for this one
         raise OverlordError("error: refusing to commit — whiteout entry names its own "
@@ -1794,7 +1915,9 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None):
     dropped = [i for i in all_layers if i not in selected]
     m.update(status="committed", committed=_now(), committed_ns=time.time_ns(),
              forced=bool(conflicts), merged_paths=merged,
-             layers_applied=selected, layers_dropped=dropped)
+             layers_applied=selected, layers_dropped=dropped,
+             countersigned=bool(rev and fresh and rev.get("verdict") == "approve"),
+             overrode_rejection=bool(rev and fresh and rev.get("verdict") == "reject"))
     save_meta(sid, m)
     with open(os.path.join(sdir, PROVENANCE_FILE)) as f:
         records = [json.loads(line) for line in f]
@@ -1833,7 +1956,13 @@ def rollback_session(sid):
 
 def cmd_commit(args):
     res = commit_session(args.session, merge=args.merge, force=args.force,
-                         only=args.only, drop=args.drop)
+                         only=args.only, drop=args.drop, countersigned=args.countersigned)
+    if not res["committed"] and res.get("rejected"):
+        r = res["rejected"]
+        print(f"error: refusing to commit — rejected by {r.get('reviewer')}: {r.get('reason')}",
+              file=sys.stderr)
+        print(f"override with: overlord commit --force {args.session}", file=sys.stderr)
+        return 1
     if not res["committed"]:
         print("error: target drifted since snapshot — refusing to commit:", file=sys.stderr)
         for reason, rel in res["conflicts"]:
@@ -1847,6 +1976,11 @@ def cmd_commit(args):
     if res.get("dropped"):
         msg += (f" — layers {', '.join(map(str, res['layers']))} applied, "
                 f"{', '.join(map(str, res['dropped']))} dropped")
+    m = load_meta(args.session)
+    if m.get("countersigned"):
+        msg += " (countersigned)"
+    elif m.get("overrode_rejection"):
+        msg += " (forced past a rejection)"
     print(msg)
     return 0
 
@@ -1892,6 +2026,25 @@ def cmd_rewind(args):
     for kind, rel in changes[:20]:
         print(f"  {kind:12s} {rel}")
     print(f"\n  resume:   overlord resume {args.session} [--note \"...\"]")
+    return 0
+
+
+def cmd_fork(args):
+    new = fork_session(args.session, args.at)
+    m = load_meta(new)
+    print(f"forked {args.session} at savepoint @{m['forked_from']['at']} -> {new}")
+    print(f"\n  continue:  overlord resume {new} [--note \"...\"]")
+    print(f"  compare:   overlord compare {args.session} {new}")
+    return 0
+
+
+def cmd_compare(args):
+    rows = compare_sessions(args.a, args.b)
+    if not rows:
+        print("neither session changed anything")
+        return 0
+    for r in rows:
+        print(f"{r['state']:8s} {r['path']:40s} a={r['a'] or '-':12s} b={r['b'] or '-'}")
     return 0
 
 
@@ -2115,7 +2268,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2184,13 +2337,30 @@ def _api_run(req):
 def _api_commit(req):
     m = load_meta(req["sid"])
     policy = load_policy()
-    if policy is not None and req.get("force"):
+    countersigned = bool(req.get("countersigned"))
+    if policy is not None:
         rule = _policy_rule(policy, m["target"]) or {}
-        if not rule.get("allow_force", False):
+        if req.get("force") and not rule.get("allow_force", False):
             raise OverlordError("error: policy forbids --force commits on this target")
+        if rule.get("require_review"):
+            countersigned = True     # policy: no commit without a fresh approval
     return commit_session(req["sid"], merge=bool(req.get("merge")),
                           force=bool(req.get("force")),
-                          only=req.get("only"), drop=req.get("drop"))
+                          only=req.get("only"), drop=req.get("drop"),
+                          countersigned=countersigned)
+
+
+def _api_review(req, emit):
+    """Streaming op: a second model countersigns a pending session."""
+    import agent as agent_mod
+    import review as review_mod
+    provider = agent_mod.make_provider(req.get("provider", "anthropic"), req.get("model"),
+                                       script_env=review_mod.SCRIPT_ENV)
+    rec = review_mod.run_review(
+        req["sid"], provider, max_turns=int(req.get("max_turns") or review_mod.DEFAULT_MAX_TURNS),
+        emit=lambda ev: emit({"ok": True, "event": "review", **ev}),
+        allow_same=bool(req.get("same_model")))
+    return {"sid": req["sid"], "review": rec}
 
 
 def _api_rewind(req):
@@ -2382,8 +2552,12 @@ DAEMON_OPS = {
     "savepoints": _api_savepoints,
     "rewind": _api_rewind,
     "blame": lambda req: blame_path(req["path"]),
+    "fork": lambda req: {"sid": fork_session(req["sid"], req.get("at")),
+                         "forked_from": req["sid"]},
+    "compare": lambda req: {"rows": compare_sessions(req["a"], req["b"])},
 }
-STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent, "resume": _api_resume}
+STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent, "resume": _api_resume,
+                 "review": _api_review}
 
 
 def cmd_daemon(args):
@@ -2510,7 +2684,23 @@ def main(argv=None):
                          "tool:NAME, call:ID (comma-separated)")
     pc.add_argument("--drop", metavar="SEL",
                     help="replay everything except these layers (same selectors)")
+    pc.add_argument("--countersigned", action="store_true",
+                    help="refuse unless a second model's fresh approval is on record "
+                         "(overlord review)")
     pc.set_defaults(fn=cmd_commit)
+
+    pf = sub.add_parser("fork", help="copy the stack up to a savepoint into a new session")
+    pf.add_argument("session")
+    pf.add_argument("--at", type=int, metavar="N", help="savepoint to fork at (default: top)")
+    pf.set_defaults(fn=cmd_fork)
+
+    pcmp = sub.add_parser("compare", help="where two sessions' stacks diverge, per path")
+    pcmp.add_argument("a")
+    pcmp.add_argument("b")
+    pcmp.set_defaults(fn=cmd_compare)
+
+    import review as review_mod
+    review_mod.add_review_parser(sub)
 
     psv = sub.add_parser("savepoints", help="the layer stack: one savepoint per writing command")
     psv.add_argument("session")

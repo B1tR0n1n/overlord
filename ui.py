@@ -176,6 +176,47 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .sp-note{font-family:var(--serif);font-size:15px;font-style:italic;color:var(--text-dim);
   margin-top:14px}
 
+.sp .btn-quiet+.btn-quiet{margin-left:6px}
+
+/* ---- countersignature ---------------------------------------------- */
+.sig{border:1px solid var(--border-lt);background:var(--bg3);padding:14px 16px;margin-bottom:18px}
+.sig .sig-l{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:8px}
+.sig .reason{font-family:var(--serif);font-size:15px;color:var(--text);margin-top:8px}
+.sig .who{font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-top:6px}
+.stamp.approve{color:var(--green)}
+.stamp.reject{color:var(--red)}
+.stamp.stale{color:var(--text-dim);text-decoration:line-through}
+.sig .req{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.sig select,.sig input[type=text]{background:var(--bg2);color:var(--text);border:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;padding:7px 9px}
+
+/* ---- blame: who put this line here --------------------------------- */
+.blame-wrap{padding:20px 18px;border-top:1px solid var(--border)}
+.blame-wrap input{width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;padding:9px 11px;margin-top:8px}
+.blame-wrap input:focus{outline:none;border-color:var(--accent-dim)}
+.linkish{background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;
+  text-decoration:underline dotted var(--accent-dim);text-underline-offset:3px}
+.linkish:hover{color:var(--accent)}
+.legend{display:grid;gap:1px;background:var(--border);border:1px solid var(--border);margin-bottom:18px}
+.legend .v{background:var(--bg2);padding:11px 14px;font-size:12px}
+.legend .v .k{font-family:var(--mono);font-size:10px;letter-spacing:2px;color:var(--accent);
+  margin-right:8px}
+.legend .v .task{font-family:var(--serif);font-size:15px;color:var(--text-bright);margin-top:4px}
+.legend .v .said{font-family:var(--serif);font-style:italic;color:var(--text-dim);margin-top:4px}
+.legend .v .cause{margin-top:4px}
+.bl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+.bl td{padding:2px 10px 2px 0;border-bottom:1px solid var(--border);white-space:pre;vertical-align:top}
+.bl td.ln{color:var(--text-dim);text-align:right;width:44px;user-select:none}
+.bl td.own{width:150px;letter-spacing:1px}
+.bl td.code{color:var(--text-bright);overflow-x:auto;max-width:0}
+.own-origin{color:var(--text-dim)}
+.own-drift{color:var(--red)}
+.own-0{color:var(--accent)}.own-1{color:var(--green)}.own-2{color:#8ab4f8}
+.own-3{color:#d7a6ff}.own-4{color:#f5a97f}.own-5{color:#7fd8d8}
+.bl tr:hover td{background:var(--accent-glow)}
+
 /* ---- 04 disposition ------------------------------------------------ */
 .disposition{border:1px solid var(--border-lt);background:var(--bg2);padding:22px 24px}
 .disp-note{font-family:var(--serif);font-size:17px;color:var(--text-dim);
@@ -278,6 +319,12 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="rule tight"></div>
     </div>
     <div class="reg-scroll" id="list">__REGISTER__</div>
+    <div class="blame-wrap">
+      <div class="sec-label">06 &mdash; Blame</div>
+      <div class="rule head"></div>
+      <label for="blamepath" class="fact-k">who put each line here &mdash; path</label>
+      <input id="blamepath" type="text" spellcheck="false" placeholder="/srv/app/src/lib.py">
+    </div>
     <div class="policy-wrap">
       <div class="sec-label">05 &mdash; Policy</div>
       <div class="rule head"></div>
@@ -319,12 +366,14 @@ async function commit(sid) {
   const body = JSON.stringify({
     merge: !!($('merge') || {}).checked,
     force: !!($('force') || {}).checked,
+    countersigned: !!($('countersigned') || {}).checked,
     drop: drop || null,
   });
   const r = await j('/api/session/' + encodeURIComponent(sid) + '/commit',
                     { method: 'POST', body });
   if (r.committed) return select(sid);
   const box = $('conflicts');
+  if (r.rejected) { alertBox('rejected by ' + r.rejected.reviewer + ': ' + r.rejected.reason); return; }
   if (r.conflicts_html) { box.innerHTML = r.conflicts_html; return; }
   box.innerHTML = '<div class="refusal"><b>Refused</b><span class="why"></span></div>';
   box.querySelector('.why').textContent = r.error || 'unknown error';
@@ -341,6 +390,36 @@ async function rollback(sid) {
     '<div class="empty">The overlay was discarded. The target is byte-identical.</div>' +
     '</section></div>';
   loadList();
+}
+
+async function blame(path) {
+  const d = await j('/api/view/blame?path=' + encodeURIComponent(path));
+  $('detail').innerHTML = d.dossier;
+}
+
+async function fork(sid, at) {
+  const r = await j('/api/session/' + encodeURIComponent(sid) + '/fork',
+                    { method: 'POST', body: JSON.stringify({ at: Number(at) }) });
+  if (r.error) { alertBox(r.error); return; }
+  return select(r.sid);
+}
+
+async function review(sid) {
+  const provider = ($('rev-provider') || {}).value || 'anthropic';
+  const model = ($('rev-model') || {}).value || null;
+  const box = $('sig-status');
+  if (box) box.textContent = 'reviewing…';
+  const r = await j('/api/session/' + encodeURIComponent(sid) + '/review',
+                    { method: 'POST', body: JSON.stringify({ provider, model }) });
+  if (r.error) { if (box) box.textContent = 'refused: ' + r.error; return; }
+  return select(sid);
+}
+
+function alertBox(text) {
+  const box = $('conflicts');
+  if (!box) return;
+  box.innerHTML = '<div class="refusal"><b>Refused</b><span class="why"></span></div>';
+  box.querySelector('.why').textContent = text;
 }
 
 async function rewind(sid, to) {
@@ -367,6 +446,7 @@ async function savePolicy() {
 
 // keyboard: the register is operable without a mouse
 document.addEventListener('keydown', e => {
+  if (e.target.id === 'blamepath' && e.key === 'Enter') return blame(e.target.value);
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (!['j', 'k', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
   const items = [...document.querySelectorAll('.reg-item')];
@@ -379,9 +459,13 @@ document.addEventListener('keydown', e => {
 
 // Delegation: no inline handlers anywhere, so the CSP can forbid them outright.
 document.addEventListener('click', e => {
-  const b = e.target.closest('[data-select],[data-commit],[data-void],[data-rewind],#seal');
+  const b = e.target.closest('[data-select],[data-commit],[data-void],[data-rewind],'
+                             + '[data-fork],[data-review],[data-blame],#seal');
   if (!b) return;
   if (b.id === 'seal') return savePolicy();
+  if (b.dataset.blame !== undefined) return blame(b.dataset.blame);
+  if (b.dataset.fork !== undefined) return fork(b.dataset.sid, b.dataset.fork);
+  if (b.dataset.review !== undefined) return review(b.dataset.review);
   if (b.dataset.select !== undefined) return select(b.dataset.select);
   if (b.dataset.commit !== undefined) return commit(b.dataset.commit);
   if (b.dataset.void !== undefined) return rollback(b.dataset.void);
@@ -482,6 +566,7 @@ def _render_dossier(payload):
         f'<div class="fact-v ts">{_esc(m.get("started"))}</div></div>',
         f'<div class="fact"><div class="fact-k">Closed</div>'
         f'<div class="fact-v ts">{_esc(m.get("finished")) or "&hellip;"}</div></div>',
+        _lineage_facts(m),
         '</div>',
         f'<div class="grants"><span class="grants-l">Grants</span>{grants_html}</div>',
         '</section>',
@@ -506,11 +591,15 @@ def _render_dossier(payload):
                          f'turn <b>{_esc(c.get("turn"))}</b> &middot; '
                          f'<b>{_esc(c.get("tool"))}</b>{summary} '
                          f'<span class="cid">{_esc(c.get("tool_call_id"))}</span></div>')
+            shown = _esc(p)
+            if m.get("status") == "committed" and not p.endswith("/") and k != "deleted":
+                full = os.path.join(m.get("target") or "", p)
+                shown = f'<button type="button" class="linkish" data-blame="{_esc(full)}">{_esc(p)}</button>'
             rows.append(
                 f'<tr class="k-{_esc(k)}">'
                 f'<td class="mk k-{_esc(k)}"><span class="g">{GLYPH.get(k, "&middot;")}</span>'
                 f'{_esc(k)}</td>'
-                f'<td><div class="mpath">{_esc(p)}</div>{cause}</td>'
+                f'<td><div class="mpath">{shown}</div>{cause}</td>'
                 f'<td class="hash">{hb}<span class="to">&rarr;</span>{ha}</td></tr>')
         h.append('<table class="manifest"><thead><tr>'
                  '<th class="c-kind">Disposition</th>'
@@ -528,6 +617,7 @@ def _render_dossier(payload):
             '<section class="sec"><div class="sec-label">04 &mdash; Disposition</div>'
             '<h2 class="sec-title">Nothing has touched the tree yet</h2>'
             '<div class="rule"></div><div class="disposition">'
+            + _render_signature(m, payload.get("review")) +
             '<p class="disp-note">Committing replays this manifest onto the real tree, '
             'after verifying it has not drifted since the snapshot. Voiding discards the '
             'overlay and leaves the target byte-identical. Savepoints unticked above are '
@@ -535,8 +625,9 @@ def _render_dossier(payload):
             f'<button class="btn btn-commit" data-commit="{_esc(m["id"])}">Commit</button>'
             f'<button class="btn btn-void" data-void="{_esc(m["id"])}">Void</button>'
             '<label class="opt"><input type="checkbox" id="merge"> merge</label>'
-            '<label class="opt"><input type="checkbox" id="force"> force</label></div>'
-            '<div id="conflicts"></div></div></section>')
+            '<label class="opt"><input type="checkbox" id="force"> force</label>'
+            '<label class="opt"><input type="checkbox" id="countersigned"> countersigned</label>'
+            '</div><div id="conflicts"></div></div></section>')
     elif m.get("status") == "committed":
         merged = len(m.get("merged_paths") or [])
         cells = (f'<div class="fact"><div class="fact-k">Committed</div>'
@@ -550,6 +641,14 @@ def _render_dossier(payload):
         if m.get("layers_dropped"):
             cells += ('<div class="fact"><div class="fact-k">Dropped</div><div class="fact-v">'
                       f'savepoints {_esc(", ".join("@%s" % n for n in m["layers_dropped"]))}'
+                      '</div></div>')
+        rev = (m.get("reviews") or [None])[-1]
+        if m.get("countersigned") and rev:
+            cells += ('<div class="fact"><div class="fact-k">Countersigned</div>'
+                      f'<div class="fact-v">{_esc(rev.get("reviewer"))}</div></div>')
+        elif m.get("overrode_rejection") and rev:
+            cells += ('<div class="fact"><div class="fact-k">Override</div>'
+                      f'<div class="fact-v">forced past {_esc(rev.get("reviewer"))}\'s rejection'
                       '</div></div>')
         h.append('<section class="sec"><div class="sec-label">04 &mdash; Disposition</div>'
                  '<h2 class="sec-title">Sealed &mdash; replayed onto the tree</h2>'
@@ -590,6 +689,8 @@ def _render_savepoints(m, savepoints):
             if sp["n"] < n - 1:
                 ctl += (f'<button class="btn btn-quiet" data-rewind="{sp["n"]}" '
                         f'data-sid="{_esc(m["id"])}">Rewind here</button>')
+            ctl += (f'<button class="btn btn-quiet" data-fork="{sp["n"]}" '
+                    f'data-sid="{_esc(m["id"])}">Fork here</button>')
         cls = "n dropped" if sp["n"] in dropped else "n"
         h.append(f'<tr><td class="{cls}">@{sp["n"]}</td>'
                  f'<td class="what">{what}<div class="paths">{paths}</div></td>'
@@ -603,6 +704,102 @@ def _render_savepoints(m, savepoints):
         h.append('<p class="sp-note">Rewinding discards every savepoint above the chosen one; '
                  'an agent session\'s transcript is cut to match, so '
                  '<code>overlord resume</code> continues the model from there.</p>')
+    h.append('</section>')
+    return "".join(h)
+
+
+def _lineage_facts(m):
+    out = ""
+    if m.get("forked_from"):
+        f = m["forked_from"]
+        out += ('<div class="fact"><div class="fact-k">Forked from</div><div class="fact-v">'
+                f'<button type="button" class="linkish" data-select="{_esc(f["session"])}">'
+                f'{_esc(f["session"])}</button> @{_esc(f["at"])}</div></div>')
+    if m.get("forks"):
+        links = " ".join(
+            f'<button type="button" class="linkish" data-select="{_esc(f["session"])}">'
+            f'{_esc(f["session"])}</button> @{_esc(f["at"])}' for f in m["forks"])
+        out += f'<div class="fact"><div class="fact-k">Forks</div><div class="fact-v">{links}</div></div>'
+    return out
+
+
+def _render_signature(m, review):
+    """The countersignature block inside a pending disposition: the latest
+    verdict, whether it still binds to this diff, and the means to ask."""
+    h = ['<div class="sig"><div class="sig-l">Countersignature</div>']
+    rev = (review or {}).get("record")
+    if rev:
+        fresh = (review or {}).get("fresh")
+        verdict = rev.get("verdict")
+        cls = verdict if verdict in ("approve", "reject") else ""
+        label = {"approve": "approved", "reject": "rejected"}.get(verdict, "no verdict")
+        h.append(f'<span class="stamp {cls}{"" if fresh else " stale"}">{label}</span>')
+        if not fresh:
+            h.append('<span class="stamp">stale &mdash; diff changed since</span>')
+        if rev.get("same_model"):
+            h.append('<span class="stamp alarm">same model as agent</span>')
+        if rev.get("reason"):
+            h.append(f'<div class="reason">{_esc(rev["reason"])}</div>')
+        h.append(f'<div class="who">{_esc(rev.get("reviewer"))} &middot; {_esc(rev.get("ts"))}</div>')
+    else:
+        h.append('<span class="stamp">unsigned</span>')
+    h.append('<div class="req">'
+             '<select id="rev-provider"><option value="anthropic">anthropic</option>'
+             '<option value="openai">openai</option></select>'
+             '<input type="text" id="rev-model" placeholder="model (default)">'
+             f'<button class="btn btn-quiet" data-review="{_esc(m["id"])}">Request countersignature</button>'
+             '<span id="sig-status" class="polmsg"></span></div></div>')
+    return "".join(h)
+
+
+def _render_blame(res):
+    """A blame sheet: the recorded versions of a file and who owns each line."""
+    h = ['<section class="sec"><div class="sec-label">06 &mdash; Blame</div>',
+         f'<h1 class="sec-title">{_esc(os.path.basename(res["path"]))}</h1>',
+         '<div class="rule"></div>',
+         f'<div class="cmdline">{_esc(res["path"])}</div>']
+    vs = res.get("versions") or []
+    if not vs:
+        h.append('<div class="empty" style="margin-top:18px">No committed session recorded this path.</div>')
+        h.append('</section>')
+        return "".join(h)
+    state = {"current": "content matches the last commit",
+             "drifted": "content changed outside OVERLORD since the last commit",
+             "deleted": "deleted by the last commit",
+             "recreated-outside": "deleted by the last commit, recreated outside"}.get(
+                 res.get("state"), res.get("state"))
+    h.append(f'<p class="disp-note" style="margin-top:18px">{len(vs)} recorded version(s) &mdash; '
+             f'{_esc(state)}</p>')
+    h.append('<div class="legend">')
+    for i, v in enumerate(vs):
+        c = v.get("cause") or {}
+        cause = ""
+        if c:
+            cause = (f'<div class="cause"><span class="arrow">&#8627;</span>turn <b>{_esc(c.get("turn"))}</b>'
+                     f' &middot; <b>{_esc(c.get("tool"))}</b> &middot; {_esc(c.get("summary"))}</div>')
+        task = f'<div class="task">{_esc(v["task"])}</div>' if v.get("task") else ""
+        said = f'<div class="said">&ldquo;{_esc(" ".join((v.get("said") or "").split())[:240])}&rdquo;</div>'             if v.get("said") else ""
+        h.append(f'<div class="v"><span class="k own-{i % 6}">[{i}]</span>'
+                 f'<button type="button" class="linkish" data-select="{_esc(v["sid"])}">{_esc(v["sid"])}</button>'
+                 f' &middot; {_esc(v.get("committed"))} &middot; {_esc(v.get("agent") or "command")}'
+                 f' &middot; {_esc(v.get("kind"))}{task}{cause}{said}</div>')
+    h.append('</div>')
+    lines = res.get("lines")
+    if lines is None:
+        h.append(f'<div class="empty">{_esc(res.get("lines_note") or "line attribution unavailable")}</div>')
+    else:
+        rows = []
+        for ln in lines:
+            o = ln["owner"]
+            if isinstance(o, int):
+                c = (vs[o].get("cause") or {})
+                tag = f'[{o}] t{c.get("turn")} {c.get("tool")}' if c else f'[{o}]'
+                cls = f"own-{o % 6}"
+            else:
+                tag, cls = o, f"own-{o}"
+            rows.append(f'<tr><td class="ln">{ln["n"]}</td><td class="own {cls}">{_esc(tag)}</td>'
+                        f'<td class="code">{_esc(ln["text"])}</td></tr>')
+        h.append('<table class="bl"><tbody>' + "".join(rows) + '</tbody></table>')
     h.append('</section>')
     return "".join(h)
 
@@ -642,8 +839,15 @@ def _session_payload(sid):
         savepoints = [{"n": i, "cause": l.get("cause"), "cmd": l.get("cmd"),
                        "label": l.get("label"), "started": l.get("started"),
                        "paths": by_layer.get(i, [])} for i, l in enumerate(meta["layers"])]
+    review = None
+    if meta.get("reviews"):
+        rec, fresh = (meta["reviews"][-1], False)
+        if live:
+            import review as review_mod
+            rec, fresh = review_mod.review_state(sid, meta)
+        review = {"record": rec, "fresh": fresh}
     return {"meta": meta, "changes": changes, "provenance": provenance,
-            "savepoints": savepoints}
+            "savepoints": savepoints, "review": review}
 
 
 def _build_page(status, register_html, dossier_html, policy_text, sel, nonce):
@@ -742,6 +946,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/view":
                 self._send(self._views((query.get("sel") or [None])[0] or None))
                 return
+            if path == "/api/view/blame":
+                res = core.blame_path((query.get("path") or [""])[0])
+                self._send({"dossier": '<div class="sheet">' + _render_blame(res) + "</div>"})
+                return
+            if path == "/api/blame":
+                self._send(core.blame_path((query.get("path") or [""])[0]))
+                return
             if path.startswith("/api/view/session/"):
                 sid = _sid(path.rsplit("/", 1)[-1])
                 self._send({"dossier": '<div class="sheet">'
@@ -798,7 +1009,8 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "commit":
                     result = core.commit_session(
                         sid, merge=bool(req.get("merge")), force=bool(req.get("force")),
-                        only=req.get("only") or None, drop=req.get("drop") or None)
+                        only=req.get("only") or None, drop=req.get("drop") or None,
+                        countersigned=bool(req.get("countersigned")))
                     if not result.get("committed"):
                         result["conflicts_html"] = _render_refusal(result)
                     self._send(result)
@@ -809,6 +1021,20 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(to, int) or isinstance(to, bool):
                         raise core.OverlordError("error: rewind needs an integer savepoint")
                     self._send({"to": to, "changes": core.rewind_session(sid, to)})
+                elif action == "fork":
+                    at = req.get("at")
+                    if at is not None and (not isinstance(at, int) or isinstance(at, bool)):
+                        raise core.OverlordError("error: fork needs an integer savepoint")
+                    self._send({"sid": core.fork_session(sid, at)})
+                elif action == "review":
+                    import agent as agent_mod
+                    import review as review_mod
+                    provider = agent_mod.make_provider(
+                        str(req.get("provider") or "anthropic"), req.get("model") or None,
+                        script_env=review_mod.SCRIPT_ENV)
+                    rec = review_mod.run_review(sid, provider,
+                                                allow_same=bool(req.get("same_model")))
+                    self._send({"review": rec})
                 else:
                     self._send({"error": "unknown action"}, 404)
             else:

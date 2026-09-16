@@ -47,19 +47,38 @@ class Session:
     def log(self):
         return self._client._call("log", sid=self.sid)["provenance"]
 
-    def commit(self, merge=False, force=False, only=None, drop=None):
-        """Returns the commit result dict; raises on conflict refusal.
+    def commit(self, merge=False, force=False, only=None, drop=None, countersigned=False):
+        """Returns the commit result dict; raises on refusal.
         only/drop select layers to replay: "layer:N", "layer:A-B", "turn:N",
         "tool:NAME", "call:ID", comma-separated — undo a decision, keep the
-        rest."""
+        rest. countersigned=True (or policy "require_review") demands a fresh
+        approval from review(); a fresh rejection refuses unless force."""
         res = self._client._call("commit", sid=self.sid, merge=merge, force=force,
-                                 only=only, drop=drop)
+                                 only=only, drop=drop, countersigned=countersigned)
         if not res.get("committed"):
+            if res.get("rejected"):
+                r = res["rejected"]
+                raise OverlordError(f"commit refused — rejected by {r.get('reviewer')}: "
+                                    f"{r.get('reason')}")
             raise OverlordError(
                 "commit refused — target drifted: "
                 + ", ".join(f"{r}:{p}" for r, p in res.get("conflicts", []))
             )
         return res
+
+    def review(self, provider="anthropic", model=None, max_turns=None, same_model=False,
+               on_event=None):
+        """Put this session's diff before a second model. Returns the review
+        record: verdict (approve / reject / abstain), reason, reviewer,
+        fingerprint of what was signed."""
+        return self._client.review(self.sid, provider=provider, model=model,
+                                   max_turns=max_turns, same_model=same_model,
+                                   on_event=on_event)
+
+    def fork(self, at=None):
+        """Copy this session's stack up to savepoint `at` into a new pending
+        session. Returns its Session handle."""
+        return self._client.fork(self.sid, at)
 
     def rollback(self):
         return self._client._call("rollback", sid=self.sid)["target"]
@@ -185,6 +204,28 @@ class OverlordClient:
 
     def savepoints(self, sid):
         return self._call("savepoints", sid=sid)["savepoints"]
+
+    def review(self, sid, provider="anthropic", model=None, max_turns=None,
+               same_model=False, on_event=None):
+        """Countersignature: a second model approves or rejects a pending
+        session's diff. on_event receives the reviewer's transcript events."""
+        def _ev(ev):
+            if on_event and ev.get("event") == "review":
+                on_event({k: v for k, v in ev.items() if k not in ("ok", "event")})
+        return self._call("review", on_event=_ev, sid=sid, provider=provider, model=model,
+                          max_turns=max_turns, same_model=same_model)["review"]
+
+    def fork(self, sid, at=None):
+        """Fork a pending session at a savepoint (default: its top). Returns a
+        Session for the new pending copy."""
+        res = self._call("fork", sid=sid, at=at)
+        new = res["sid"]
+        return Session(self, new, None, self._call("diff", sid=new)["changes"], None)
+
+    def compare(self, a, b):
+        """Per-path divergence of two pending stacks on one target:
+        [{"path", "state": same|differ|only-a|only-b, "a", "b"}]."""
+        return self._call("compare", a=a, b=b)["rows"]
 
     def rewind(self, sid, to):
         """Rewind a pending session (or one this daemon holds open)."""

@@ -183,6 +183,22 @@ try:
             fail("manifest did not shrink after rewind")
         ok(f"savepoints rendered; rewind here cut {before} rows to {after}")
 
+        # Fork here: a new session appears and the page lands on its dossier,
+        # which names its origin; the countersignature block is on the page.
+        origin = page.locator(".sec-title .sid").inner_text().strip()
+        if page.locator("[data-review]").count() != 1 or "UNSIGNED" not in page.locator(".sig").inner_text().upper():
+            fail("countersignature block missing from a pending dossier")
+        page.locator("[data-fork]").first.click()
+        page.wait_for_timeout(900)
+        clean("fork click")
+        shown = page.locator(".sec-title .sid").inner_text().strip()
+        lineage = page.locator(".facts").inner_text()
+        if shown == origin or "forked from" not in lineage.lower() or origin not in lineage:
+            fail(f"fork via the page: showing {shown}, lineage {lineage!r}")
+        if page.locator(".reg-item").count() != 3:
+            fail("fork did not appear in the register")
+        ok("fork here creates a session and the page lands on its dossier")
+
         # Drift refusal: server-rendered, must reach the page intact.
         page.locator(".reg-item").filter(has_not_text="JAIL").first.click()
         page.wait_for_timeout(600)

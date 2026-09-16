@@ -80,6 +80,22 @@ s = ov.resume(s.sid, note="use pytest, not unittest", on_event=print)
 id, and its `transcript.jsonl` carries a `rewind` and a `resume` event where the
 history was cut and picked up.
 
+### Countersignature and forks from the SDK
+
+```python
+s = ov.agent("/srv/app", "add a Makefile with a test target", jail=True, net="none")
+rec = s.review(provider="openai")            # a model that had no part in the work
+if rec["verdict"] == "approve":
+    s.commit(countersigned=True)             # refuses if the diff changed since signing
+else:
+    print(rec["reason"], rec["paths"])
+
+b = s.fork(at=1)                             # second continuation of savepoint @1
+b = ov.resume(b.sid, note="do it with pytest instead")
+for row in ov.compare(s.sid, b.sid):         # path, state (same/differ/only-a/only-b)
+    print(row)
+```
+
 ## 3. Policy-brokered fleets (the operator holds the keys)
 
 `~/.overlord/policy.json` binds every session brokered by the daemon.
@@ -89,7 +105,8 @@ Callers can request grants; they can never obtain a looser scope than policy:
 {
   "default": null,
   "targets": {
-    "/srv/staging":  { "jail": true, "net": "none", "timeout": 900, "allow_force": false },
+    "/srv/staging":  { "jail": true, "net": "none", "timeout": 900, "allow_force": false,
+                       "require_review": true },
     "/srv/scratch":  { "timeout": 3600, "allow_force": true }
   }
 }
@@ -98,6 +115,8 @@ Callers can request grants; they can never obtain a looser scope than policy:
 - `"default": null` = deny-by-default: targets not listed are refused.
 - policy `jail`/`net` force containment on; `timeout` caps whatever is asked.
 - `allow_force` gates `commit --force` through the daemon.
+- `require_review` refuses every commit on the target without a fresh
+  countersignature (`review`) bound to exactly the diff being committed.
 - Edits apply immediately — policy is re-read per request.
 
 The direct CLI is the operator's own authority and does not consult policy;

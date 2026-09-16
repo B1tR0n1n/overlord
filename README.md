@@ -78,6 +78,8 @@ overlord memory accept <session> --all               # keep the notes an agent p
 overlord users add alice --role admin                # accounts: the UI now asks who you are
 overlord tls selfsign --host overlord.lan            # a certificate for --bind
 overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.overlord/tls/key.pem
+overlord skills add skills/python-testing            # packaged know-how, loaded when it fits
+overlord skills new release -t /srv/app              # a project skill: part of the tree, reviewed like code
 overlord cost                                        # what the models spent, by model / account / day
 overlord cost budget --day-usd 20                    # a line no conversation crosses
 overlord audit verify                                # the hash chain of every consequential act
@@ -226,6 +228,28 @@ certificate with openssl for a private deployment). A `--host name`
 allowlist backs the Host check, HSTS is sent, and a plain-HTTP probe at the
 TLS port is shrugged off. A workspace that can commit an agent's changes to
 a real tree is not something to leave on a LAN behind a Host header.
+
+## Skills
+
+Packaged know-how the agent pulls in when it fits (`skills.py`). A skill is
+a folder with a `SKILL.md` — front matter `name`, `description`, an optional
+`when` — and any supporting files. Two homes, one rule:
+
+- **Project skills** live in `.overlord/skills/<name>/` inside the working
+  folder. They are part of the tree, so part of the transaction: an agent
+  may write or improve one, and that change is a diff a person reviews,
+  committed or discarded with everything else. The next conversation in
+  that folder is offered it.
+- **Machine skills** live in `~/.overlord/skills/<name>/`, installed by a
+  person (`overlord skills add <path>`, or Settings → Skills), offered to
+  every conversation, capped per folder by the policy rule
+  `"skills": [...] | "*" | []`.
+
+The model is told the catalogue — names and descriptions only — and loads a
+skill with the `skill` tool when its description fits the task, so the text
+is not in the prompt until it is needed. A project skill shadows a machine
+skill of the same name entirely. Every load is a transcript event; the
+session records what it was offered. Two examples ship in `skills/`.
 
 ## Cost
 
@@ -502,6 +526,7 @@ python3 test/memory_test.py       # 7 memory assertions: injection, caps, transa
 python3 test/auth_test.py         # 7 auth assertions: open mode, sign-in + lockout, roles, ownership, tokens, TLS + Host allowlist, CLI sessions
 python3 test/cost_test.py         # 6 cost assertions: prices, ledger, policy / global / account budgets, review ledger, CLI, workspace
 python3 test/audit_test.py        # 5 audit assertions: chained acts, tamper detection, actors + healthz, gc, --log-json + doctor
+python3 test/skills_test.py       # 6 skills assertions: catalogue + shadowing, jailed / host loads, authored in-transaction, policy, CLI, workspace
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -645,3 +670,10 @@ grants are absent.
   `/healthz`, `overlord ui --log-json`, systemd units for the UI and
   nightly gc, a Dockerfile, doctor rows for accounts / TLS / audit / disk.
   163 assertions across sixteen suites.
+- 2026-09-16 — v0.14: skills. `skills.py`: a SKILL.md catalogue from the
+  folder (`.overlord/skills/`, part of the transaction — an agent may author
+  one and it is a reviewed diff) and the machine (`~/.overlord/skills/`,
+  policy-capped per folder), told to the model up front and loaded on demand
+  with a `skill` tool, every load on the transcript; `overlord skills
+  list|show|add|new|rm`; a Skills panel; two example skills. 169 assertions
+  across seventeen suites.

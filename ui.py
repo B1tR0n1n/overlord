@@ -1244,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._users_post(parts, self._body()):
                     self._send({"error": "not found"}, 404)
                 return
-            if parts[:2] in (["api", "chats"], ["api", "connectors"]):
+            if parts[:2] in (["api", "chats"], ["api", "connectors"], ["api", "skills"]):
                 if chatui.handle_post(self, parts, self._body()):
                     return
                 self._send({"error": "not found"}, 404)

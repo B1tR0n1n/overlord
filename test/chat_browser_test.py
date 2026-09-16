@@ -177,6 +177,8 @@ try:
             fail("settings lacks the connectors section")
         if not page.locator("#mem-section").count() or not page.locator("#m-user").count():
             fail("settings lacks the memory section")
+        if not page.locator("#skills-section").count() or not page.locator("#sk-add").count():
+            fail("settings lacks the skills section")
         if page.locator("#s-models option").count() != 1:
             fail("model datalist not populated from /api/models")
         page.locator("#closesettings").click()

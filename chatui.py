@@ -33,6 +33,7 @@ import mcp as mcp_mod
 import memory as memory_mod
 import auth
 import cost as cost_mod
+import skills as skills_mod
 
 LAUNCH_CWD = os.getcwd()
 SETTINGS_FILE = os.path.join(core.OVERLORD_HOME, "ui.json")
@@ -359,6 +360,12 @@ def _map_event(ev):
     if t == "memory_suggestion":
         return {"type": "memory_suggestion", "id": ev.get("id"), "text": ev.get("text", ""),
                 "accepted": False}
+    if t == "skills":
+        return {"type": "note", "text": "Skills offered: " + ", ".join(
+            s["name"] for s in ev.get("offered") or [])}
+    if t == "skill_use":
+        return {"type": "note", "text": f"Loaded skill {ev.get('name')} ({ev.get('source')})"
+                + (f" — {ev.get('file')}" if ev.get("file") not in (None, "SKILL.md") else "")}
     if t == "approval_decision":
         return {"type": "approval_decision", "id": ev.get("id"), "decision": ev.get("decision"),
                 "server": ev.get("server"), "tool": ev.get("tool")}
@@ -515,6 +522,12 @@ def messages_from_transcript(sid):
             elif t == "memory_suggestion":
                 msgs.append({"type": "memory_suggestion", "id": ev.get("id"),
                              "text": ev.get("text", ""), "accepted": False})
+            elif t == "skills":
+                msgs.append({"type": "note", "text": "Skills offered: " + ", ".join(
+                    s["name"] for s in ev.get("offered") or [])})
+            elif t == "skill_use":
+                msgs.append({"type": "note", "text": f"Loaded skill {ev.get('name')} ({ev.get('source')})"
+                             + (f" — {ev.get('file')}" if ev.get("file") not in (None, "SKILL.md") else "")})
             elif t == "memory_accepted":
                 for m in msgs:
                     if m.get("type") == "memory_suggestion" and m.get("id") == ev.get("id"):
@@ -1029,6 +1042,19 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <div class="ap-acts"><button class="act act-review" id="c-add">Add connector</button>
       <span class="act-msg" id="c-msg"></span></div>
     </details>
+    <details class="adv" id="skills-section"><summary>Skills</summary>
+    <div class="desc">Packaged know-how the agent loads when its description fits the task. Project skills live in .overlord/skills/ inside the working folder — the agent may write or improve one, and that change is reviewed with everything else. Machine skills are installed here for every conversation.</div>
+    <div id="skills-list" class="conn-list"></div>
+    <div class="field"><label>Install a machine skill from a folder on this machine</label>
+      <input id="sk-path" type="text" placeholder="/path/to/skill-folder (with a SKILL.md)"></div>
+    <div class="row2">
+      <div class="field"><label>…or create one: name</label><input id="sk-name" type="text" placeholder="release-checklist"></div>
+      <div class="field"><label>Description (when it fits)</label><input id="sk-desc" type="text" placeholder="Steps for cutting a release"></div>
+    </div>
+    <div class="field"><label>SKILL.md body</label><textarea id="sk-body" rows="4" placeholder="# Release checklist&#10;1. …"></textarea></div>
+    <div class="ap-acts"><button class="act act-review" id="sk-add">Add skill</button>
+      <span class="act-msg" id="sk-msg"></span></div>
+    </details>
     <details class="adv" id="cost-section"><summary>Cost</summary>
     <div class="desc">Every model call is priced from the table in ~/.overlord/cost.json and written to a ledger. A conversation stops before the call that would cross a budget line.</div>
     <div class="field"><label>Spend</label><div class="memview" id="cost-spend"></div></div>
@@ -1364,6 +1390,7 @@ async function openSettings(msg){
   loadMemory();
   $('account-section').classList.toggle('hide', !ME.auth);
   loadCost();
+  loadSkills();
   $('audit-section').classList.toggle('hide', !(isAdmin() || ME.role==='viewer'));
   if(isAdmin() || ME.role==='viewer') loadAudit();
   $('users-section').classList.toggle('hide', !(ME.auth && ME.role==='admin'));
@@ -1467,6 +1494,25 @@ async function mintToken(){
   const r = await j('/api/users/'+encodeURIComponent(ME.user)+'/token',{method:'POST',body:JSON.stringify({label:'workspace'})});
   $('a-token').textContent = r.error||r.token;
 }
+async function loadSkills(){
+  const r = await j('/api/skills'); const list = $('skills-list'); list.innerHTML='';
+  if(r.error){ list.appendChild(el('div','desc',r.error)); return; }
+  if(!r.skills.length){ list.appendChild(el('div','desc','No skills yet. Two examples ship in the repo: overlord skills add skills/python-testing')); }
+  r.skills.forEach(s=>{ const row = el('div','conn-item'); row.appendChild(el('span','cn', s.name));
+    row.appendChild(el('span','cw', '['+s.source+'] '+s.description+(s.files.length?' (+'+s.files.length+' files)':'')));
+    if(s.source==='machine' && isAdmin()){ const rm = el('button','linkbtn','remove'); rm.addEventListener('click', async()=>{
+      const q = await j('/api/skills/'+encodeURIComponent(s.name)+'/remove',{method:'POST',body:'{}'});
+      $('sk-msg').textContent = q.error||''; loadSkills(); }); row.appendChild(rm); }
+    list.appendChild(row); });
+  ['sk-path','sk-name','sk-desc','sk-body','sk-add'].forEach(id=>{ $(id).disabled = !isAdmin(); });
+}
+async function addSkill(){
+  const body = $('sk-path').value.trim() ? {path:$('sk-path').value.trim()}
+    : {name:$('sk-name').value.trim(), description:$('sk-desc').value.trim(), body:$('sk-body').value};
+  const r = await j('/api/skills',{method:'POST',body:JSON.stringify(body)});
+  const m=$('sk-msg'); m.textContent = r.error||('added '+r.added); m.className='act-msg '+(r.error?'bad':'ok');
+  if(!r.error){ ['sk-path','sk-name','sk-desc','sk-body'].forEach(id=>{ $(id).value=''; }); loadSkills(); }
+}
 function money(v){ return v==null ? '—' : '$'+Number(v).toFixed(4); }
 async function loadCost(){
   const r = await j('/api/cost'); if(r.error){ $('cost-spend').textContent = r.error; return; }
@@ -1535,6 +1581,7 @@ $('u-add').addEventListener('click',addUser);
 $('a-passwd').addEventListener('click',changePassword);
 $('a-mint').addEventListener('click',mintToken);
 $('b-save').addEventListener('click',saveBudget);
+$('sk-add').addEventListener('click',addSkill);
 $('logout').addEventListener('click',signOut);
 $('c-approval').addEventListener('change',async()=>{ await j('/api/connectors/approval',{method:'POST',
   body:JSON.stringify({mode:$('c-approval').value})}); CONNECTORS = await j('/api/connectors'); });
@@ -1563,6 +1610,13 @@ def handle_get(handler, path, query):
         return True
     if path == "/api/connectors":
         handler._send(mcp_mod.public_config())
+        return True
+    if path == "/api/skills":
+        s = load_settings()
+        wd = os.path.realpath(os.path.expanduser((query.get("target") or [s["workdir"]])[0]))
+        handler._send({"skills": skills_mod.public(wd if os.path.isdir(wd) else None),
+                       "project_dir": os.path.join(wd, skills_mod.PROJECT_DIR),
+                       "machine_dir": skills_mod.MACHINE_DIR})
         return True
     if path == "/api/memory":
         s = load_settings()
@@ -1628,6 +1682,20 @@ def handle_post(handler, parts, req):
             auth.require("act", core.load_meta(sid))
             handler._send(memory_mod.accept_suggestion(sid, str(req.get("id") or "")))
             return True
+    if parts == ["api", "skills"]:
+        auth.require("admin")
+        if req.get("path"):
+            e = skills_mod.install(str(req["path"]), req.get("name") or None)
+        else:
+            e = skills_mod.create(str(req.get("name") or ""), str(req.get("description") or ""),
+                                  str(req.get("body") or ""), when=str(req.get("when") or ""))
+        handler._send({"added": e["name"], "source": e["source"]})
+        return True
+    if len(parts) == 4 and parts[:2] == ["api", "skills"] and parts[3] == "remove":
+        auth.require("admin")
+        skills_mod.remove(parts[2])
+        handler._send({"removed": parts[2]})
+        return True
     if parts == ["api", "connectors"]:
         auth.require("admin")
         env = req.get("env") or {}

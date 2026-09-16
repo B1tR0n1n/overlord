@@ -116,6 +116,13 @@ token: `overlord users token <name> --name ci` prints it once; send
 CI job that should only read gets a viewer's token. `GET /api/me` says who
 the server thinks you are.
 
+### Skills
+
+Ship know-how with the code: a `.overlord/skills/<name>/SKILL.md` in the
+repository is offered to every conversation in that folder and versioned
+with it. Machine-wide skills come from `overlord skills add`; a policy rule
+`"skills": ["python-testing"]` limits what a folder's sessions may load.
+
 ### Budgets, the ledger and the audit log
 
 A policy rule may carry `"budget": {"session_tokens": N, "session_usd": X}`;

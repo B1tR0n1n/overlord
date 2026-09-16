@@ -45,6 +45,7 @@ import overlord as ov
 import memory as memory_mod
 import cost as cost_mod
 import audit as audit_mod
+import skills as skills_mod
 
 import providers as _providers_defaults  # noqa: E402
 DEFAULT_MODELS = _providers_defaults.DEFAULT_MODELS
@@ -88,6 +89,7 @@ TOOLS = [
                                                  "description": "seconds (default 300)"}},
                       "required": ["command"]}},
     memory_mod.REMEMBER_TOOL,
+    skills_mod.SKILL_TOOL,
 ]
 
 
@@ -199,6 +201,8 @@ class ToolRunner:
         self.live = live
         self._cause = None
         self.suggestions = []       # user-scope notes proposed this run
+        self.skills = {}            # catalogue name -> source, set by run_agent
+        self.skill_uses = []        # (name, source, file) loads this run
 
     def run(self, name, inp, label, cause=None):
         fn = getattr(self, f"t_{name}", None)
@@ -243,6 +247,29 @@ class ToolRunner:
         cmd = inp.get("command", "")
         timeout = float(inp.get("timeout") or 300)
         return self._exec(["bash", "-c", cmd], timeout, label)
+
+    def t_skill(self, inp, label):
+        """A project skill is read through the jail (it is in the tree, maybe
+        written this very session); a machine skill host-side, read-only."""
+        name = skills_mod.check_name(str(inp.get("name") or ""))
+        rel = skills_mod.safe_rel(inp.get("file") or skills_mod.SKILL_FILE)
+        source = self.skills.get(name)
+        if source != "machine":
+            out, rc = self._exec(["cat", "--", f"{skills_mod.PROJECT_DIR}/{name}/{rel}"], 30, label)
+            if rc == 0:
+                if len(out) > skills_mod.FILE_CAP:
+                    out = out[:skills_mod.FILE_CAP] + f"\n… [truncated at {skills_mod.FILE_CAP} characters]"
+                self.skill_uses.append((name, "project", rel))
+                return out, 0
+            # a name resolves to one source: a project skill shadows a machine
+            # skill entirely, so its missing file is missing, not borrowed
+            if source == "project":
+                return f"error: project skill {name} has no file {rel}", 1
+            if not os.path.isdir(os.path.join(skills_mod.MACHINE_DIR, name)):
+                return f"error: no skill named {name} (see the Skills list in your instructions)", 1
+        text = skills_mod.read_machine(name, rel)
+        self.skill_uses.append((name, "machine", rel))
+        return text, 0
 
     def t_remember(self, inp, label):
         """Project scope appends to OVERLORD.md inside the transaction (a
@@ -422,9 +449,14 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
     tools = ToolRunner(live)
     attribution = Attribution(live)
     mem_text, mem_summary = memory_mod.build_context(live.meta["target"], live.meta.get("owner"))
-    system_prompt = SYSTEM_PROMPT + mem_text
+    catalogue = skills_mod.catalogue(live.meta["target"])
+    tools.skills = {s["name"]: s["source"] for s in catalogue}
+    system_prompt = SYSTEM_PROMPT + mem_text + skills_mod.context_block(catalogue)
     if mem_summary:
         live.meta["memory"] = mem_summary
+    if catalogue:
+        live.meta["skills"] = [f"{s['source']}:{s['name']}" for s in catalogue]
+    if mem_summary or catalogue:
         ov.save_meta(live.sid, live.meta)
     all_tools = list(TOOLS)
     if registry:
@@ -435,6 +467,9 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
             raise
         record({"type": "connectors", "servers": list(connectors), "approval": mode,
                 "tools": [t["name"] for t in all_tools[len(TOOLS):]]})
+    if catalogue and not resume:
+        record({"type": "skills", "offered": [{"name": s["name"], "source": s["source"]}
+                                              for s in catalogue]})
     if resume:
         text = _operator_note(live, note)
         messages.append({"role": "user", "content": text})
@@ -444,6 +479,7 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         record({"type": "task", "text": task, "agent": live.meta["agent"]})
     final = ""
     recorded_suggestions = 0
+    recorded_skill_uses = 0
     try:
         for turn in range(start_turn, start_turn + max_turns):
             if should_stop and should_stop():
@@ -533,6 +569,10 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                     record({"type": "memory_suggestion", "turn": turn, "id": sug["id"],
                             "text": sug["text"]})
                 recorded_suggestions = len(tools.suggestions)
+                for name, source, rel in tools.skill_uses[recorded_skill_uses:]:
+                    record({"type": "skill_use", "turn": turn, "name": name, "source": source,
+                            "file": rel})
+                recorded_skill_uses = len(tools.skill_uses)
         record({"type": "done", "reason": "max_turns", "turn": start_turn + max_turns - 1,
                 "usage": live.meta["usage"]})
         return final
@@ -724,6 +764,11 @@ def _show(ev):
     elif t == "memory_suggestion":
         print(f"  ✎ proposed for your memory [{ev['id']}]: {ev['text']}  "
               f"(overlord memory accept <session> --id {ev['id']})")
+    elif t == "skills":
+        print(f"  ◇ skills offered: {', '.join(s['name'] for s in ev['offered'])}")
+    elif t == "skill_use":
+        print(f"  ◆ loaded skill {ev['name']} ({ev['source']}"
+              + (f", {ev['file']}" if ev.get("file") != "SKILL.md" else "") + ")")
     elif t == "approval_decision":
         print(f"    {ev['server']}.{ev['tool']}: {ev['decision']}")
     elif t == "done":

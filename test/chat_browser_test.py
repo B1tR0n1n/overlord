@@ -230,6 +230,12 @@ try:
         page.locator("#whoami").get_by_text("alice").wait_for(timeout=5000)
         if page.locator("#logout").evaluate("e => e.classList.contains('hide')"):
             fail("sign-out button hidden while signed in")
+        boxes = [page.locator(sel).bounding_box() for sel in ("#opensettings", ".consolelink", "#logout")]
+        if any(b is None for b in boxes) or any(boxes[i + 1]["y"] < boxes[i]["y"] + boxes[i]["height"]
+                                                 for i in range(2)):
+            fail(f"rail footer controls must stack, one per line: {boxes}")
+        if len({round(b["x"]) for b in boxes}) != 1:
+            fail(f"rail footer controls must share a left edge: {boxes}")
         # a fresh account has no key yet, so Settings may already be open
         if not page.locator(".modal.open").count():
             page.locator("#opensettings").click()

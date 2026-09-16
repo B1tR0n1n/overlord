@@ -792,7 +792,8 @@ button{font-family:inherit;cursor:pointer}
 .dot.thinking{background:var(--accent);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.3}}
 .railfoot{border-top:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;align-items:flex-start;gap:6px}
-.railnav{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
+.railnav{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.railnav .gear,.railnav .consolelink{display:block;text-align:left}
 .railfoot .backend{white-space:nowrap}
 .gear{background:none;border:0;padding:0;color:var(--dim);font-size:11px;letter-spacing:2px;text-transform:uppercase;cursor:pointer}
 .gear:hover{color:var(--accent)}
@@ -953,7 +954,7 @@ button{font-family:inherit;cursor:pointer}
   letter-spacing:2px;text-transform:uppercase;font-weight:600}
 .closebtn{background:none;border:1px solid var(--border-lt);color:var(--dim);padding:10px 18px;
   font-size:11px;letter-spacing:2px;text-transform:uppercase}
-.consolelink{color:var(--dim);text-decoration:none;font-size:10px;letter-spacing:2px;text-transform:uppercase}
+.consolelink{color:var(--dim);text-decoration:none;font-size:11px;letter-spacing:2px;text-transform:uppercase}
 .consolelink:hover{color:var(--accent)}
 .mt16{margin-top:16px}.mt18{margin-top:18px}.right-auto{margin-right:auto}
 .stopbtn.hide{display:none}

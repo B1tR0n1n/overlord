@@ -84,6 +84,8 @@ overlord skills add skills/python-testing            # packaged know-how, loaded
 overlord skills new release -t /srv/app              # a project skill: part of the tree, reviewed like code
 overlord webhooks add team https://hooks.slack.com/… # tell the channel when work waits for a person
 overlord secrets set-command 'vault kv get -field=value secret/overlord/{name}'   # then secret://NAME anywhere
+overlord export <session> -o review.ovl              # one signed file: record, retained versions, pending changes
+overlord import review.ovl -t /srv/app               # replay its changes here as a new pending session
 overlord cost                                        # what the models spent, by model / account / day
 overlord cost budget --day-usd 20                    # a line no conversation crosses
 overlord audit verify                                # the hash chain of every consequential act
@@ -284,6 +286,26 @@ itself a transcript event (`compaction`: the note, what was kept, the
 tokens that triggered it), the note's call is on the ledger, and a resume
 rebuilds exactly the view the model had — nothing the model was told is
 lost from the record, only from its context.
+
+## Hand-offs: a session as one file
+
+`overlord export <sid>` writes a signed `.ovl` (a tar.gz): the session's
+record (meta, transcript, provenance, output), the retained file versions
+its provenance names — so `blame` keeps working where it lands — and, for
+a pending session, every changed file's content and the list of deletions
+(`bundle.py`). A manifest hashes every member and is HMAC-signed with the
+machine's `bundle.key` (`overlord bundle key` to share it).
+
+`overlord import file.ovl` keeps the record on this machine (an altered
+member or a forged manifest is refused; without the key the import is
+marked unverified, and `--require-signature` refuses it). `overlord import
+file.ovl -t <folder>` replays a pending bundle's changes as a **new pending
+session** on that folder — every write inside the transaction with an
+`import` cause, the transcript carried across with a note of where it came
+from — so review, diff, savepoints and commit apply as to any other work.
+Nothing reaches the folder until a person commits. Extraction is strict
+(relative names under known prefixes, regular files only); both directions
+are audited; the inspector offers Export.
 
 ## Secrets: bring your own vault
 
@@ -597,6 +619,7 @@ python3 test/sso_test.py          # 5 SSO assertions against a fake provider: co
 python3 test/session_test.py      # 5 long-conversation assertions: compaction + record, exact resume replay, the window setting, durable logins, rate limit
 python3 test/webhook_test.py      # 5 webhook assertions against a local receiver: config, needs-review + link + signature, approval gate + budget, retries, API
 python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
+python3 test/bundle_test.py       # 5 bundle assertions: signed export, second-machine import + tamper/forgery refusal, replay + commit, UI, crafted tars
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -771,3 +794,11 @@ grants are absent.
   headers, the SSO secret and webhook signatures; cached, audited without
   values; `overlord secrets set-command|show|test|off`. 189 assertions
   across twenty-one suites.
+- 2026-09-16 — v0.19: hand-offs. `bundle.py`: `overlord export` writes a
+  signed `.ovl` with the record, retained versions and a pending session's
+  changes; `overlord import` keeps the record (hashes and signature
+  checked, strict extraction) or replays the changes onto a folder as a new
+  pending session with `import` causes; Export in the inspector. Fixed:
+  the CLI printed a traceback instead of the error line for errors raised
+  in submodules (a second copy of the engine was being imported). 194
+  assertions across twenty-two suites.

@@ -2339,7 +2339,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2788,7 +2788,9 @@ def main(argv=None):
     import oidc as oidc_mod
     import notify as notify_mod
     import vault as vault_mod
+    import bundle as bundle_mod
     vault_mod.add_vault_parser(sub)
+    bundle_mod.add_bundle_parsers(sub)
     skills_mod.add_skills_parser(sub)
     oidc_mod.add_sso_parser(sub)
     notify_mod.add_webhooks_parser(sub)
@@ -2882,4 +2884,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # submodules `import overlord`; without this alias they would load a
+    # second copy of the engine whose OverlordError is a different class,
+    # and main() would show a traceback instead of the error line
+    sys.modules.setdefault("overlord", sys.modules[__name__])
     sys.exit(main())

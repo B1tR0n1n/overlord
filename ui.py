@@ -1190,6 +1190,27 @@ class Handler(BaseHTTPRequestHandler):
                 auth.require("read")
                 self._send(core.blame_path((query.get("path") or [""])[0]))
                 return
+            if path.startswith("/api/session/") and path.endswith("/export"):
+                sid = _sid(path.split("/")[3])
+                auth.require("read", core.load_meta(sid))
+                import bundle as bundle_mod
+                import tempfile
+                tmp = os.path.join(tempfile.mkdtemp(), f"{sid}.ovl")
+                try:
+                    bundle_mod.export_session(sid, tmp)
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                finally:
+                    import shutil
+                    shutil.rmtree(os.path.dirname(tmp), ignore_errors=True)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Disposition", f'attachment; filename="{sid}.ovl"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path.startswith("/api/view/session/"):
                 sid = _sid(path.rsplit("/", 1)[-1])
                 auth.require("read", core.load_meta(sid))

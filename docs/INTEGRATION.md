@@ -116,6 +116,13 @@ provider, then `overlord sso set --issuer <issuer> --client-id <id>
 follow a groups claim (`--role-claim groups --role-map ops=admin`). The
 provider must be https; `overlord sso test` fetches its discovery document.
 
+### Moving work between machines
+
+`overlord export <sid>` on one machine, `overlord import file.ovl -t
+<folder> --require-signature --key their.key` on another: the changes
+arrive as a new pending session to review and commit there. Share
+`overlord bundle key` out of band.
+
 ### Scripts against the web API
 
 With accounts on, a script authenticates to `overlord ui` with a bearer

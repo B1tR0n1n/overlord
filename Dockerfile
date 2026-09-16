@@ -20,7 +20,7 @@ RUN apt-get update \
  && useradd --system --create-home --home-dir /home/overlord overlord
 
 COPY overlord.py agent.py providers.py review.py mcp.py memory.py auth.py cost.py audit.py \
-     retention.py skills.py oidc.py notify.py vault.py ui.py chatui.py /usr/local/lib/overlord/
+     retention.py skills.py oidc.py notify.py vault.py bundle.py ui.py chatui.py /usr/local/lib/overlord/
 COPY sdk/overlord_client.py /usr/local/lib/overlord/overlord_client.py
 COPY packaging/ebpf/provenance.bt /usr/local/lib/overlord/provenance.bt
 RUN printf '#!/bin/sh\nexec python3 /usr/local/lib/overlord/overlord.py "$@"\n' > /usr/local/bin/overlord \

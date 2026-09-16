@@ -700,7 +700,15 @@ def _inspector_body(sid, m, live):
                  f'<button class="act act-commit" data-commit="{_esc(sid)}">Commit changes</button>'
                  f'<button class="act act-discard" data-discard="{_esc(sid)}">Discard</button>'
                  f'<button class="act act-review" data-review="{_esc(sid)}">Second-model check</button>'
+                 f'<a class="act act-discard" href="/api/session/{_esc(sid)}/export" download>Export</a>'
                  '<div class="act-msg" id="actmsg"></div></div>')
+    elif m.get("imported"):
+        i = m["imported"]
+        h.append(f'<div class="ins-note">Imported from {_esc(i.get("from"))} ({_esc(i.get("exported"))}); '
+                 + ("signature verified" if i.get("verified") else "signature not verified") + '.</div>')
+    if m.get("status") == "committed" or m.get("imported"):
+        h.append(f'<div class="ins-actions"><a class="act act-discard" href="/api/session/{_esc(sid)}/export" '
+                 'download>Export</a></div>')
     return "".join(h)
 
 

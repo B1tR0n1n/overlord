@@ -159,7 +159,24 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .hash .to{color:var(--accent-dim);margin:0 5px}
 .empty{font-family:var(--serif);font-size:17px;font-style:italic;color:var(--text-dim)}
 
-/* ---- 03 disposition ------------------------------------------------ */
+/* ---- 03 savepoints: the chain of decisions ------------------------- */
+.sp{width:100%;border-collapse:collapse}
+.sp td{padding:10px 14px 10px 0;border-bottom:1px solid var(--border);
+  vertical-align:top;font-size:12px}
+.sp tr:hover td{background:var(--accent-glow)}
+.sp .n{font-family:var(--mono);color:var(--accent);width:52px;white-space:nowrap}
+.sp .n.dropped{color:var(--text-dim);text-decoration:line-through}
+.sp .what{color:var(--text-bright)}
+.sp .what b{font-weight:400;color:var(--text)}
+.sp .paths{font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-top:4px;
+  line-height:1.7}
+.sp .ctl{width:180px;white-space:nowrap;text-align:right}
+.sp .ctl .opt{display:inline-flex;margin-right:12px}
+.sp .btn-quiet{padding:6px 12px;font-size:9px}
+.sp-note{font-family:var(--serif);font-size:15px;font-style:italic;color:var(--text-dim);
+  margin-top:14px}
+
+/* ---- 04 disposition ------------------------------------------------ */
 .disposition{border:1px solid var(--border-lt);background:var(--bg2);padding:22px 24px}
 .disp-note{font-family:var(--serif);font-size:17px;color:var(--text-dim);
   margin-bottom:18px;max-width:60ch}
@@ -185,7 +202,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .refusal .hint{font-family:var(--serif);font-style:italic;font-size:15px;
   color:var(--text-dim);margin-top:10px}
 
-/* ---- 04 policy ----------------------------------------------------- */
+/* ---- 05 policy ----------------------------------------------------- */
 .policy-wrap{padding:20px 18px;border-top:1px solid var(--border)}
 textarea{width:100%;height:150px;background:var(--bg2);color:var(--text);
   border:1px solid var(--border);font-family:var(--mono);font-size:11px;
@@ -262,7 +279,7 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>
     <div class="reg-scroll" id="list">__REGISTER__</div>
     <div class="policy-wrap">
-      <div class="sec-label">04 &mdash; Policy</div>
+      <div class="sec-label">05 &mdash; Policy</div>
       <div class="rule head"></div>
       <label for="policy" class="fact-k">broker ceiling &mdash; json</label>
       <textarea id="policy" spellcheck="false">__POLICY__</textarea>
@@ -296,9 +313,13 @@ async function select(sid) {
 }
 
 async function commit(sid) {
+  // savepoints unticked in section 03 are dropped from the replay
+  const drop = [...document.querySelectorAll('[data-keep]')]
+    .filter(el => !el.checked).map(el => el.dataset.keep).join(',');
   const body = JSON.stringify({
     merge: !!($('merge') || {}).checked,
     force: !!($('force') || {}).checked,
+    drop: drop || null,
   });
   const r = await j('/api/session/' + encodeURIComponent(sid) + '/commit',
                     { method: 'POST', body });
@@ -320,6 +341,20 @@ async function rollback(sid) {
     '<div class="empty">The overlay was discarded. The target is byte-identical.</div>' +
     '</section></div>';
   loadList();
+}
+
+async function rewind(sid, to) {
+  const r = await j('/api/session/' + encodeURIComponent(sid) + '/rewind',
+                    { method: 'POST', body: JSON.stringify({ to: Number(to) }) });
+  if (r.error) {
+    const box = $('conflicts');
+    if (box) {
+      box.innerHTML = '<div class="refusal"><b>Refused</b><span class="why"></span></div>';
+      box.querySelector('.why').textContent = r.error;
+    }
+    return;
+  }
+  return select(sid);
 }
 
 async function savePolicy() {
@@ -344,12 +379,13 @@ document.addEventListener('keydown', e => {
 
 // Delegation: no inline handlers anywhere, so the CSP can forbid them outright.
 document.addEventListener('click', e => {
-  const b = e.target.closest('[data-select],[data-commit],[data-void],#seal');
+  const b = e.target.closest('[data-select],[data-commit],[data-void],[data-rewind],#seal');
   if (!b) return;
   if (b.id === 'seal') return savePolicy();
   if (b.dataset.select !== undefined) return select(b.dataset.select);
   if (b.dataset.commit !== undefined) return commit(b.dataset.commit);
   if (b.dataset.void !== undefined) return rollback(b.dataset.void);
+  if (b.dataset.rewind !== undefined) return rewind(b.dataset.sid, b.dataset.rewind);
 });
 
 setInterval(() => loadList(), 2500);
@@ -485,14 +521,17 @@ def _render_dossier(payload):
         h.append('<div class="empty">Nothing was written. The tree is as it was.</div>')
     h.append('</section>')
 
+    h.append(_render_savepoints(m, payload.get("savepoints")))
+
     if m.get("status") == "pending":
         h.append(
-            '<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>'
+            '<section class="sec"><div class="sec-label">04 &mdash; Disposition</div>'
             '<h2 class="sec-title">Nothing has touched the tree yet</h2>'
             '<div class="rule"></div><div class="disposition">'
             '<p class="disp-note">Committing replays this manifest onto the real tree, '
             'after verifying it has not drifted since the snapshot. Voiding discards the '
-            'overlay and leaves the target byte-identical.</p><div class="acts">'
+            'overlay and leaves the target byte-identical. Savepoints unticked above are '
+            'dropped from the replay.</p><div class="acts">'
             f'<button class="btn btn-commit" data-commit="{_esc(m["id"])}">Commit</button>'
             f'<button class="btn btn-void" data-void="{_esc(m["id"])}">Void</button>'
             '<label class="opt"><input type="checkbox" id="merge"> merge</label>'
@@ -508,9 +547,63 @@ def _render_dossier(payload):
         if merged:
             cells += (f'<div class="fact"><div class="fact-k">Merged</div>'
                       f'<div class="fact-v">{merged} path(s)</div></div>')
-        h.append('<section class="sec"><div class="sec-label">03 &mdash; Disposition</div>'
+        if m.get("layers_dropped"):
+            cells += ('<div class="fact"><div class="fact-k">Dropped</div><div class="fact-v">'
+                      f'savepoints {_esc(", ".join("@%s" % n for n in m["layers_dropped"]))}'
+                      '</div></div>')
+        h.append('<section class="sec"><div class="sec-label">04 &mdash; Disposition</div>'
                  '<h2 class="sec-title">Sealed &mdash; replayed onto the tree</h2>'
                  f'<div class="rule"></div><div class="facts">{cells}</div></section>')
+    return "".join(h)
+
+
+def _render_savepoints(m, savepoints):
+    """Section 03: the chain of decisions — one row per layer, what caused
+    it, what it changed. Pending sessions can rewind to a row or untick it
+    so the commit drops it; committed ones show what was applied."""
+    if not savepoints:
+        return ""
+    pending = m.get("status") == "pending"
+    dropped = set(m.get("layers_dropped") or [])
+    n = len(savepoints)
+    h = ['<section class="sec"><div class="sec-label">03 &mdash; Savepoints</div>',
+         f'<h2 class="sec-title">{n} savepoint{"" if n == 1 else "s"} &mdash; '
+         'one per command that wrote</h2>', '<div class="rule"></div>',
+         '<table class="sp"><tbody>']
+    for sp in savepoints:
+        c = sp.get("cause") or {}
+        if c:
+            summary = f' &middot; {_esc(c.get("summary"))}' if c.get("summary") else ""
+            what = (f'turn <b>{_esc(c.get("turn"))}</b> &middot; <b>{_esc(c.get("tool"))}</b>'
+                    f'{summary} <span class="cid">{_esc(c.get("tool_call_id"))}</span>')
+        elif sp.get("cmd"):
+            what = _esc(" ".join(sp["cmd"]))
+        else:
+            what = "&mdash;"
+        paths = "".join(f'<div>{GLYPH.get(k, "&middot;")} {_esc(p)}</div>' for k, p in sp["paths"])
+        if not sp["paths"]:
+            paths = "<div>no writes</div>"
+        ctl = ""
+        if pending:
+            ctl = (f'<label class="opt"><input type="checkbox" checked data-keep="{sp["n"]}"> '
+                   'keep</label>')
+            if sp["n"] < n - 1:
+                ctl += (f'<button class="btn btn-quiet" data-rewind="{sp["n"]}" '
+                        f'data-sid="{_esc(m["id"])}">Rewind here</button>')
+        cls = "n dropped" if sp["n"] in dropped else "n"
+        h.append(f'<tr><td class="{cls}">@{sp["n"]}</td>'
+                 f'<td class="what">{what}<div class="paths">{paths}</div></td>'
+                 f'<td class="ctl">{ctl}</td></tr>')
+    h.append('</tbody></table>')
+    if m.get("rewinds"):
+        h.append('<p class="sp-note">' + " ".join(
+            f'Rewound to @{_esc(r["to"])} at {_esc(r["at"])}, {len(r["layers"])} savepoint(s) discarded.'
+            for r in m["rewinds"]) + '</p>')
+    if pending:
+        h.append('<p class="sp-note">Rewinding discards every savepoint above the chosen one; '
+                 'an agent session\'s transcript is cut to match, so '
+                 '<code>overlord resume</code> continues the model from there.</p>')
+    h.append('</section>')
     return "".join(h)
 
 
@@ -528,8 +621,8 @@ def _session_payload(sid):
     sid = core.validate_session_id(sid)
     meta = core.load_meta(sid)
     upper = core.session_file(sid, "upper")
-    changes = (core.compute_diff(upper, meta["target"], meta.get("backend"))
-               if os.path.isdir(upper) else [])
+    live = os.path.isdir(upper)
+    changes = core.session_stack(sid, meta)[0] if live else []
     prov_path = core.session_file(sid, core.PROVENANCE_FILE)
     provenance = []
     if os.path.isfile(prov_path):
@@ -537,7 +630,20 @@ def _session_payload(sid):
             provenance = [json.loads(line) for line in f]
     if not changes and provenance:  # committed sessions: show from the record
         changes = [[r["kind"], r["path"]] for r in provenance]
-    return {"meta": meta, "changes": changes, "provenance": provenance}
+    savepoints = []
+    if live:
+        savepoints = core.session_savepoints(sid, meta)
+    elif meta.get("layers"):
+        # layers are gone after commit; the record still says what each did
+        by_layer = {}
+        for r in provenance:
+            if "layer" in r:
+                by_layer.setdefault(r["layer"], []).append([r["kind"], r["path"]])
+        savepoints = [{"n": i, "cause": l.get("cause"), "cmd": l.get("cmd"),
+                       "label": l.get("label"), "started": l.get("started"),
+                       "paths": by_layer.get(i, [])} for i, l in enumerate(meta["layers"])]
+    return {"meta": meta, "changes": changes, "provenance": provenance,
+            "savepoints": savepoints}
 
 
 def _build_page(status, register_html, dossier_html, policy_text, sel, nonce):
@@ -691,12 +797,18 @@ class Handler(BaseHTTPRequestHandler):
                 req = self._body()
                 if action == "commit":
                     result = core.commit_session(
-                        sid, merge=bool(req.get("merge")), force=bool(req.get("force")))
+                        sid, merge=bool(req.get("merge")), force=bool(req.get("force")),
+                        only=req.get("only") or None, drop=req.get("drop") or None)
                     if not result.get("committed"):
                         result["conflicts_html"] = _render_refusal(result)
                     self._send(result)
                 elif action == "rollback":
                     self._send({"target": core.rollback_session(sid)})
+                elif action == "rewind":
+                    to = req.get("to")
+                    if not isinstance(to, int) or isinstance(to, bool):
+                        raise core.OverlordError("error: rewind needs an integer savepoint")
+                    self._send({"to": to, "changes": core.rewind_session(sid, to)})
                 else:
                     self._send({"error": "unknown action"}, 404)
             else:

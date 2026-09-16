@@ -6,8 +6,12 @@
     overlord sessions
     overlord diff <session>
     overlord log <session>
-    overlord commit <session> [--merge] [--force]
+    overlord savepoints <session>
+    overlord rewind <session> --to <savepoint>
+    overlord resume <session> [--note "..."] | [-- <cmd>]
+    overlord commit <session> [--merge] [--force] [--only SEL] [--drop SEL]
     overlord rollback <session>
+    overlord blame <path> [--json]
     overlord doctor
     overlord agent -t <dir> [grants] [--provider anthropic|openai] "<task>"
     overlord keys <provider> <key>
@@ -17,6 +21,19 @@ lands in the session's upper layer; the real tree is untouched until an
 explicit commit. Commit verifies the real tree has not drifted since the
 snapshot and refuses to clobber external changes (or three-way merges them
 with --merge when the session kept a base copy).
+
+Savepoints: a session's upper layer is a *stack*, one layer per command that
+wrote something (for the agent, per tool call). Each command runs in its own
+mount namespace over the current stack, so a new layer costs one mount and
+nothing is copied. That makes three things possible:
+    rewind   drop the layers above a savepoint; the tree is as it was after
+             that command, and an agent session's transcript is cut to match,
+             so `resume` continues the model from a world it believes in.
+    commit --only / --drop
+             replay only the layers a selector names (layer:N, turn:N,
+             tool:NAME, call:ID); undo a decision, not a path.
+    blame    committed provenance plus retained content answer, per line,
+             which session, turn, tool call and instruction put it there.
 
 Grants (the capability manifest, via flags or --manifest file):
     --jail          pivot_root jail: the process sees system dirs + the target
@@ -55,8 +72,21 @@ import uuid
 OVERLORD_HOME = os.environ.get("OVERLORD_HOME", os.path.expanduser("~/.overlord"))
 SESSIONS_DIR = os.path.join(OVERLORD_HOME, "sessions")
 LOCKS_DIR = os.path.join(OVERLORD_HOME, "locks")
+# content-addressed copies of every committed file version (before and after),
+# so `blame` can attribute lines, not just files. Capped per file.
+OBJECTS_DIR = os.path.join(OVERLORD_HOME, "objects")
+OBJECT_MAX = int(os.environ.get("OVERLORD_OBJECT_MAX", 4 << 20))
 EBPF_SCRIPT = "/usr/local/lib/overlord/provenance.bt"
 TIMEOUT_RC = 124
+ENTER_RC = 125          # the namespace-entry wrapper failed before exec
+
+# layer stack: layer 0 is <session>/upper (unchanged on-disk contract), layer
+# N>0 is <session>/layers/N/upper. The legacy mount(2) data page is 4 KiB and
+# every layer adds a path to lowerdir=, so layers are named relative to the
+# session dir and the stack is capped; past the cap the top layer keeps
+# absorbing writes (savepoints get coarser, nothing is lost).
+LAYERS_DIR = "layers"
+MAX_LAYERS = 200
 
 # session record file names
 META_FILE = "meta.json"
@@ -110,56 +140,129 @@ def _check_mount_path(path, name):
         )
 
 
-def _jail_script(target, opts, sdir, cmd, bind_trace=False):
-    """Inner script for the pivot_root jail: tmpfs root, system dirs bound,
-    overlay at the target's path, private /proc. $HOME and the rest of the
-    real filesystem do not exist inside. Session records (meta, manifest,
-    provenance) are NEVER exposed — only an isolated trace/ subdir is bound,
-    and only when strace needs somewhere to write (red team finding A3)."""
+def layer_upper_rel(i):
+    """Upper dir of layer i, relative to the session dir."""
+    return "upper" if i == 0 else f"{LAYERS_DIR}/{i}/upper"
+
+
+def layer_work_rel(i):
+    return "work" if i == 0 else f"{LAYERS_DIR}/{i}/work"
+
+
+def layer_uppers(sdir, meta):
+    """Absolute upper dirs of every layer, bottom (0) to top."""
+    n = len(meta.get("layers") or ()) or 1
+    return [os.path.join(sdir, layer_upper_rel(i)) for i in range(n)]
+
+
+def overlay_opts(target, n_layers, kernel=True, sdir=None):
+    """Mount options for a stack of n_layers over target. Kernel mounts are
+    made with cwd = session dir and layer paths relative to it (the mount
+    data page is 4 KiB); fuse-overlayfs daemonizes, so it gets absolute ones."""
+    def up(i):
+        return layer_upper_rel(i) if sdir is None else os.path.join(sdir, layer_upper_rel(i))
+
+    def wk(i):
+        return layer_work_rel(i) if sdir is None else os.path.join(sdir, layer_work_rel(i))
+    lowers = [up(i) for i in range(n_layers - 2, -1, -1)] + [target]
+    opts = f"lowerdir={':'.join(lowers)},upperdir={up(n_layers - 1)},workdir={wk(n_layers - 1)}"
+    return opts + ",userxattr" if kernel else opts
+
+
+# Per-command namespace entry for the kernel backend. The session holder (the
+# executor loop below) lives in the session's user/mount(/net/pid/uts/ipc)
+# namespaces with the real root still visible, and every command it runs
+# passes through this wrapper: a fresh private mount namespace, the overlay
+# mounted over the *current* layer stack, then (with the jail grant) a tmpfs
+# root with system dirs bound, private /proc, pivot_root, and the old root
+# detached. Layers are addressed relative to the session dir; mount(2) is
+# called directly so no mount(8) option-length policy gets between the stack
+# and the kernel. Session records (meta, manifest, provenance, layers) are
+# NEVER exposed to the jail — only the isolated trace/ subdir is bound, and
+# only when strace needs somewhere to write (red team finding A3), plus the
+# session's own tmp/ so /tmp survives from one command to the next.
+_ENTER_SRC = r"""
+import ctypes, json, os, platform, subprocess, sys
+spec = json.loads(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_BIND, MS_REC, MS_PRIVATE = 1, 2, 4, 4096, 16384, 1 << 18
+MNT_DETACH, CLONE_NEWNS = 2, 0x20000
+def die(what):
+    e = ctypes.get_errno()
+    sys.stderr.write("overlord: %s: %s\n" % (what, os.strerror(e) if e else "failed"))
+    sys.exit(125)
+def mount(src, tgt, fstype, flags, data=None):
+    if libc.mount(src.encode(), tgt.encode(), fstype.encode() if fstype else None,
+                  ctypes.c_ulong(flags), data.encode() if data else None) != 0:
+        die("mount " + tgt)
+if libc.unshare(CLONE_NEWNS) != 0:
+    die("unshare mount namespace")
+mount("none", "/", None, MS_REC | MS_PRIVATE)
+sdir, target, cmd = spec["sdir"], spec["target"], spec["cmd"]
+cwd = spec.get("cwd") or ""
+if spec.get("jail"):
     tgt_rel = target.lstrip("/")
-    jail = os.path.join(sdir, "jail")
-    trace_bind = ""
-    if bind_trace:
-        trace_bind = (
-            f'mkdir -p .overlord\nmount --bind {shlex.quote(os.path.join(sdir, "trace"))} .overlord\n'
-        )
-    return f"""set -e
-mount --make-rprivate /
-J={shlex.quote(jail)}
-mount -t tmpfs tmpfs "$J"
-cd "$J"
-mkdir -p oldroot proc tmp dev
-chmod 1777 tmp
-for d in usr bin sbin lib lib64 lib32 etc opt; do
-  if [ -L "/$d" ]; then ln -s "$(readlink "/$d")" "$d"
-  elif [ -d "/$d" ]; then mkdir -p "$d"; mount --rbind "/$d" "$d"; fi
-done
-for n in null zero full random urandom tty; do
-  if [ -e "/dev/$n" ]; then touch "dev/$n"; mount --bind "/dev/$n" "dev/$n"; fi
-done
-ln -s /proc/self/fd dev/fd
-RESOLV="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
-if [ -n "$RESOLV" ] && [ "${{RESOLV#/run/}}" != "$RESOLV" ] && [ -f "$RESOLV" ]; then
-  mkdir -p "$(dirname "${{RESOLV#/}}")"; cp "$RESOLV" "${{RESOLV#/}}"
-fi
-{trace_bind}mkdir -p {shlex.quote(tgt_rel)}
-mount -t overlay overlay -o {shlex.quote(opts)} "$J/{tgt_rel}"
-mount -t proc proc proc
-pivot_root . oldroot
-cd /
-umount -l /oldroot 2>/dev/null || true
-export HOME=/{shlex.quote(tgt_rel)} TMPDIR=/tmp
-cd /{shlex.quote(tgt_rel)}
-exec {shlex.join(cmd)}
+    J = os.path.join(sdir, "jail")
+    mount("tmpfs", J, "tmpfs", 0)
+    os.chdir(J)
+    for d in ("oldroot", "proc", "tmp", "dev"):
+        os.mkdir(d)
+    mount(os.path.join(sdir, "tmp"), "tmp", None, MS_BIND)
+    for d in ("usr", "bin", "sbin", "lib", "lib64", "lib32", "etc", "opt"):
+        if os.path.islink("/" + d):
+            os.symlink(os.readlink("/" + d), d)
+        elif os.path.isdir("/" + d):
+            os.mkdir(d)
+            mount("/" + d, d, None, MS_BIND | MS_REC)
+    for n in ("null", "zero", "full", "random", "urandom", "tty"):
+        if os.path.exists("/dev/" + n):
+            open("dev/" + n, "w").close()
+            mount("/dev/" + n, "dev/" + n, None, MS_BIND)
+    os.symlink("/proc/self/fd", "dev/fd")
+    try:
+        resolv = os.path.realpath("/etc/resolv.conf")
+        if resolv.startswith("/run/") and os.path.isfile(resolv):
+            os.makedirs(os.path.dirname(resolv.lstrip("/")), exist_ok=True)
+            with open(resolv, "rb") as f, open(resolv.lstrip("/"), "wb") as g:
+                g.write(f.read())
+    except OSError:
+        pass
+    if spec.get("trace_bind"):
+        os.mkdir(".overlord")
+        mount(os.path.join(sdir, "trace"), ".overlord", None, MS_BIND)
+    os.makedirs(tgt_rel, exist_ok=True)
+    os.chdir(sdir)
+    mount("overlay", os.path.join(J, tgt_rel), "overlay", 0, spec["opts"])
+    os.chdir(J)
+    mount("proc", "proc", "proc", 0)
+    nr = {"x86_64": 155, "aarch64": 41, "riscv64": 41, "i686": 217, "i386": 217,
+          "armv7l": 218, "ppc64le": 203, "s390x": 217}.get(platform.machine())
+    if nr is None or libc.syscall(nr, b".", b"oldroot") != 0:
+        subprocess.run(["pivot_root", ".", "oldroot"], check=True)
+    os.chdir("/")
+    libc.umount2(b"/oldroot", MNT_DETACH)
+    os.environ["HOME"] = "/" + tgt_rel
+    os.environ["TMPDIR"] = "/tmp"
+    os.chdir(os.path.join("/", tgt_rel, cwd))
+else:
+    os.chdir(sdir)
+    mount("overlay", target, "overlay", 0, spec["opts"])
+    os.chdir(os.path.join(target, cwd))
+try:
+    os.execvp(cmd[0], cmd)
+except OSError as e:
+    sys.stderr.write("overlord: exec %s: %s\n" % (cmd[0], e.strerror))
+    sys.exit(127)
 """
 
 
-def prepare_kernel(target, sdir, cmd, grants):
-    """Returns (argv, cwd, cleanup) for the kernel backend."""
-    upper, work = os.path.join(sdir, "upper"), os.path.join(sdir, "work")
+def prepare_kernel(target, sdir, grants):
+    """Holder launch prefix for the kernel backend: the executor lives in the
+    session's namespaces with the real root visible; every command it runs
+    enters its own mount namespace over the current layer stack (_ENTER_SRC).
+    Returns (argv_prefix, cleanup)."""
     _check_mount_path(target, "target")
     _check_mount_path(sdir, "session")
-    opts = f"lowerdir={target},upperdir={upper},workdir={work},userxattr"
     argv = ["unshare", "--map-root-user", "--mount"]
     if grants.get("net") == "none":
         argv.append("--net")
@@ -169,39 +272,44 @@ def prepare_kernel(target, sdir, cmd, grants):
         # hostname (red team finding A4 when overlord itself runs as root)
         argv += ["--pid", "--fork", "--uts", "--ipc"]
         os.makedirs(os.path.join(sdir, "jail"), exist_ok=True)
-        inner = _jail_script(target, opts, sdir, cmd,
-                             bind_trace=grants.get("_bind_trace", False))
-    else:
-        inner = (
-            f"mount -t overlay overlay -o {shlex.quote(opts)} {shlex.quote(target)} "
-            f"&& cd {shlex.quote(target)} && exec {shlex.join(cmd)}"
-        )
-    return argv + ["bash", "-c", inner], None, None
+    return argv, None
 
 
-def prepare_fuse(target, sdir, cmd, grants):
-    """Returns (argv, cwd, cleanup) for the fuse backend."""
+def prepare_fuse(target, sdir, grants):
+    """Holder launch prefix for the fuse backend: no namespaces; the parent
+    process mounts fuse-overlayfs at <session>/merged and remounts it when the
+    stack grows. Returns (argv_prefix, cleanup)."""
     for grant in ("jail", "net"):
         if grants.get(grant) and grants[grant] != "host":
             raise OverlordError(
                 f"error: --{grant} requires the kernel backend "
                 "(install packaging/apparmor profile)"
             )
-    upper, work = os.path.join(sdir, "upper"), os.path.join(sdir, "work")
-    merged = os.path.join(sdir, "merged")
     _check_mount_path(target, "target")
     _check_mount_path(sdir, "session")
-    opts = f"lowerdir={target},upperdir={upper},workdir={work}"
-    mnt = subprocess.run(
-        ["fuse-overlayfs", "-o", opts, merged], capture_output=True, text=True
-    )
+    merged = os.path.join(sdir, "merged")
+
+    def cleanup():
+        _fuse_unmount(merged)
+
+    return [], cleanup
+
+
+def _fuse_mount(target, sdir, n_layers):
+    merged = os.path.join(sdir, "merged")
+    opts = overlay_opts(target, n_layers, kernel=False, sdir=sdir)
+    mnt = subprocess.run(["fuse-overlayfs", "-o", opts, merged],
+                         capture_output=True, text=True)
     if mnt.returncode != 0:
         raise OverlordError(f"error: fuse-overlayfs mount failed: {mnt.stderr.strip()}")
 
-    def cleanup():
-        subprocess.run(["fusermount3", "-u", merged], capture_output=True)
 
-    return cmd, merged, cleanup
+def _fuse_unmount(merged):
+    """True when merged is no longer mounted."""
+    if not os.path.ismount(merged):
+        return True
+    r = subprocess.run(["fusermount3", "-u", merged], capture_output=True)
+    return r.returncode == 0 and not os.path.ismount(merged)
 
 
 PREPARE = {"kernel": prepare_kernel, "fuse": prepare_fuse}
@@ -366,38 +474,55 @@ def is_opaque_dir(path):
     return False
 
 
-def compute_diff(upper, target, backend=None):
-    """Classify upper-layer entries: sorted list of (kind, relpath).
+# fuse-overlayfs keeps its opaque bookkeeping as entries inside the directory
+# it marks; they are not the workload's and must never reach the tree
+_FUSE_MARKERS = {".wh..opq", ".wh..wh..opq"}
 
-    kinds: added, modified, deleted, replaced-dir. Added dirs get a '/' suffix.
-    """
-    changes = []
+
+def _layer_entries(upper, target, backend=None):
+    """Walk one layer: yields (kind, rel, opaque).
+
+    kinds: added, modified, deleted, replaced-dir. Added dirs get a '/'
+    suffix. A directory marked opaque over something the target has is a
+    replaced-dir and is not descended (it is replayed wholesale); one marked
+    opaque over nothing (fuse-overlayfs marks every new directory) is simply
+    an added directory, descended like any other — but its opacity still
+    matters to a stack, where it hides whatever lower layers put beneath."""
     for root, dirs, files in os.walk(upper):
-        opaque = []
+        skip = []
         for d in dirs:
             dpath = os.path.join(root, d)
             rel = os.path.relpath(dpath, upper)
-            if is_opaque_dir(dpath):
-                changes.append(("replaced-dir", rel))
-                opaque.append(d)
-            elif not os.path.isdir(_safe_join(target, rel)):
-                changes.append(("added", rel + "/"))
-        dirs[:] = [d for d in dirs if d not in opaque]  # don't descend replaced dirs
+            opaque = is_opaque_dir(dpath)
+            tdir = _safe_join(target, rel)
+            if opaque and os.path.lexists(tdir):
+                yield ("replaced-dir", rel, True)
+                skip.append(d)
+            elif not os.path.isdir(tdir):
+                yield ("added", rel + "/", opaque)
+        dirs[:] = [d for d in dirs if d not in skip]  # don't descend replaced dirs
         for name in files:
+            if backend != "kernel" and name in _FUSE_MARKERS:
+                continue
             fpath = os.path.join(root, name)
             rel = os.path.relpath(fpath, upper)
             if is_whiteout(fpath, backend):
                 try:
-                    changes.append(("deleted", _victim_rel(fpath, upper)))
+                    yield ("deleted", _victim_rel(fpath, upper), False)
                 except OverlordError:
                     # names its own tree root; recorded so diff/log show it,
                     # refused by commit_session before anything is replayed
-                    changes.append(("invalid-whiteout", rel))
+                    yield ("invalid-whiteout", rel, False)
             elif os.path.lexists(_safe_join(target, rel)):
-                changes.append(("modified", rel))
+                yield ("modified", rel, False)
             else:
-                changes.append(("added", rel))
-    return sorted(changes, key=lambda c: c[1])
+                yield ("added", rel, False)
+
+
+def compute_diff(upper, target, backend=None):
+    """Classify upper-layer entries: sorted list of (kind, relpath)."""
+    return sorted(((k, r) for k, r, _o in _layer_entries(upper, target, backend)),
+                  key=lambda c: c[1])
 
 
 def _victim_rel(whiteout_path, upper):
@@ -410,6 +535,63 @@ def _victim_rel(whiteout_path, upper):
         raise OverlordError(f"error: whiteout names its own tree: {whiteout_path}")
     _safe_join(upper, victim)
     return victim
+
+
+def _drop_subtree(merged, clean):
+    prefix = clean + os.sep
+    for key in [k for k in merged if k == clean or k.startswith(prefix)]:
+        del merged[key]
+
+
+def stack_diff(uppers, target, backend=None):
+    """Flatten a layer stack the way the kernel would present it.
+
+    Returns (changes, origin, touched):
+      changes  sorted [(kind, rel)] — the net effect of the whole stack on the
+               target, same shape as compute_diff
+      origin   rel -> index into uppers of the layer that holds the final
+               content (the topmost layer mentioning the path)
+      touched  every per-layer entry a sequential replay would act on. This
+               is the set conflict detection must check: a file a lower
+               layer created and a higher one deleted is absent from
+               `changes`, yet replay still writes it, so a same-named file
+               that appeared externally would be destroyed unnoticed.
+    Whiteouts of paths the target never had cancel lower-layer entries and
+    are not replayed against the target, so they are excluded from touched."""
+    merged = {}     # clean rel -> [kind, layer, display rel]
+    touched = set()
+    for k, upper in enumerate(uppers):
+        for kind, rel, opaque in sorted(_layer_entries(upper, target, backend),
+                                        key=lambda c: c[1]):
+            clean = rel.rstrip("/")
+            if kind == "deleted":
+                _drop_subtree(merged, clean)
+                if os.path.lexists(_safe_join(target, clean)):
+                    merged[clean] = ["deleted", k, rel]
+                    touched.add((kind, rel))
+                continue
+            if opaque:
+                _drop_subtree(merged, clean)
+            merged[clean] = [kind, k, rel]
+            touched.add((kind, rel))
+    changes = sorted(((v[0], v[2]) for v in merged.values()), key=lambda c: c[1])
+    origin = {v[2]: v[1] for v in merged.values()}
+    return changes, origin, sorted(touched, key=lambda c: c[1])
+
+
+def session_stack(sid, meta=None, layers=None):
+    """(changes, origin, touched, uppers) for a session's stack, or a subset
+    of its layers (indices, ascending). Empty when the layers are gone."""
+    meta = meta or load_meta(sid)
+    sdir = session_path(sid)
+    uppers = layer_uppers(sdir, meta)
+    if layers is not None:
+        uppers = [uppers[i] for i in layers]
+    uppers = [u for u in uppers if os.path.isdir(u)]
+    if not uppers:
+        return [], {}, [], []
+    changes, origin, touched = stack_diff(uppers, meta["target"], meta.get("backend"))
+    return changes, origin, touched, uppers
 
 
 # ---------------------------------------------------------------- conflicts
@@ -477,19 +659,21 @@ def _replaced_dir_conflicts(rel, manifest, target):
     return found
 
 
-def try_merge(conflicts, sdir, target):
+def try_merge(conflicts, sdir, target, locate=None):
     """Three-way merge modified-externally conflicts using the session's base
-    copy. Merged content is written into the upper layer, so a subsequent
-    apply replays it. Returns (resolved, unresolved)."""
+    copy. Merged content is written into the layer that holds the session's
+    version (locate(rel) — the top of the stack by default), so a subsequent
+    replay applies it. Returns (resolved, unresolved)."""
     base_dir = os.path.join(sdir, "base")
     upper = os.path.join(sdir, "upper")
+    locate = locate or (lambda rel: _safe_join(upper, rel))
     if not os.path.isdir(base_dir):
         raise OverlordError(
             "error: --merge needs a base copy — session was not run with --merge-base"
         )
     resolved, unresolved = [], []
     for reason, rel in conflicts:
-        ours = _safe_join(upper, rel)       # session's version
+        ours = locate(rel)                  # session's version
         base = _safe_join(base_dir, rel)    # common ancestor
         theirs = _safe_join(target, rel)    # external version
         if reason != "modified-externally" or not all(
@@ -529,23 +713,59 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def build_provenance(changes, upper, target):
-    """Transaction-level flight record: hashes before (lower) and after (upper)."""
+def build_provenance(changes, upper, target, origin=None, uppers=None):
+    """Transaction-level flight record: hashes before (lower) and after (upper).
+    With a stack, origin maps each path to the layer (index into uppers) that
+    holds its final content, and the record names that layer."""
     ts = _now()
     records = []
     for kind, rel in changes:
         rec = {"ts": ts, "kind": kind, "path": rel}
         clean = rel.rstrip("/")
+        if origin is not None and rel in origin:
+            rec["layer"] = origin[rel]
         if kind in ("modified", "deleted"):
             tpath = _safe_join(target, clean)
             if os.path.lexists(tpath):
                 rec["before_sha256"] = _sha256(tpath)
         if kind in ("added", "modified") and not rel.endswith("/"):
-            upath = _safe_join(upper, clean)
+            layer_dir = uppers[origin[rel]] if origin is not None and uppers else upper
+            upath = _safe_join(layer_dir, clean)
             rec["after_sha256"] = _sha256(upath)
             rec["after_size"] = os.lstat(upath).st_size
         records.append(rec)
     return records
+
+
+def store_object(path):
+    """Retain a copy of a regular file under objects/<sha256> for blame.
+    Returns the hash, or None when the file is not retained (symlink,
+    special, or over OBJECT_MAX)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > OBJECT_MAX:
+        return None
+    digest = _sha256(path)
+    os.makedirs(OBJECTS_DIR, exist_ok=True)
+    dst = os.path.join(OBJECTS_DIR, digest)
+    if not os.path.exists(dst):
+        tmp = dst + f".{uuid.uuid4().hex[:8]}.tmp"
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dst)
+    return digest
+
+
+def load_object(digest):
+    """Retained content for a hash, or None."""
+    if not digest or "/" in digest:
+        return None
+    path = os.path.join(OBJECTS_DIR, digest)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
 
 
 # strace line: "PID  TS syscall(args) = ret"
@@ -646,21 +866,23 @@ def apply_upper(upper, target, backend=None):
     """Replay the upper layer onto the real tree. Returns change count."""
     applied = 0
     for root, dirs, files in os.walk(upper):
-        opaque = []
         for d in dirs:
             dpath = os.path.join(root, d)
             tpath = _safe_join(target, os.path.relpath(dpath, upper))
             if is_opaque_dir(dpath):
+                # wholesale replacement: clear, recreate, then the walk below
+                # fills it entry by entry (which also keeps fuse's markers out)
                 _remove_target(tpath)
-                shutil.copytree(dpath, tpath, symlinks=True)
-                opaque.append(d)
+                os.makedirs(tpath)
+                shutil.copystat(dpath, tpath)
                 applied += 1
             elif not os.path.isdir(tpath):
                 _remove_target(tpath)
                 os.makedirs(tpath, exist_ok=True)
                 applied += 1
-        dirs[:] = [d for d in dirs if d not in opaque]  # copied whole above
         for name in files:
+            if backend != "kernel" and name in _FUSE_MARKERS:
+                continue
             fpath = os.path.join(root, name)
             if is_whiteout(fpath, backend):
                 _remove_target(_safe_join(target, _victim_rel(fpath, upper)))
@@ -668,6 +890,15 @@ def apply_upper(upper, target, backend=None):
                 _copy_entry(fpath, _safe_join(target, os.path.relpath(fpath, upper)))
             applied += 1
     return applied
+
+
+def apply_layers(uppers, target, backend=None):
+    """Replay a stack bottom-up. Each layer's entries are complete (overlayfs
+    copies a whole file up on first write), so sequential replay of any
+    ascending subset of layers yields exactly the state the topmost selected
+    layer describes for every path it mentions."""
+    for upper in uppers:
+        apply_upper(upper, target, backend)
 
 
 # ---------------------------------------------------------------- execution
@@ -716,7 +947,7 @@ def send(o):
         sock.sendall((json.dumps(o) + "\n").encode())
 def run(req):
     rid, cmd = req["id"], req["cmd"]
-    cwd = os.path.join(os.getcwd(), req["cwd"]) if req.get("cwd") else None
+    cwd = req.get("cwd") or None
     kw = {}
     if req.get("capture", True):
         kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -755,12 +986,31 @@ os._exit(0)
 """
 
 
+def _dir_nonempty(path):
+    try:
+        with os.scandir(path) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
+def _check_rel_cwd(cwd):
+    """A working directory for exec is relative to the target and stays in it."""
+    if not cwd:
+        return ""
+    p = os.path.normpath(cwd)
+    if os.path.isabs(p) or p == os.pardir or p.startswith(os.pardir + os.sep):
+        raise OverlordError(f"error: cwd must be relative to the target: {cwd}")
+    return "" if p == os.curdir else p
+
+
 class LiveSession:
-    """An open transaction: overlay mounted, holder alive, commands accepted."""
+    """An open transaction: holder alive, commands accepted, each one run over
+    the current layer stack. A command that wrote something seals its layer:
+    the next command starts a new one (a savepoint)."""
 
     def __init__(self, sid, meta, proc, sock, lock, cleanup, ebpf, trace_inside):
         import queue
-        import socket as _socket
         import threading
         self.sid, self.meta, self.proc = sid, meta, proc
         self.sdir = session_path(sid)
@@ -769,6 +1019,9 @@ class LiveSession:
         self._q = {}
         self._qlock = threading.Lock()
         self._wlock = threading.Lock()
+        self._layer_lock = threading.Lock()
+        self._active = 0
+        self._fuse_layers = 0      # fuse: how many layers the live mount stacks
         self._queue = queue
         self.expired = False
         self.closed = False
@@ -784,6 +1037,64 @@ class LiveSession:
         if not self._ready.wait(30):
             self._kill()
             raise OverlordError("error: session holder did not start (backend failure?)")
+
+    # -- layers
+    @property
+    def layers(self):
+        return self.meta.setdefault("layers", [{"n": 0, "started": self.meta.get("started")}])
+
+    @property
+    def current_layer(self):
+        return len(self.layers) - 1
+
+    def _ensure_layer(self):
+        """Start a new layer if the top one holds writes. Returns the index the
+        next command will write into."""
+        layers = self.layers
+        top = os.path.join(self.sdir, layer_upper_rel(len(layers) - 1))
+        if not _dir_nonempty(top):
+            return len(layers) - 1
+        if len(layers) >= MAX_LAYERS:
+            self.meta["layer_cap_hit"] = True
+            return len(layers) - 1
+        if self.meta.get("backend") == "fuse" and not _fuse_unmount(
+                os.path.join(self.sdir, "merged")):
+            # a lingering process pins the mount; keep writing to this layer
+            self.meta["layer_reuse"] = self.meta.get("layer_reuse", 0) + 1
+            return len(layers) - 1
+        n = len(layers)
+        for sub in (layer_upper_rel(n), layer_work_rel(n)):
+            os.makedirs(os.path.join(self.sdir, sub))
+        layers.append({"n": n, "started": _now()})
+        return n
+
+    def _wrap(self, cmd, cwd):
+        """(argv, cwd) that runs cmd over the current stack on this backend."""
+        n = len(self.layers)
+        target = self.meta["target"]
+        if self.meta.get("backend") == "fuse":
+            merged = os.path.join(self.sdir, "merged")
+            if not os.path.ismount(merged):
+                _fuse_mount(target, self.sdir, n)
+                self._fuse_layers = n
+            return list(cmd), os.path.join(merged, cwd) if cwd else merged
+        jail = bool(self.meta["grants"].get("jail"))
+        spec = {"sdir": self.sdir, "target": target, "cmd": list(cmd), "cwd": cwd,
+                "jail": jail, "opts": overlay_opts(target, n, kernel=True),
+                "trace_bind": jail and self._trace_inside == "/.overlord"}
+        py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
+        return [py, "-c", _ENTER_SRC, json.dumps(spec)], None
+
+    def rewind(self, to):
+        """Drop every layer above savepoint `to` while the session stays open.
+        Refused while a command is running (its mount would pin the layers)."""
+        with self._layer_lock:
+            if self._active:
+                raise OverlordError("error: cannot rewind while a command is running")
+            if self.meta.get("backend") == "fuse" and not _fuse_unmount(
+                    os.path.join(self.sdir, "merged")):
+                raise OverlordError("error: cannot rewind: the fuse mount is busy")
+            return _rewind_layers(self.sid, self.meta, to)
 
     # -- transport
     def _read_loop(self):
@@ -825,12 +1136,15 @@ class LiveSession:
 
     # -- api
     def exec(self, cmd, timeout=None, capture=True, cwd=None, on_output=None,
-             label=None):
-        """Run one command inside the transaction. Returns (rc, output_bytes)."""
+             label=None, cause=None):
+        """Run one command inside the transaction. Returns (rc, output_bytes).
+        `cause` (an agent's tool call, say) is stamped on the layer the
+        command writes into, which is how provenance names its reason."""
         import threading
         if self.closed or self.expired:
             raise OverlordError("error: session is closed" if self.closed else
                              "error: session expired (timeout grant)")
+        cwd = _check_rel_cwd(cwd)
         rid = uuid.uuid4().hex[:8]
         q = self._queue.Queue()
         with self._qlock:
@@ -840,14 +1154,22 @@ class LiveSession:
             real_cmd = ["strace", "-f", "-qq", "-ttt", "-e",
                         "trace=%file,%process,%network", "-o",
                         f"{self._trace_inside}/raw.{rid}.strace"] + real_cmd
-        rec = {"id": rid, "cmd": list(cmd), "label": label,
+        with self._layer_lock:
+            layer = self._ensure_layer()
+            self._active += 1
+            lrec = self.layers[layer]
+            lrec.update(exec=rid, label=label, cmd=list(cmd))
+            if cause is not None:
+                lrec["cause"] = cause
+            wrapped, run_cwd = self._wrap(real_cmd, cwd)
+        rec = {"id": rid, "cmd": list(cmd), "label": label, "layer": layer,
                "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         self.meta.setdefault("execs", []).append(rec)
         if not self.meta.get("cmd"):
             self.meta["cmd"] = list(cmd)
         save_meta(self.sid, self.meta)
-        self._send({"op": "run", "id": rid, "cmd": real_cmd, "capture": capture,
-                    "cwd": cwd})
+        self._send({"op": "run", "id": rid, "cmd": wrapped, "capture": capture,
+                    "cwd": run_cwd})
         timer = None
         timed_out = [False]
         if timeout:
@@ -883,6 +1205,8 @@ class LiveSession:
                 outlog.close()
             with self._qlock:
                 self._q.pop(rid, None)
+            with self._layer_lock:
+                self._active -= 1
         if timed_out[0] or (self.expired and rc in (137, TIMEOUT_RC)):
             rc = TIMEOUT_RC
             rec["timed_out"] = True
@@ -891,8 +1215,11 @@ class LiveSession:
         return rc, bytes(out)
 
     def changes(self):
-        return compute_diff(os.path.join(self.sdir, "upper"), self.meta["target"],
-                            self.meta.get("backend"))
+        return session_stack(self.sid, self.meta)[0]
+
+    def stack(self):
+        """(changes, origin, touched, uppers) of the live stack."""
+        return session_stack(self.sid, self.meta)
 
     def close(self):
         """Tear the namespace down and finalize the session as pending.
@@ -922,22 +1249,29 @@ class LiveSession:
         return self.sid, changes
 
 
+def _write_provenance(sid, meta, layers=None):
+    """Provenance for the stack (or a subset of its layers): hashes before and
+    after, the layer holding each final version, and caused_by — the cause
+    stamped on that layer (an agent's tool call) — so every path names its
+    reason structurally, which survives rewind. Returns the changes."""
+    sdir = session_path(sid)
+    changes, origin, _touched, uppers = session_stack(sid, meta, layers)
+    idx = layers if layers is not None else list(range(len(uppers)))
+    lrecs = meta.get("layers") or []
+    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
+        for rec in build_provenance(changes, None, meta["target"], origin, uppers):
+            if "layer" in rec:
+                rec["layer"] = idx[rec["layer"]]     # index into the session's stack
+                if rec["layer"] < len(lrecs) and lrecs[rec["layer"]].get("cause"):
+                    rec["caused_by"] = lrecs[rec["layer"]]["cause"]
+            f.write(json.dumps(rec) + "\n")
+    return changes
+
+
 def _finalize_session(sid, meta):
     """Compute diff + provenance, parse traces, mark pending. Idempotent."""
     sdir = session_path(sid)
-    upper = os.path.join(sdir, "upper")
-    changes = (compute_diff(upper, meta["target"], meta.get("backend"))
-               if os.path.isdir(upper) else [])
-    attribution = {}
-    apath = os.path.join(sdir, "attribution.json")
-    if os.path.isfile(apath):
-        with open(apath) as f:
-            attribution = json.load(f)
-    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
-        for rec in build_provenance(changes, upper, meta["target"]):
-            if rec["path"] in attribution:
-                rec["caused_by"] = attribution[rec["path"]]   # agent tool call
-            f.write(json.dumps(rec) + "\n")
+    changes = _write_provenance(sid, meta)
     tdir = os.path.join(sdir, "trace")
     if meta.get("trace") == "strace" and os.path.isdir(tdir):
         raws = sorted(p for p in os.listdir(tdir) if p.endswith(".strace"))
@@ -984,7 +1318,6 @@ def reconcile_session(sid, meta):
 def open_session(target, backend, grants, trace=None, wait=False, stack=False,
                  capture=False, agent=None):
     """Snapshot the target, mount the overlay, start the holder. Returns LiveSession."""
-    import socket
     target = os.path.realpath(target)
     if not os.path.isdir(target):
         raise OverlordError(f"error: target is not a directory: {target}")
@@ -1005,8 +1338,9 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
 
     sid = new_session_id()
     sdir = session_path(sid)
-    for d in ("upper", "work", "merged"):
+    for d in ("upper", "work", "merged", "tmp"):
         os.makedirs(os.path.join(sdir, d))
+    os.chmod(os.path.join(sdir, "tmp"), 0o1777)
 
     manifest = snapshot_manifest(target)
     with open(os.path.join(sdir, MANIFEST_FILE), "w") as f:
@@ -1017,39 +1351,102 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
             check=True,
         )
 
-    grants = dict(grants)
-    trace_inside = None
-    if trace == "strace":
-        if not shutil.which("strace"):
-            raise OverlordError("error: --trace requires strace (sudo apt install strace)")
-        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
-        if grants.get("jail"):
-            # red team finding A3: never expose session records to the jail —
-            # strace gets an isolated trace/ subdir bound at /.overlord
-            grants["_bind_trace"] = True
-            trace_inside = "/.overlord"
-        else:
-            trace_inside = os.path.join(sdir, "trace")
-
+    if trace == "strace" and not shutil.which("strace"):
+        raise OverlordError("error: --trace requires strace (sudo apt install strace)")
     meta = {
         "id": sid, "target": target, "cmd": [], "execs": [], "backend": backend,
         "grants": {k: v for k, v in grants.items() if not k.startswith("_")},
         "trace": trace, "agent": agent,
+        "layers": [{"n": 0, "started": _now()}],
         "started": _now(), "status": "open",
     }
+    return _launch_holder(sid, meta, lock, capture, fresh=True)
 
+
+def reopen_session(sid, wait=False, capture=False):
+    """Bring a pending session back to life on its existing layer stack, so
+    more commands (or a resumed agent) run on top of it — the mechanism
+    behind `resume`. The snapshot manifest is kept: commit still verifies the
+    tree against the moment the session began."""
+    m = load_meta(sid)
+    if m.get("status") != "pending":
+        raise OverlordError(f"error: session is {m.get('status')}, not pending")
+    sdir = session_path(sid)
+    if not os.path.isdir(os.path.join(sdir, "upper")):
+        raise OverlordError("error: session layers are gone; nothing to resume")
+    target = m["target"]
+    if not os.path.isdir(target):
+        raise OverlordError(f"error: target is not a directory: {target}")
+    if m.get("backend") not in PREPARE or (
+            m["backend"] == "kernel" and not _kernel_backend_available()) or (
+            m["backend"] == "fuse" and not _fuse_backend_available()):
+        raise OverlordError(f"error: backend {m.get('backend')} is not available now")
+    lock = acquire_target_lock(target, wait)
+    os.makedirs(os.path.join(sdir, "tmp"), exist_ok=True)
+    if m.get("backend") == "kernel" and m["grants"].get("jail"):
+        os.makedirs(os.path.join(sdir, "jail"), exist_ok=True)
+    m.setdefault("layers", [{"n": 0, "started": m.get("started")}])
+    m.setdefault("resumed", []).append(_now())
+    m["status"] = "open"
+    for k in ("finished", "exit_code"):
+        m.pop(k, None)
+    return _launch_holder(sid, m, lock, capture, fresh=False)
+
+
+def _launch_holder(sid, meta, lock, capture, fresh):
+    """Start the holder process for a session record and hand back the live
+    handle. On any failure a fresh session vanishes entirely (_abort_launch);
+    a reopened one is put back to pending untouched."""
+    import socket
+    sdir, target, backend = session_path(sid), meta["target"], meta["backend"]
+    grants, trace = dict(meta["grants"]), meta.get("trace")
+    trace_inside = None
+    if trace == "strace":
+        os.makedirs(os.path.join(sdir, "trace"), exist_ok=True)
+        if grants.get("jail"):
+            # red team finding A3: never expose session records to the jail —
+            # strace gets an isolated trace/ subdir bound at /.overlord
+            trace_inside = "/.overlord"
+        else:
+            trace_inside = os.path.join(sdir, "trace")
+
+    def abort(parent_sock, cleanup, proc=None):
+        if fresh:
+            _abort_launch(sid, lock, cleanup, parent_sock, proc)
+            return
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+        parent_sock.close()
+        if cleanup:
+            cleanup()
+        meta.pop("holder_pid", None)
+        meta["status"] = "pending"
+        save_meta(sid, meta)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    try:
+        prefix, cleanup = PREPARE[backend](target, sdir, grants)
+    except OverlordError:
+        if fresh:
+            _force_rmtree(sdir)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        raise
     parent_sock, child_sock = socket.socketpair()
     py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
-    executor = [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
-    argv, cwd, cleanup = PREPARE[backend](target, sdir, executor, grants)
+    argv = prefix + [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
     popen_kw = {"pass_fds": (child_sock.fileno(),)}
     if capture:
         outfile = open(os.path.join(sdir, "output.log"), "ab")
         popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     try:
-        proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True, **popen_kw)
+        proc = subprocess.Popen(argv, start_new_session=True, **popen_kw)
     except OSError:
-        _abort_launch(sid, lock, cleanup, parent_sock)
+        abort(parent_sock, cleanup)
         raise
     finally:
         child_sock.close()
@@ -1063,9 +1460,145 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
             ebpf = start_ebpf(proc.pid, sdir)
         except Exception:
             # the workload is already live and the recorder is not
-            _abort_launch(sid, lock, cleanup, parent_sock, proc)
+            abort(parent_sock, cleanup, proc)
             raise
-    return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+    try:
+        return LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
+    except OverlordError:
+        abort(parent_sock, cleanup, proc)
+        raise
+
+
+# ---------------------------------------------------------------- savepoints
+
+
+def _rewind_layers(sid, meta, to):
+    """Drop layers above `to` on disk and in meta; cut an agent transcript to
+    match. The dropped tail is archived (meta['rewinds'], transcript.rewound.N)
+    because a rewind is itself an act with provenance. Returns meta."""
+    layers = meta.get("layers") or [{"n": 0}]
+    if not isinstance(to, int) or not 0 <= to < len(layers):
+        raise OverlordError(f"error: no savepoint {to} (session has 0..{len(layers) - 1})")
+    if to == len(layers) - 1:
+        return meta
+    sdir = session_path(sid)
+    execs = meta.get("execs") or []
+    archived = {"at": _now(), "to": to, "layers": layers[to + 1:],
+                "execs": [e for e in execs if e.get("layer", 0) > to]}
+    for i in range(to + 1, len(layers)):
+        _force_rmtree(os.path.join(sdir, LAYERS_DIR, str(i)))
+    meta["layers"] = layers[:to + 1]
+    meta["execs"] = [e for e in execs if e.get("layer", 0) <= to]
+    rewinds = meta.setdefault("rewinds", [])
+    tpath = os.path.join(sdir, "transcript.jsonl")
+    if os.path.isfile(tpath):
+        with open(tpath) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        cut = 0
+        for i, ev in enumerate(events):
+            if ev.get("type") == "tool_result" and ev.get("layer", 0) <= to:
+                cut = i + 1
+            elif ev.get("type") in ("task", "rewind", "resume"):
+                cut = max(cut, i + 1)
+        tail = events[cut:]
+        n = len(rewinds) + 1
+        with open(os.path.join(sdir, f"transcript.rewound.{n}.jsonl"), "w") as f:
+            for ev in tail:
+                f.write(json.dumps(ev) + "\n")
+        with open(tpath, "w") as f:
+            for ev in events[:cut]:
+                f.write(json.dumps(ev) + "\n")
+            f.write(json.dumps({"ts": _now(), "type": "rewind", "to": to,
+                                "dropped_events": len(tail)}) + "\n")
+        archived["transcript_events"] = len(tail)
+    rewinds.append(archived)
+    save_meta(sid, meta)
+    return meta
+
+
+def rewind_session(sid, to):
+    """Rewind a pending session to savepoint `to` and re-derive its
+    provenance. Returns the remaining changes."""
+    m = load_meta(sid)
+    if m.get("status") != "pending":
+        raise OverlordError(f"error: session is {m.get('status')}, not pending"
+                            + (" (rewind it through the daemon that holds it)"
+                               if m.get("status") == "open" else ""))
+    _rewind_layers(sid, m, to)
+    return _write_provenance(sid, m)
+
+
+def session_savepoints(sid, meta=None):
+    """One entry per layer: what ran, what it was for, what it changed."""
+    meta = meta or load_meta(sid)
+    sdir = session_path(sid)
+    out = []
+    for i, lrec in enumerate(meta.get("layers") or [{"n": 0}]):
+        upper = os.path.join(sdir, layer_upper_rel(i))
+        entries = (compute_diff(upper, meta["target"], meta.get("backend"))
+                   if os.path.isdir(upper) else [])
+        out.append({"n": i, "started": lrec.get("started"), "label": lrec.get("label"),
+                    "cmd": lrec.get("cmd"), "cause": lrec.get("cause"),
+                    "paths": [list(c) for c in entries]})
+    return out
+
+
+_SEL_RE = re.compile(r"^(layer|turn|tool|call)?:?(.+)$")
+
+
+def select_layers(meta, only=None, drop=None):
+    """Resolve --only / --drop selectors to ascending layer indices.
+
+    Selectors, comma-separated: layer:N, layer:A-B, turn:N, turn:A-B,
+    tool:NAME, call:TOOL_CALL_ID; a bare N or A-B means layer. turn/tool/call
+    match the cause stamped on a layer (an agent's tool call)."""
+    layers = meta.get("layers") or [{"n": 0}]
+    n = len(layers)
+
+    def parse_range(text, what):
+        try:
+            if "-" in text:
+                a, b = text.split("-", 1)
+                return int(a), int(b)
+            return int(text), int(text)
+        except ValueError:
+            raise OverlordError(f"error: bad {what} selector: {text}")
+
+    def matches(sel):
+        m = _SEL_RE.match(sel.strip())
+        kind, arg = (m.group(1) or "layer"), m.group(2)
+        if sel.strip() and ":" not in sel:
+            kind, arg = "layer", sel.strip()
+        hits = set()
+        if kind == "layer":
+            a, b = parse_range(arg, "layer")
+            hits = {i for i in range(n) if a <= i <= b}
+        elif kind == "turn":
+            a, b = parse_range(arg, "turn")
+            hits = {i for i, l in enumerate(layers)
+                    if (l.get("cause") or {}).get("turn") is not None
+                    and a <= l["cause"]["turn"] <= b}
+        elif kind == "tool":
+            hits = {i for i, l in enumerate(layers) if (l.get("cause") or {}).get("tool") == arg}
+        elif kind == "call":
+            hits = {i for i, l in enumerate(layers)
+                    if (l.get("cause") or {}).get("tool_call_id") == arg}
+        if not hits:
+            raise OverlordError(f"error: selector matches no layer: {sel.strip()}")
+        return hits
+
+    def expand(spec):
+        out = set()
+        for part in (spec or "").split(","):
+            if part.strip():
+                out |= matches(part)
+        return out
+
+    selected = expand(only) if only else set(range(n))
+    selected -= expand(drop) if drop else set()
+    if not selected:
+        raise OverlordError("error: selection leaves no layer to commit")
+    return sorted(selected)
 
 
 def _abort_launch(sid, lock, cleanup, parent_sock, proc=None):
@@ -1174,25 +1707,24 @@ def cmd_diff(args):
     upper = session_file(args.session, "upper")
     if not os.path.isdir(upper):
         raise OverlordError(f"error: session is {m.get('status')}; layers discarded")
-    changes = compute_diff(upper, m["target"], m.get("backend"))
+    changes, origin, _t, _u = session_stack(args.session, m)
     for kind, rel in changes:
-        print(f"{kind:12s} {rel}")
+        tag = f"  @{origin[rel]}" if len(m.get("layers") or ()) > 1 else ""
+        print(f"{kind:12s} {rel}{tag}")
     if not changes:
         print("no changes")
     return 0
 
 
+def _describe_cause(cause):
+    return (f"turn {cause.get('turn')} {cause.get('tool')}({cause.get('summary', '')}) "
+            f"[{cause.get('tool_call_id')}]")
+
+
 def cmd_log(args):
     load_meta(args.session)
     prov = session_file(args.session, PROVENANCE_FILE)
-    if os.path.isfile(prov):
-        with open(prov) as f:
-            for line in f:
-                rec = json.loads(line)
-                before = (rec.get("before_sha256") or "-")[:12]
-                after = (rec.get("after_sha256") or "-")[:12]
-                print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
-    else:
+    if not os.path.isfile(prov):
         print("no provenance recorded")
         return 0
     with open(prov) as f:
@@ -1200,12 +1732,11 @@ def cmd_log(args):
             rec = json.loads(line)
             before = (rec.get("before_sha256") or "-")[:12]
             after = (rec.get("after_sha256") or "-")[:12]
-            print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}")
+            layer = f"  @{rec['layer']}" if "layer" in rec else ""
+            print(f"{rec['kind']:12s} {rec['path']:40s} {before} -> {after}{layer}")
             cause = rec.get("caused_by")
             if cause:
-                print(f"{'':12s}   caused_by: turn {cause.get('turn')} "
-                      f"{cause.get('tool')}({cause.get('summary', '')}) "
-                      f"[{cause.get('tool_call_id')}]")
+                print(f"{'':12s}   caused_by: {_describe_cause(cause)}")
     for name, label in ((SYSCALLS_FILE, "syscall trace"), ("ebpf.log", "ebpf trace")):
         p = session_file(args.session, name)
         if os.path.isfile(p):
@@ -1215,37 +1746,71 @@ def cmd_log(args):
     return 0
 
 
-def commit_session(sid, merge=False, force=False):
-    """Core commit. Returns a result dict; never prints."""
+def commit_session(sid, merge=False, force=False, only=None, drop=None):
+    """Core commit. Returns a result dict; never prints.
+
+    only/drop select layers (see select_layers): the replay applies just
+    those, in order, so a decision — a tool call, a turn — can be undone
+    while everything after it that stands on its own is kept. Conflict
+    detection covers every path the selected layers would touch on replay,
+    not only the net diff. Content before and after is retained for blame."""
     m = load_meta(sid)
     if m.get("status") != "pending":
         raise OverlordError(f"error: session is {m.get('status')}, not pending")
     sdir = session_path(sid)
-    upper = os.path.join(sdir, "upper")
     with open(os.path.join(sdir, MANIFEST_FILE)) as f:
         manifest = json.load(f)
-    changes = compute_diff(upper, m["target"], m.get("backend"))
+    all_layers = list(range(len(m.get("layers") or [{"n": 0}])))
+    selected = select_layers(m, only, drop) if (only or drop) else all_layers
+    changes, origin, touched, uppers = session_stack(sid, m, selected)
     bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
     if bad:  # would _remove_target(<tree root>); no --force for this one
         raise OverlordError("error: refusing to commit — whiteout entry names its own "
                             f"tree root: {', '.join(bad)} (roll the session back)")
-    conflicts = find_conflicts(changes, manifest, m["target"])
+    conflicts = list(dict.fromkeys(find_conflicts(touched, manifest, m["target"])))
     merged = []
     if conflicts and merge:
-        merged, conflicts = try_merge(conflicts, sdir, m["target"])
+        merged, conflicts = try_merge(
+            conflicts, sdir, m["target"],
+            locate=lambda rel: _safe_join(uppers[origin[rel]], rel) if rel in origin
+            else _safe_join(uppers[-1], rel))
     if conflicts and not force:
         return {"committed": False, "conflicts": conflicts, "merged": merged,
-                "target": m["target"]}
-    n = apply_upper(upper, m["target"], m.get("backend"))
-    m.update(status="committed", committed=_now(),
-             forced=bool(conflicts), merged_paths=merged)
+                "target": m["target"], "layers": selected}
+    # provenance is derived while the tree still holds the "before" state
+    _write_provenance(sid, m, selected)
+    # retain content for blame: the tree's version before replay, then the
+    # session's version after it (both content-addressed, so nothing repeats)
+    retained = {}
+    for kind, rel in changes:
+        if kind in ("modified", "deleted"):
+            if store_object(_safe_join(m["target"], rel)):
+                retained.setdefault(rel, set()).add("before")
+    apply_layers(uppers, m["target"], m.get("backend"))
+    for kind, rel in changes:
+        if kind in ("added", "modified") and not rel.endswith("/"):
+            if store_object(_safe_join(m["target"], rel)):
+                retained.setdefault(rel, set()).add("after")
+    dropped = [i for i in all_layers if i not in selected]
+    m.update(status="committed", committed=_now(), committed_ns=time.time_ns(),
+             forced=bool(conflicts), merged_paths=merged,
+             layers_applied=selected, layers_dropped=dropped)
     save_meta(sid, m)
-    for sub in ("upper", "work", "merged", "base", "jail", "trace", MANIFEST_FILE, RAW_TRACE_FILE):
+    with open(os.path.join(sdir, PROVENANCE_FILE)) as f:
+        records = [json.loads(line) for line in f]
+    with open(os.path.join(sdir, PROVENANCE_FILE), "w") as f:
+        for rec in records:
+            for side in retained.get(rec["path"], ()):
+                rec[f"{side}_retained"] = True
+            f.write(json.dumps(rec) + "\n")
+    for sub in ("upper", "work", "merged", "base", "jail", "trace", "tmp", LAYERS_DIR,
+                MANIFEST_FILE, RAW_TRACE_FILE):
         try:
             _force_rmtree(os.path.join(sdir, sub))
         except OSError:
             pass
-    return {"committed": True, "applied": n, "merged": merged, "target": m["target"]}
+    return {"committed": True, "applied": len(changes), "merged": merged,
+            "target": m["target"], "layers": selected, "dropped": dropped}
 
 
 def rollback_session(sid):
@@ -1267,7 +1832,8 @@ def rollback_session(sid):
 
 
 def cmd_commit(args):
-    res = commit_session(args.session, merge=args.merge, force=args.force)
+    res = commit_session(args.session, merge=args.merge, force=args.force,
+                         only=args.only, drop=args.drop)
     if not res["committed"]:
         print("error: target drifted since snapshot — refusing to commit:", file=sys.stderr)
         for reason, rel in res["conflicts"]:
@@ -1278,6 +1844,9 @@ def cmd_commit(args):
     msg = f"committed {res['applied']} changes to {res['target']}"
     if res["merged"]:
         msg += f" ({len(res['merged'])} three-way merged)"
+    if res.get("dropped"):
+        msg += (f" — layers {', '.join(map(str, res['layers']))} applied, "
+                f"{', '.join(map(str, res['dropped']))} dropped")
     print(msg)
     return 0
 
@@ -1285,6 +1854,226 @@ def cmd_commit(args):
 def cmd_rollback(args):
     target = rollback_session(args.session)
     print(f"rolled back {args.session} — target untouched: {target}")
+    return 0
+
+
+def _savepoint_line(sp):
+    what = ""
+    if sp.get("cause"):
+        c = sp["cause"]
+        what = f"turn {c.get('turn')} {c.get('tool')}({c.get('summary', '')})"
+    elif sp.get("cmd"):
+        what = shlex.join(sp["cmd"])
+    n = len(sp["paths"])
+    return f"@{sp['n']:<3d} {n:3d} path{'s' if n != 1 else ' '}  {what}"
+
+
+def cmd_savepoints(args):
+    m = load_meta(args.session)
+    if not os.path.isdir(session_file(args.session, "upper")):
+        raise OverlordError(f"error: session is {m.get('status')}; layers discarded")
+    for sp in session_savepoints(args.session, m):
+        print(_savepoint_line(sp))
+        if args.paths:
+            for kind, rel in sp["paths"]:
+                print(f"      {kind:12s} {rel}")
+    if m.get("rewinds"):
+        for rw in m["rewinds"]:
+            print(f"rewound to @{rw['to']} at {rw['at']}: "
+                  f"{len(rw['layers'])} layer(s) discarded")
+    if m.get("layer_cap_hit"):
+        print(f"note: layer cap ({MAX_LAYERS}) reached; later writes share the top layer")
+    return 0
+
+
+def cmd_rewind(args):
+    changes = rewind_session(args.session, args.to)
+    print(f"rewound {args.session} to savepoint @{args.to}: {len(changes)} change(s) remain")
+    for kind, rel in changes[:20]:
+        print(f"  {kind:12s} {rel}")
+    print(f"\n  resume:   overlord resume {args.session} [--note \"...\"]")
+    return 0
+
+
+def cmd_resume(args):
+    m = load_meta(args.session)
+    if m.get("agent") and not args.cmd:
+        import agent as agent_mod
+        return agent_mod.cmd_resume(args, m)
+    if not args.cmd:
+        raise OverlordError("error: resume needs a command after -- for a non-agent session")
+    live = reopen_session(args.session, wait=args.wait)
+    try:
+        rc, _ = live.exec(args.cmd, capture=False)
+    finally:
+        sid, changes = live.close()
+    if live.expired:
+        rc = TIMEOUT_RC
+    _print_session_footer(sid, rc, m["backend"], changes)
+    return rc
+
+
+# ---------------------------------------------------------------- blame
+
+
+def _sessions_for_path(real):
+    """Committed sessions whose target contains the path, oldest commit first."""
+    hits = []
+    for sid in list_sessions():
+        m = load_meta(sid)
+        t = m.get("target") or ""
+        if m.get("status") == "committed" and (real == t or real.startswith(t + os.sep)):
+            hits.append(m)
+    # committed_ns orders commits that share a second; the wall-clock string
+    # keeps records from before it was written in their place
+    return sorted(hits, key=lambda m: (m.get("committed") or "", m.get("committed_ns") or 0))
+
+
+def _turn_text(sid, turn):
+    """What the model said in the turn that issued a tool call."""
+    path = session_file(sid, "transcript.jsonl")
+    if turn is None or not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            ev = json.loads(line)
+            if ev.get("type") == "assistant" and ev.get("turn") == turn:
+                return ev.get("text")
+    return None
+
+
+def blame_path(path):
+    """Attribute a file — and, where content was retained, each of its
+    lines — to the committed session, turn, tool call and instruction that
+    produced it. Returns a dict (see cmd_blame for the rendering)."""
+    real = os.path.realpath(path)
+    versions = []
+    for m in _sessions_for_path(real):
+        rel = os.path.relpath(real, m["target"])
+        prov = session_file(m["id"], PROVENANCE_FILE)
+        if not os.path.isfile(prov):
+            continue
+        with open(prov) as f:
+            for line in f:
+                rec = json.loads(line)
+                if rec["path"] != rel:
+                    continue
+                cause = rec.get("caused_by") or {}
+                versions.append({
+                    "sid": m["id"], "committed": m.get("committed"),
+                    "agent": m.get("agent"), "task": m.get("task"),
+                    "kind": rec["kind"], "layer": rec.get("layer"), "cause": cause,
+                    "before_sha256": rec.get("before_sha256"),
+                    "after_sha256": rec.get("after_sha256"),
+                    "said": _turn_text(m["id"], cause.get("turn")) if cause else None,
+                })
+    out = {"path": real, "versions": versions, "lines": None, "state": "unrecorded"}
+    if not versions:
+        return out
+    current = _sha256(real) if os.path.lexists(real) else None
+    last = versions[-1]
+    if last["kind"] == "deleted":
+        out["state"] = "deleted" if current is None else "recreated-outside"
+    elif current == last["after_sha256"]:
+        out["state"] = "current"
+    else:
+        out["state"] = "drifted"
+    # line attribution: walk the retained content chain
+    if not os.path.isfile(real) or os.path.islink(real):
+        return out
+    with open(real, "rb") as f:
+        raw = f.read()
+    try:
+        cur_lines = raw.decode().splitlines()
+    except UnicodeDecodeError:
+        out["state_note"] = "binary"
+        return out
+    attr = None            # per-line owner, None = chain broken (content not retained)
+    prev = None
+    first_before = load_object(versions[0].get("before_sha256"))
+    if first_before is not None:
+        try:
+            prev = first_before.decode().splitlines()
+            attr = ["origin"] * len(prev)
+        except UnicodeDecodeError:
+            prev = None
+    for i, v in enumerate(versions):
+        content = load_object(v.get("after_sha256")) if v["kind"] != "deleted" else b""
+        if content is None:
+            attr, prev = None, None
+            continue
+        try:
+            new = content.decode().splitlines()
+        except UnicodeDecodeError:
+            attr, prev = None, None
+            continue
+        attr = _attribute_lines(prev, attr, new, i)
+        prev = new
+    if attr is None or prev is None:
+        out["lines_note"] = "content not retained for every version; line blame unavailable"
+        return out
+    if cur_lines != prev:
+        attr = _attribute_lines(prev, attr, cur_lines, "drift")
+    out["lines"] = [{"n": n + 1, "owner": owner, "text": text}
+                    for n, (owner, text) in enumerate(zip(attr, cur_lines))]
+    return out
+
+
+def _attribute_lines(prev, attr, new, owner):
+    """Carry ownership across equal lines; everything inserted or replaced
+    belongs to `owner`."""
+    import difflib
+    if prev is None or attr is None:
+        return [owner] * len(new)
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, prev, new, autojunk=False).get_opcodes():
+        if op == "equal":
+            out.extend(attr[i1:i2])
+        elif op in ("insert", "replace"):
+            out.extend([owner] * (j2 - j1))
+    return out
+
+
+def cmd_blame(args):
+    res = blame_path(args.path)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0
+    vs = res["versions"]
+    if not vs:
+        print(f"{res['path']}: no committed overlord session recorded this path")
+        return 1
+    state = {"current": "current content matches the last commit",
+             "drifted": "content has changed OUTSIDE overlord since the last commit",
+             "deleted": "deleted by the last commit",
+             "recreated-outside": "deleted by the last commit, recreated outside overlord",
+             }.get(res["state"], res["state"])
+    print(f"{res['path']} — {len(vs)} recorded version(s); {state}")
+    for i, v in enumerate(vs):
+        who = f"agent {v['agent']}" if v.get("agent") else "command"
+        print(f"  [{i}] {v['sid']}  committed {v.get('committed')}  {who}  ({v['kind']})")
+        if v.get("task"):
+            print(f"      task:   {v['task']}")
+        if v.get("cause"):
+            print(f"      cause:  {_describe_cause(v['cause'])}")
+        if v.get("said"):
+            said = " ".join(v["said"].split())
+            print(f"      model:  \"{said[:240]}{'…' if len(said) > 240 else ''}\"")
+    if res.get("lines") is None:
+        if res.get("lines_note"):
+            print(f"  ({res['lines_note']})")
+        return 0
+    print()
+    for ln in res["lines"]:
+        owner = ln["owner"]
+        if isinstance(owner, int):
+            v = vs[owner]
+            c = v.get("cause") or {}
+            tag = (f"[{owner}] t{c.get('turn')} {c.get('tool')}" if c
+                   else f"[{owner}] {v['sid'][-6:]}")
+        else:
+            tag = owner
+        print(f"{ln['n']:5d}  {tag:26s} │ {ln['text']}")
     return 0
 
 
@@ -1306,6 +2095,9 @@ def cmd_doctor(args):
         ("three-way merge (git merge-file)",
          "available" if shutil.which("git") else "missing",
          bool(shutil.which("git"))),
+        ("savepoints (one overlay layer per writing command; rewind / commit --only)",
+         "kernel: exact" if k else ("fuse: best effort (remount between commands)"
+                                    if fu else "no backend"), k or fu),
     ]
     try:
         with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
@@ -1323,7 +2115,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -1397,7 +2189,58 @@ def _api_commit(req):
         if not rule.get("allow_force", False):
             raise OverlordError("error: policy forbids --force commits on this target")
     return commit_session(req["sid"], merge=bool(req.get("merge")),
-                          force=bool(req.get("force")))
+                          force=bool(req.get("force")),
+                          only=req.get("only"), drop=req.get("drop"))
+
+
+def _api_rewind(req):
+    """Rewind a session this daemon holds open, or a pending one."""
+    ls = LIVE.get(req["sid"])
+    to = req.get("to")
+    if not isinstance(to, int):
+        raise OverlordError("error: rewind needs an integer savepoint")
+    if ls is not None:
+        ls.rewind(to)
+        return {"sid": ls.sid, "to": to, "changes": ls.changes(), "open": True}
+    return {"sid": req["sid"], "to": to, "changes": rewind_session(req["sid"], to),
+            "open": False}
+
+
+def _api_savepoints(req):
+    ls = LIVE.get(req["sid"])
+    return {"savepoints": session_savepoints(req["sid"], ls.meta if ls else None)}
+
+
+def _api_resume(req, emit):
+    """Streaming op: reopen a pending agent session and let the model carry
+    on from its restored transcript (after a rewind, typically), with an
+    optional operator note; then seal it again."""
+    import agent as agent_mod
+    m = load_meta(req["sid"])
+    if not m.get("agent"):
+        raise OverlordError("error: not an agent session; use open/exec on it instead")
+    provider = agent_mod.provider_for(m, req.get("provider"), req.get("model"))
+    ls = reopen_session(req["sid"], wait=bool(req.get("wait")), capture=True)
+    LIVE[ls.sid] = ls
+    emit({"ok": True, "event": "session", "sid": ls.sid, "grants": ls.meta["grants"],
+          "backend": ls.meta["backend"]})
+    final = ""
+    try:
+        final = agent_mod.run_agent(
+            ls, provider, m.get("task", ""), max_turns=int(req.get("max_turns") or
+                                                        agent_mod.DEFAULT_MAX_TURNS),
+            emit=lambda ev: emit({"ok": True, "event": "agent", **ev}),
+            should_stop=lambda: ls.sid in AGENT_CANCEL,
+            resume=True, note=req.get("note"))
+    except SystemExit as e:
+        emit({"ok": True, "event": "agent", "type": "error", "text": str(e)})
+    finally:
+        AGENT_CANCEL.discard(ls.sid)
+        LIVE.pop(ls.sid, None)
+        sid, changes = ls.close()
+    m = load_meta(sid)
+    return {"sid": sid, "final": final, "changes": changes, "grants": m.get("grants"),
+            "usage": m.get("usage"), "exit_code": m.get("exit_code")}
 
 
 def _api_log(req):
@@ -1528,17 +2371,19 @@ DAEMON_OPS = {
     "run": _api_run,
     "open": _api_open,
     "close": _api_close,
-    "diff": lambda req: {"changes": compute_diff(
-        session_file(req["sid"], "upper"), load_meta(req["sid"])["target"],
-        load_meta(req["sid"]).get("backend"))},
+    "diff": lambda req: {"changes": (LIVE[req["sid"]].changes() if req["sid"] in LIVE
+                                     else session_stack(req["sid"])[0])},
     "log": _api_log,
     "commit": _api_commit,
     "rollback": _api_rollback,
     "sessions": lambda req: {"sessions": [load_meta(s) for s in list_sessions()]},
     "agent_cancel": _api_agent_cancel,
     "transcript": _api_transcript,
+    "savepoints": _api_savepoints,
+    "rewind": _api_rewind,
+    "blame": lambda req: blame_path(req["path"]),
 }
-STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent}
+STREAMING_OPS = {"exec": _api_exec, "agent": _api_agent, "resume": _api_resume}
 
 
 def cmd_daemon(args):
@@ -1660,10 +2505,47 @@ def main(argv=None):
                     help="three-way merge external drift (session needs --merge-base)")
     pc.add_argument("--force", action="store_true",
                     help="commit even if the target drifted since snapshot")
+    pc.add_argument("--only", metavar="SEL",
+                    help="replay only these layers: layer:N, layer:A-B, turn:N, "
+                         "tool:NAME, call:ID (comma-separated)")
+    pc.add_argument("--drop", metavar="SEL",
+                    help="replay everything except these layers (same selectors)")
     pc.set_defaults(fn=cmd_commit)
 
+    psv = sub.add_parser("savepoints", help="the layer stack: one savepoint per writing command")
+    psv.add_argument("session")
+    psv.add_argument("--paths", action="store_true", help="list each savepoint's paths")
+    psv.set_defaults(fn=cmd_savepoints)
+
+    prw = sub.add_parser("rewind", help="discard every layer above a savepoint")
+    prw.add_argument("session")
+    prw.add_argument("--to", type=int, required=True, metavar="N",
+                     help="savepoint to return to (see `overlord savepoints`)")
+    prw.set_defaults(fn=cmd_rewind)
+
+    prs = sub.add_parser("resume", help="reopen a pending session: continue the agent, "
+                                         "or run another command on its stack")
+    prs.add_argument("session")
+    prs.add_argument("--note", help="operator note the resumed model reads first")
+    prs.add_argument("--provider", choices=["anthropic", "openai", "scripted"],
+                     help="override the session's recorded provider")
+    prs.add_argument("--model")
+    prs.add_argument("--max-turns", type=int)
+    prs.add_argument("--wait", action="store_true",
+                     help="queue behind an executing session instead of failing")
+    prs.add_argument("cmd", nargs="*", metavar="-- CMD",
+                     help="non-agent sessions: the command to run on the stack "
+                          "(after --)")
+    prs.set_defaults(fn=cmd_resume)
+
+    pb = sub.add_parser("blame", help="which session, turn, tool call and instruction "
+                                       "put each line of a file there")
+    pb.add_argument("path")
+    pb.add_argument("--json", action="store_true")
+    pb.set_defaults(fn=cmd_blame)
+
     args = p.parse_args(argv)
-    if getattr(args, "cmd", None) is not None:
+    if getattr(args, "cmd", None) is not None and args.command != "resume":
         if args.cmd and args.cmd[0] == "--":
             args.cmd = args.cmd[1:]
         if not args.cmd:

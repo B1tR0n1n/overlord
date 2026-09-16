@@ -66,10 +66,16 @@ overlord agent --no-jail -t /srv/app "<task>"        # opt out: tools reach the 
 overlord sessions                # pending/committed history with command provenance
 overlord diff <session>          # added / modified / deleted / replaced-dir
 overlord log <session>           # per-change sha256 before -> after, syscall count
+overlord savepoints <session>    # the layer stack: one savepoint per command that wrote
+overlord rewind <session> --to 3 # discard everything above savepoint @3
+overlord resume <session> --note "..."   # agent carries on from there, reading the note
 overlord commit <session>        # verify no external drift, replay onto real tree
+overlord commit --drop tool:shell <sess>     # replay all but the shell tool's layers
+overlord commit --only turn:2-4 <sess>       # replay only what turns 2–4 did
 overlord commit --merge <sess>   # three-way merge non-overlapping drift (needs --merge-base)
 overlord commit --force <sess>   # commit despite drift (explicit override)
 overlord rollback <session>      # discard — target byte-identical
+overlord blame <path>            # which session, turn, tool call, instruction put each line here
 overlord doctor                  # backend / dependency diagnostics
 ```
 
@@ -101,18 +107,65 @@ Arbitration: one executing session per target (flock; `--wait` queues), and a
 new session is refused while another is pending on the same target (`--stack`
 overrides).
 
+## Savepoints: the tool call is the transaction
+
+A session's upper layer is a *stack*. Every command that writes seals its
+layer; the next command starts a new one. Each command runs in its own mount
+namespace over the current stack (`lowerdir=layer_k:…:layer_0:target`), so a
+savepoint costs one mount and copies nothing — it is SQL's `SAVEPOINT` on the
+kernel's own overlay primitive. For the agent that means one savepoint per
+tool call, stamped with the call that caused it. Three things fall out:
+
+```bash
+overlord savepoints <session>          # @0  1 path  turn 2 write_file(src/hello.py)
+                                       # @1  2 paths turn 3 shell(rm scratch.txt; rm old.txt)
+                                       # @2  1 path  turn 5 write_file(lib.py)
+overlord rewind <session> --to 1       # world as it was after turn 3; transcript cut to match
+overlord resume <session> --note "keep scratch.txt; make a() return 3"
+overlord commit <session> --drop turn:3          # undo a decision, keep what came after
+overlord blame src/lib.py              # per line: session · turn · tool call · the prompt
+```
+
+- **Rewind the agent to a thought.** `rewind` drops the layers above a
+  savepoint and cuts the agent's transcript at the same point (the dropped
+  tail is archived, because a rewind is itself an act with provenance).
+  `resume` reopens the session on the surviving stack, rebuilds the model's
+  message history exactly as it saw it, delivers your note as the next user
+  turn, and lets it continue — from a world that matches what it remembers.
+- **Commit by cause, not by path.** `commit --only` / `--drop` take selectors
+  (`layer:N`, `layer:A-B`, `turn:N`, `tool:NAME`, `call:ID`) and replay just
+  those layers in order. Overlayfs copies a whole file up on first write, so
+  every layer's entries are complete and any ascending subset replays to a
+  well-defined tree. Conflict detection covers every path the selected layers
+  would touch on replay — not only the net diff — so a file one layer created
+  and a later one deleted still cannot clobber a same-named file that
+  appeared outside.
+- **Blame to the prompt.** Commit retains the content it replaced and the
+  content it wrote (content-addressed under `~/.overlord/objects`, capped per
+  file by `OVERLORD_OBJECT_MAX`). `blame` walks the committed versions of a
+  file and attributes each line to the session, turn, tool call and task that
+  first produced it — `origin` for lines older than the record, `drift` for
+  lines changed outside OVERLORD since the last commit.
+
+Layers are addressed relative to the session dir (the mount data page is
+4 KiB) and capped at 200 per session; past the cap the top layer keeps
+absorbing writes. On the fuse backend the merged view is remounted between
+commands; a lingering process that pins it makes the next savepoint coarser
+rather than failing. Rewind is refused while a command is running.
+
 ## Mission control (web UI)
 
 ```bash
 overlord ui          # http://127.0.0.1:7777 — localhost only
 ```
 
-![OVERLORD mission control — a pending session rendered as a dossier: grant envelope, manifest of changed paths with tool-call attribution and before/after hashes, commit or void](assets/ui.png)
+![OVERLORD mission control — a pending agent session's savepoint chain: one row per tool call that wrote, each with its paths, a keep checkbox that drops it from the commit when unticked, and a rewind-here control; the disposition below commits or voids](assets/ui.png)
 
 The review moment for human eyes, rendered as a document of record rather than
 a dashboard. The register indexes sessions; the dossier is the instrument a
 human signs: the grant envelope the session ran under, a manifest of every
 changed path with its before → after hashes and the tool call that caused it,
+the savepoint chain (rewind to any row; untick a row and the commit drops it),
 and the disposition — commit or void. Zero dependencies (stdlib http server),
 server-rendered first paint, binds 127.0.0.1 only.
 
@@ -162,7 +215,9 @@ the OS, built on the kernel's own isolation rather than a new one.
 ## Provenance
 
 Every session records `provenance.jsonl` — one record per change with sha256
-before (lower) and after (upper), which survives commit. With `--trace`, a
+before (lower) and after (upper), the savepoint layer that holds the final
+content and the cause stamped on it (`caused_by`: turn, tool, call id,
+summary), which survives commit and is what `blame` reads. With `--trace`, a
 syscall-level record (`syscalls.jsonl`: exec, file mutation, connect, per pid,
 timestamped) is captured via strace. `--trace ebpf` uses the bpftrace recorder
 instead (installed to /usr/local/lib/overlord/provenance.bt) — lower overhead
@@ -176,9 +231,13 @@ bash test/smoke.sh                # 26 core transactional + replay-safety assert
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
 python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
-python3 test/ui_test.py           # 9 mission-control API + origin-guard assertions
-python3 test/ui_browser_test.py   # 8 mission-control DOM assertions (needs playwright)
+python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions
+python3 test/ui_test.py           # 10 mission-control API + origin-guard + savepoint assertions
+python3 test/ui_browser_test.py   # 9 mission-control DOM assertions (needs playwright)
 ```
+
+`savepoint_test.py` runs on whichever backend is live; `OVERLORD_TEST_BACKEND=fuse`
+forces the cooperative one, so both stacking implementations are exercised.
 
 `ui_test.py` drives the HTTP API; `ui_browser_test.py` loads the page in
 Chromium and asserts on the rendered DOM — console errors, the dossier
@@ -201,6 +260,9 @@ grants are absent.
 - token/cost budget grants for LLM-backed agents
 - eBPF recorder hardening (attach-race close, structured output)
 - multi-target sessions; cross-target atomic commit
+- forks: resume a rewound session as a new session so branches from one
+  savepoint can be compared before either is committed
+- blame across renames; a `blame` view in mission control
 
 ## Status
 
@@ -233,3 +295,17 @@ grants are absent.
   launch; a Chromium DOM test suite.
 - 2026-09-15 — merged to `master`. SonarCloud quality gate green; 80 assertions
   across six suites.
+- 2026-09-16 — v0.6: savepoints. The session holder now stays outside the
+  jail and every command enters its own mount namespace over the current
+  layer stack, so each writing command (each agent tool call) seals its own
+  overlay layer with its cause stamped on it. On that: `rewind` (layers and
+  transcript cut together, tail archived), `resume` (message history rebuilt
+  as the model saw it, operator note injected), `commit --only/--drop`
+  (replay a selection of layers; conflicts checked on everything replay would
+  touch), and `blame` (committed content retained content-addressed; per-line
+  attribution to session, turn, tool call and task, with drift detection).
+  Mission control renders the chain with rewind-here and keep/drop controls;
+  daemon ops and SDK methods for all of it. Also fixed: `log` printed its
+  records twice; on the fuse backend a brand-new directory read as
+  `replaced-dir` and its marker files could reach the tree on commit. 92
+  assertions across seven suites, both backends.

@@ -12,7 +12,8 @@ overlord run --jail --net none --timeout 600 -t ~/projects/app -- \
 
 overlord diff <session>      # what it did
 overlord log  <session>      # hashes before -> after
-overlord commit <session>    # or rollback
+overlord savepoints <session>  # one per command that wrote; rewind --to N
+overlord commit <session>    # or rollback; --drop / --only select savepoints
 ```
 
 The agent believes it edited the project. Nothing is real until you commit.
@@ -50,6 +51,34 @@ if session.exit_code == 0:
 else:
     session.rollback()
 ```
+
+### Savepoints from the SDK
+
+Every `exec` that writes seals a layer; `savepoints()` lists them, `rewind(n)`
+drops everything above one (on a live session between commands, or on a
+pending one), `commit(only=..., drop=...)` replays a selection, and
+`blame(path)` answers who put each line there:
+
+```python
+live = ov.open("/srv/app", jail=True, net="none")
+live.exec(["bash", "-c", "echo a > a.txt"])            # savepoint @0
+live.exec(["bash", "-c", "rm a.txt; echo b > b.txt"])  # savepoint @1
+live.rewind(0)                                          # a.txt is back
+session = live.close()
+session.commit(drop="layer:0")                          # or only="turn:2-4", "tool:write_file"
+
+for line in ov.blame("/srv/app/b.txt")["lines"]:
+    print(line["n"], line["owner"], line["text"])   # owner: version index, "origin" or "drift"
+
+# an agent session: rewind to a thought, tell it what you want, let it go on
+s = ov.agent("/srv/app", "add a Makefile with a test target", jail=True, net="none")
+ov.rewind(s.sid, 1)
+s = ov.resume(s.sid, note="use pytest, not unittest", on_event=print)
+```
+
+`resume` streams the same transcript events as `agent`; the session keeps its
+id, and its `transcript.jsonl` carries a `rewind` and a `resume` event where the
+history was cut and picked up.
 
 ## 3. Policy-brokered fleets (the operator holds the keys)
 

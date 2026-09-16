@@ -162,6 +162,47 @@ try:
         fail(f"same-origin rollback broke: {res}")
     ok("same-origin requests still work; CSP + nosniff present")
 
+    # --- savepoints: the dossier shows the chain; rewind and drop act on it ---
+    sys.path.insert(0, HERE)
+    import overlord as core
+    live = core.open_session(target, None, {"net": "host", "jail": False,
+                                            "timeout": None, "merge_base": False})
+    live.exec(["bash", "-c", "echo one > s1.txt"])
+    live.exec(["bash", "-c", "echo two > s2.txt"])
+    live.exec(["bash", "-c", "echo three > s3.txt"])
+    sid3, _ = live.close()
+    page = json.loads(req(f"/api/view/session/{sid3}"))["dossier"]
+    if "03 &mdash; Savepoints" not in page or "3 savepoints" not in page:
+        fail("savepoints section missing from the dossier")
+    if page.count('data-keep="') != 3 or page.count('data-rewind="') != 2 or "s3.txt" not in page:
+        fail(f"savepoint controls: keep={page.count('data-keep=')} rewind={page.count('data-rewind=')}")
+    detail = json.loads(req(f"/api/session/{sid3}"))
+    if [len(sp["paths"]) for sp in detail["savepoints"]] != [1, 1, 1]:
+        fail(f"savepoints payload: {detail['savepoints']}")
+    for bad in ('{"to": "1"}', '{"to": true}', '{"to": 9}'):
+        try:
+            req(f"/api/session/{sid3}/rewind", data=bad, method="POST")
+            fail(f"bad rewind accepted: {bad}")
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                fail(f"bad rewind {bad}: expected 400, got {e.code}")
+    res = json.loads(req(f"/api/session/{sid3}/rewind", data='{"to": 1}', method="POST"))
+    if sorted(p for _k, p in res["changes"]) != ["s1.txt", "s2.txt"]:
+        fail(f"ui rewind: {res}")
+    page = json.loads(req(f"/api/view/session/{sid3}"))["dossier"]
+    if "2 savepoints" not in page or "Rewound to @1" not in page or "s3.txt" in page:
+        fail("dossier not re-rendered after rewind")
+    res = json.loads(req(f"/api/session/{sid3}/commit", data='{"drop": "0"}', method="POST"))
+    if not res.get("committed") or res.get("dropped") != [0]:
+        fail(f"ui commit with drop: {res}")
+    if os.path.exists(os.path.join(target, "s1.txt")) or not os.path.exists(
+            os.path.join(target, "s2.txt")):
+        fail("dropped savepoint reached the tree, or kept one did not")
+    page = json.loads(req(f"/api/view/session/{sid3}"))["dossier"]
+    if 'class="n dropped">@0' not in page or "savepoints @0" not in page:
+        fail("committed dossier does not show the dropped savepoint")
+    ok("savepoints rendered; rewind and drop-on-commit act through the UI")
+
     print("PASS: mission control")
 finally:
     server.terminate()

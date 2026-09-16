@@ -168,6 +168,21 @@ try:
             fail(f"session status leaked into the grant envelope: {grants!r}")
         ok("grant envelope shows capability, not status")
 
+        # Savepoints: the chain renders, and "Rewind here" acts through the
+        # same delegated click path as everything else.
+        before = page.locator(".sp tbody tr").count()
+        if before < 2 or page.locator("[data-rewind]").count() != before - 1:
+            fail(f"savepoints: {before} rows, {page.locator('[data-rewind]').count()} rewind controls")
+        page.locator("[data-rewind]").first.click()
+        page.wait_for_timeout(800)
+        clean("rewind click")
+        after = page.locator(".sp tbody tr").count()
+        if after != 1 or "rewound to @0" not in page.locator(".sp-note").first.inner_text().lower():
+            fail(f"rewind via the page: {before} -> {after} rows")
+        if page.locator(".manifest tbody tr").count() >= rows:
+            fail("manifest did not shrink after rewind")
+        ok(f"savepoints rendered; rewind here cut {before} rows to {after}")
+
         # Drift refusal: server-rendered, must reach the page intact.
         page.locator(".reg-item").filter(has_not_text="JAIL").first.click()
         page.wait_for_timeout(600)

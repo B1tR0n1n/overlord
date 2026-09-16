@@ -47,9 +47,13 @@ class Session:
     def log(self):
         return self._client._call("log", sid=self.sid)["provenance"]
 
-    def commit(self, merge=False, force=False):
-        """Returns the commit result dict; raises on conflict refusal."""
-        res = self._client._call("commit", sid=self.sid, merge=merge, force=force)
+    def commit(self, merge=False, force=False, only=None, drop=None):
+        """Returns the commit result dict; raises on conflict refusal.
+        only/drop select layers to replay: "layer:N", "layer:A-B", "turn:N",
+        "tool:NAME", "call:ID", comma-separated — undo a decision, keep the
+        rest."""
+        res = self._client._call("commit", sid=self.sid, merge=merge, force=force,
+                                 only=only, drop=drop)
         if not res.get("committed"):
             raise OverlordError(
                 "commit refused — target drifted: "
@@ -59,6 +63,17 @@ class Session:
 
     def rollback(self):
         return self._client._call("rollback", sid=self.sid)["target"]
+
+    def savepoints(self):
+        """One entry per layer: n, cause (tool call) or cmd, and its paths."""
+        return self._client._call("savepoints", sid=self.sid)["savepoints"]
+
+    def rewind(self, to):
+        """Discard every layer above savepoint `to`. Returns the daemon's
+        result (remaining changes); self.changes is refreshed."""
+        res = self._client._call("rewind", sid=self.sid, to=int(to))
+        self.changes = [tuple(c) for c in res["changes"]]
+        return res
 
     def __repr__(self):
         return (f"<overlord.Session {self.sid} exit={self.exit_code} "
@@ -150,6 +165,36 @@ class OverlordClient:
     def agent_cancel(self, sid):
         return self._call("agent_cancel", sid=sid)
 
+    def resume(self, sid, note=None, provider=None, model=None, max_turns=None,
+               wait=False, on_event=None):
+        """Reopen a pending agent session (after a rewind, typically) and let
+        the model continue from its restored transcript, reading `note` as an
+        operator message first. Returns a Session plus the agent's final text."""
+        def _ev(ev):
+            if not on_event:
+                return
+            if ev.get("event") == "session":
+                on_event({"type": "session", "sid": ev["sid"], "grants": ev["grants"]})
+            elif ev.get("event") == "agent":
+                on_event({k: v for k, v in ev.items() if k not in ("ok", "event")})
+        res = self._call("resume", on_event=_ev, sid=sid, note=note, provider=provider,
+                         model=model, max_turns=max_turns, wait=wait)
+        s = Session(self, res["sid"], res.get("exit_code"), res["changes"], res.get("grants"))
+        s.final, s.usage = res.get("final", ""), res.get("usage")
+        return s
+
+    def savepoints(self, sid):
+        return self._call("savepoints", sid=sid)["savepoints"]
+
+    def rewind(self, sid, to):
+        """Rewind a pending session (or one this daemon holds open)."""
+        return self._call("rewind", sid=sid, to=int(to))
+
+    def blame(self, path):
+        """Which committed session, turn, tool call and instruction produced
+        the file at path — per line where content was retained."""
+        return self._call("blame", path=str(path))
+
     def transcript(self, sid):
         return self._call("transcript", sid=sid)["transcript"]
 
@@ -181,6 +226,14 @@ class LiveSession:
 
     def diff(self):
         return [tuple(c) for c in self._c._call("diff", sid=self.sid)["changes"]]
+
+    def savepoints(self):
+        return self._c._call("savepoints", sid=self.sid)["savepoints"]
+
+    def rewind(self, to):
+        """Drop every layer above savepoint `to` while the session stays open
+        (refused while a command is running). Returns the daemon's result."""
+        return self._c._call("rewind", sid=self.sid, to=int(to))
 
     def close(self):
         """Seal the transaction; returns a Session to inspect/commit/rollback."""

@@ -18,10 +18,13 @@ changes=0. Jailed, the model sees system dirs and the target and nothing else,
 and the guarantee holds: nothing it does touches anything until commit.
 --no-jail drops that and says so on stderr.
 
-Provenance is linked: after each tool call the upper layer is re-hashed, and
-any path whose content changed is attributed to that tool call. The record
-lands in provenance.jsonl as `caused_by` at close, next to the transcript
-(transcript.jsonl) so "why did this file change" has a complete answer.
+Provenance is structural: every tool call that writes seals its own overlay
+layer (a savepoint), stamped with the call that caused it, so each changed
+path names its turn, tool and instruction in provenance.jsonl (`caused_by`)
+next to the transcript (transcript.jsonl). Because the layer stack and the
+transcript are cut at the same savepoint, `overlord rewind` followed by
+`overlord resume` puts the model back in a world that matches what it
+remembers, with an optional operator note injected at that point.
 
 Providers are stdlib-only (urllib). Keys come from the environment
 (ANTHROPIC_API_KEY / OPENAI_API_KEY) or ~/.overlord/keys.json (mode 0600):
@@ -31,7 +34,6 @@ Providers are stdlib-only (urllib). Keys come from the environment
 import base64
 import json
 import os
-import shlex
 import sys
 import time
 import urllib.error
@@ -293,29 +295,35 @@ def _rel_ok(path):
 class ToolRunner:
     def __init__(self, live):
         self.live = live
+        self._cause = None
 
-    def run(self, name, inp, label):
+    def run(self, name, inp, label, cause=None):
         fn = getattr(self, f"t_{name}", None)
         if fn is None:
             return f"error: unknown tool {name}", 1
+        self._cause = cause
         try:
             return fn(inp, label)
         except (ov.OverlordError, SystemExit) as e:
             return f"error: {e}", 1
 
+    def _exec(self, cmd, timeout, label):
+        # the cause rides along so the layer this command writes into is
+        # stamped with the tool call — that is what provenance reports
+        rc, out = self.live.exec(cmd, timeout=timeout, label=label, cause=self._cause)
+        return out.decode(errors="replace"), rc
+
     def t_list_dir(self, inp, label):
         p = _rel_ok(inp.get("path", "."))
         if p is None:
             return "error: path must be relative to the project root", 1
-        rc, out = self.live.exec(["ls", "-lA", "--", p], timeout=30, label=label)
-        return out.decode(errors="replace"), rc
+        return self._exec(["ls", "-lA", "--", p], 30, label)
 
     def t_read_file(self, inp, label):
         p = _rel_ok(inp.get("path"))
         if p is None:
             return "error: path must be relative to the project root", 1
-        rc, out = self.live.exec(["cat", "--", p], timeout=30, label=label)
-        return out.decode(errors="replace"), rc
+        return self._exec(["cat", "--", p], 30, label)
 
     def t_write_file(self, inp, label):
         p = _rel_ok(inp.get("path"))
@@ -326,58 +334,127 @@ class ToolRunner:
                 "d and os.makedirs(d, exist_ok=True); "
                 "open(p,'wb').write(base64.b64decode(sys.argv[2])); "
                 "print('wrote', p, os.path.getsize(p), 'bytes')")
-        rc, out = self.live.exec(["python3", "-c", code, p, b64], timeout=30, label=label)
-        return out.decode(errors="replace"), rc
+        return self._exec(["python3", "-c", code, p, b64], 30, label)
 
     def t_shell(self, inp, label):
         cmd = inp.get("command", "")
         timeout = float(inp.get("timeout") or 300)
-        rc, out = self.live.exec(["bash", "-c", cmd], timeout=timeout, label=label)
-        return out.decode(errors="replace"), rc
+        return self._exec(["bash", "-c", cmd], timeout, label)
 
 
 # ---------------------------------------------------------------- provenance link
 
 
 class Attribution:
-    """Re-hash the upper layer after each tool call; attribute every path whose
-    content changed to that call. Persisted as attribution.json so the engine
-    can fold it into provenance.jsonl at close."""
+    """Re-hash the flattened stack after each tool call to report which paths
+    that call touched (for the transcript and the operator's eyes). The
+    durable attribution is the cause stamped on each layer by the engine."""
 
     def __init__(self, live):
         self.live = live
-        self.upper = os.path.join(live.sdir, "upper")
         self.state = self._snapshot()
-        self.map = {}
 
     def _snapshot(self):
-        changes = ov.compute_diff(self.upper, self.live.meta["target"])
-        recs = ov.build_provenance(changes, self.upper, self.live.meta["target"])
+        changes, origin, _t, uppers = self.live.stack()
+        recs = ov.build_provenance(changes, None, self.live.meta["target"], origin, uppers)
         return {r["path"]: (r["kind"], r.get("after_sha256")) for r in recs}
 
     def attribute(self, cause):
         now = self._snapshot()
         touched = [p for p, v in now.items() if self.state.get(p) != v]
         touched += [p for p in self.state if p not in now]   # reverted
-        for p in touched:
-            self.map[p] = cause
         self.state = now
-        with open(os.path.join(self.live.sdir, "attribution.json"), "w") as f:
-            json.dump(self.map, f)
         return touched
 
 
 # ---------------------------------------------------------------- the loop
 
 
+def _restore_messages(events):
+    """Rebuild the neutral message list from a transcript, exactly as the
+    model saw it. A turn cut short by a rewind keeps only the tool calls
+    that still have results, so every provider's pairing rule holds."""
+    messages, turn = [], 0
+    for ev in events:
+        t = ev.get("type")
+        if t == "task":
+            messages.append({"role": "user", "content": ev.get("text", "")})
+        elif t == "assistant":
+            turn = max(turn, ev.get("turn", 0))
+            messages.append({"role": "assistant", "content": ev.get("text", ""),
+                             "tool_calls": [], "_turn": ev.get("turn")})
+        elif t == "tool_call":
+            turn = max(turn, ev.get("turn", 0))
+            if not (messages and messages[-1]["role"] == "assistant"
+                    and messages[-1].get("_turn") == ev.get("turn")):
+                messages.append({"role": "assistant", "content": "", "tool_calls": [],
+                                 "_turn": ev.get("turn")})
+            messages[-1]["tool_calls"].append(
+                {"id": ev["id"], "name": ev["tool"], "input": ev.get("input") or {}})
+        elif t == "tool_result":
+            out = ev.get("output", "")
+            if len(out) > MAX_TOOL_OUTPUT:
+                out = (out[:MAX_TOOL_OUTPUT // 2] + "\n...[truncated]...\n"
+                       + out[-MAX_TOOL_OUTPUT // 2:])
+            rc = ev.get("exit_code", 0)
+            content = out if rc == 0 else f"{out}\n[exit code {rc}]"
+            messages.append({"role": "tool", "tool_call_id": ev["id"],
+                             "content": content or "(no output)"})
+        elif t == "resume" and ev.get("note"):
+            messages.append({"role": "user", "content": ev["note"]})
+    answered = {m["tool_call_id"] for m in messages if m["role"] == "tool"}
+    for m in messages:
+        if m["role"] == "assistant":
+            m["tool_calls"] = [tc for tc in m["tool_calls"] if tc["id"] in answered]
+            m.pop("_turn", None)
+    # a tool message must follow the assistant message that asked for it
+    out = []
+    for m in messages:
+        if m["role"] == "tool" and not any(
+                p["role"] == "assistant" and any(tc["id"] == m["tool_call_id"]
+                                                 for tc in p["tool_calls"]) for p in out):
+            continue
+        out.append(m)
+    return out, turn
+
+
+def _operator_note(live, note):
+    layers = live.meta.get("layers") or []
+    top = layers[-1] if layers else {}
+    where = ""
+    if top.get("cause"):
+        c = top["cause"]
+        where = f" after turn {c.get('turn')} {c.get('tool')}({c.get('summary', '')})"
+    text = (f"OPERATOR: this session was paused{where} and is now resumed. The "
+            f"project tree is exactly as it was at that point; anything you did "
+            f"after it was undone.")
+    if note:
+        text += f"\nOperator note: {note}"
+    return text + "\nContinue the task from here."
+
+
 def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
-              should_stop=None):
+              should_stop=None, resume=False, note=None):
     """Drive the model against an open LiveSession until it stops calling
     tools, hits max_turns, or should_stop() is true. Emits events:
       assistant / tool_call / tool_result / done / error
+    With resume=True the transcript already on disk (as cut by rewind) is
+    the model's memory; an operator note is delivered as the next user turn.
     Returns the final assistant text."""
     emit = emit or (lambda e: None)
-    transcript = open(os.path.join(live.sdir, "transcript.jsonl"), "a")
+    tpath = os.path.join(live.sdir, "transcript.jsonl")
+    start_turn = 1
+    messages = [{"role": "user", "content": task}]
+    if resume:
+        events = []
+        if os.path.isfile(tpath):
+            with open(tpath) as f:
+                events = [json.loads(line) for line in f if line.strip()]
+        messages, last_turn = _restore_messages(events)
+        if not messages:
+            messages = [{"role": "user", "content": task}]
+        start_turn = last_turn + 1
+    transcript = open(tpath, "a")
 
     def record(ev):
         ev = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **ev}
@@ -387,16 +464,21 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
 
     live.meta["agent"] = f"{provider.name}:{getattr(provider, 'model', '-')}"
     live.meta["task"] = task
-    live.meta["usage"] = {"in": 0, "out": 0}
+    live.meta.setdefault("usage", {"in": 0, "out": 0})
     ov.save_meta(live.sid, live.meta)
 
     tools = ToolRunner(live)
     attribution = Attribution(live)
-    messages = [{"role": "user", "content": task}]
-    record({"type": "task", "text": task, "agent": live.meta["agent"]})
+    if resume:
+        text = _operator_note(live, note)
+        messages.append({"role": "user", "content": text})
+        record({"type": "resume", "note": text, "turn": start_turn - 1,
+                "layer": live.current_layer})
+    else:
+        record({"type": "task", "text": task, "agent": live.meta["agent"]})
     final = ""
     try:
-        for turn in range(1, max_turns + 1):
+        for turn in range(start_turn, start_turn + max_turns):
             if should_stop and should_stop():
                 record({"type": "done", "reason": "cancelled", "turn": turn})
                 return final
@@ -417,9 +499,9 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                 record({"type": "tool_call", "turn": turn, "id": tc["id"],
                         "tool": tc["name"], "input": tc["input"]})
                 label = f"turn{turn}:{tc['id']}:{tc['name']}"
-                out, rc = tools.run(tc["name"], tc["input"], label)
                 cause = {"turn": turn, "tool_call_id": tc["id"], "tool": tc["name"],
                          "summary": _summarize(tc)}
+                out, rc = tools.run(tc["name"], tc["input"], label, cause)
                 touched = attribution.attribute(cause)
                 if len(out) > MAX_TOOL_OUTPUT:
                     out = (out[:MAX_TOOL_OUTPUT // 2] + "\n...[truncated]...\n"
@@ -429,8 +511,8 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
                                  "content": content or "(no output)"})
                 record({"type": "tool_result", "turn": turn, "id": tc["id"],
                         "tool": tc["name"], "exit_code": rc, "output": out,
-                        "touched": touched})
-        record({"type": "done", "reason": "max_turns", "turn": max_turns,
+                        "touched": touched, "layer": live.current_layer})
+        record({"type": "done", "reason": "max_turns", "turn": start_turn + max_turns - 1,
                 "usage": live.meta["usage"]})
         return final
     except (ov.OverlordError, SystemExit) as e:
@@ -478,32 +560,63 @@ def cmd_agent(args):
     print(f"overlord agent: {provider.name}/{provider.model} over {live.meta['target']}"
           f"  [session {live.sid}]", file=sys.stderr)
 
-    def show(ev):
-        t = ev["type"]
-        if t == "assistant":
-            print(f"\n{ev['text']}\n")
-        elif t == "tool_call":
-            print(f"  → {ev['tool']}  {_summarize({'name': ev['tool'], 'input': ev['input']})}")
-        elif t == "tool_result":
-            tail = ev["output"].strip().splitlines()[-3:]
-            for line in tail:
-                print(f"      {line[:160]}")
-            print(f"    exit={ev['exit_code']}"
-                  + (f"  touched={len(ev['touched'])}" if ev["touched"] else ""))
-        elif t == "done":
-            print(f"\n[{ev['reason']} after {ev['turn']} turn(s), "
-                  f"tokens in/out {ev.get('usage', {}).get('in', 0)}/"
-                  f"{ev.get('usage', {}).get('out', 0)}]")
-        elif t == "error":
-            print(f"\n[error] {ev['text']}", file=sys.stderr)
-
     try:
-        run_agent(live, provider, args.task, max_turns=args.max_turns, emit=show)
+        run_agent(live, provider, args.task, max_turns=args.max_turns, emit=_show)
     finally:
         sid, changes = live.close()
     ov._print_session_footer(sid, ov.load_meta(sid).get("exit_code"),
                              ov.load_meta(sid)["backend"], changes)
     return 0
+
+
+def provider_for(meta, provider=None, model=None):
+    """The provider a session ran with (meta['agent'] is 'name:model'),
+    unless overridden."""
+    recorded = (meta.get("agent") or ":").split(":", 1)
+    name = provider or recorded[0] or "anthropic"
+    if not provider and not model and len(recorded) > 1 and recorded[1] not in ("", "-"):
+        model = recorded[1] if name != "scripted" else None
+    return make_provider(name, model)
+
+
+def cmd_resume(args, meta):
+    """`overlord resume <sid>` for an agent session: reopen the stack, restore
+    the transcript, hand the model the operator's note, run until it stops."""
+    provider = provider_for(meta, args.provider, args.model)
+    live = ov.reopen_session(args.session, wait=args.wait, capture=True)
+    print(f"overlord resume: {provider.name}/{provider.model} over {live.meta['target']}"
+          f"  [session {live.sid}, savepoint @{live.current_layer}]", file=sys.stderr)
+    try:
+        run_agent(live, provider, meta.get("task", ""),
+                  max_turns=args.max_turns or DEFAULT_MAX_TURNS, emit=_show,
+                  resume=True, note=args.note)
+    finally:
+        sid, changes = live.close()
+    ov._print_session_footer(sid, ov.load_meta(sid).get("exit_code"),
+                             ov.load_meta(sid)["backend"], changes)
+    return 0
+
+
+def _show(ev):
+    t = ev["type"]
+    if t == "assistant":
+        print(f"\n{ev['text']}\n")
+    elif t == "tool_call":
+        print(f"  → {ev['tool']}  {_summarize({'name': ev['tool'], 'input': ev['input']})}")
+    elif t == "tool_result":
+        tail = ev["output"].strip().splitlines()[-3:]
+        for line in tail:
+            print(f"      {line[:160]}")
+        print(f"    exit={ev['exit_code']}"
+              + (f"  touched={len(ev['touched'])}  @{ev.get('layer')}" if ev["touched"] else ""))
+    elif t == "resume":
+        print(f"  ↺ resumed at savepoint @{ev.get('layer')}")
+    elif t == "done":
+        print(f"\n[{ev['reason']} after {ev['turn']} turn(s), "
+              f"tokens in/out {ev.get('usage', {}).get('in', 0)}/"
+              f"{ev.get('usage', {}).get('out', 0)}]")
+    elif t == "error":
+        print(f"\n[error] {ev['text']}", file=sys.stderr)
 
 
 def add_agent_parser(sub, add_exec_flags):

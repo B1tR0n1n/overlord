@@ -50,6 +50,26 @@ Installs the engine to `/usr/local/lib/overlord/`, a compiled ELF launcher to
 that enables the kernel backend on Ubuntu 24.04+, and the runtime deps
 (`fuse-overlayfs`, `strace`).
 
+### Windows and macOS
+
+The engine is Linux kernel machinery — overlayfs, user namespaces,
+`mount(2)` — so OVERLORD does not run natively on Windows or macOS, and a
+port would be a different product. It runs in the Linux those systems
+ship or host:
+
+- **WSL2** (Windows): `wsl --install -d Ubuntu`, then the install above
+  inside Ubuntu (the AppArmor step skips itself) and `overlord ui`; WSL2
+  forwards localhost, so a Windows browser opens `http://127.0.0.1:7777`.
+  Keep the project folder in the Linux filesystem (`~/projects/…`, seen
+  from Windows as `\\wsl$\Ubuntu\home\…`), not under `/mnt/c/`, where
+  the overlay is slow and `doctor` may fall back to the fuse backend.
+- **Docker Desktop** (Windows, macOS): the `Dockerfile` builds an image on
+  the fuse backend; its header has the run line (`--device /dev/fuse
+  --cap-add SYS_ADMIN`, a data volume, accounts and a certificate first).
+
+`overlord doctor` is the ground truth on any machine: it names the
+backend it found and what each grant will mean there.
+
 ## Use
 
 ```bash

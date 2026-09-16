@@ -490,7 +490,8 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
     mem_text, mem_summary = memory_mod.build_context(live.meta["target"], live.meta.get("owner"))
     catalogue = skills_mod.catalogue(live.meta["target"])
     tools.skills = {s["name"]: s["source"] for s in catalogue}
-    system_prompt = SYSTEM_PROMPT + mem_text + skills_mod.context_block(catalogue)
+    system_prompt = (SYSTEM_PROMPT + _conditions_block(live, provider) + mem_text
+                     + skills_mod.context_block(catalogue))
     if mem_summary:
         live.meta["memory"] = mem_summary
     if catalogue:
@@ -628,6 +629,35 @@ def run_agent(live, provider, task, max_turns=DEFAULT_MAX_TURNS, emit=None,
         transcript.close()
         if registry:
             registry.close()
+
+
+def _conditions_block(live, provider):
+    """The truth about the agent's situation, stated up front. A model that
+    has to guess what it is running under goes looking; one that is told
+    has nothing to discover — and the design loses nothing by saying it,
+    which is the test of whether a safeguard is real."""
+    g = live.meta.get("grants") or {}
+    model = getattr(provider, "model", None) or "-"
+    lines = [f"- You are {getattr(provider, 'name', 'model')}:{model}, driven by OVERLORD "
+             f"{ov.VERSION}; session {live.sid}.",
+             "- Sandbox: " + ("a kernel jail (user + mount + PID namespaces; the real tree, other "
+                              "sessions and OVERLORD's own files are unreachable)"
+                              if g.get("jail") else "a cooperative overlay (no jail)")
+             + "; network: " + ("none" if g.get("net", "none") == "none" else "host")
+             + (f"; time limit {g['timeout']}s" if g.get("timeout") else "") + ".",
+             "- Every command and file change is recorded; provenance is derived from the "
+             "overlay by the engine, not from what you report. A person reviews the diff "
+             "and commits or discards it; nothing you do reaches the real folder otherwise."]
+    try:
+        limits, _src = cost_mod.budget_for(live.meta.get("target"), live.meta.get("owner"))
+    except ov.OverlordError:
+        limits = {}
+    if limits:
+        lines.append("- Budget: " + ", ".join(f"{k}={v}" for k, v in limits.items())
+                     + "; the session stops before the call that would cross a line.")
+    if live.meta.get("owner"):
+        lines.append(f"- You are working for {live.meta['owner']}.")
+    return "\n\n# Operating conditions\n" + "\n".join(lines)
 
 
 def _compact(live, provider, system_prompt, messages, task, turn, in_tokens, record):

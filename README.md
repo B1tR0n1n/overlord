@@ -406,6 +406,18 @@ nothing an outsider learns), and a `Dockerfile` for the fuse backend
 accounts, TLS material, the audit chain and disk usage next to the
 backends.
 
+## What the agent is told
+
+The system prompt states the agent's situation up front — its model, the
+sandbox it is in (jail or cooperative), its network, any budget line, whom
+it works for, and that every command is recorded and provenance is derived
+by the engine rather than from what it reports. A model that has to guess
+what it runs under goes looking; one that is told has nothing to discover,
+and the design loses nothing by saying it, which is the test of whether a
+safeguard is real. The safeguards are locks, not rules: understanding the
+jail does not open it, and the one act that changes the world — commit —
+belongs to a person. `test/escape_test.py` is an agent that tries anyway.
+
 ## Grants (the capability manifest)
 
 Grants scope what a session may do — commander's intent as enforced constraints.
@@ -640,6 +652,7 @@ python3 test/session_test.py      # 5 long-conversation assertions: compaction +
 python3 test/webhook_test.py      # 5 webhook assertions against a local receiver: config, needs-review + link + signature, approval gate + budget, retries, API
 python3 test/vault_test.py        # 5 vault assertions with a fake resolver: CLI, provider keys + convention, cache, connectors / SSO / webhooks, audit
 python3 test/bundle_test.py       # 5 bundle assertions: signed export, second-machine import + tamper/forgery refusal, replay + commit, UI, crafted tars
+python3 test/escape_test.py       # 3 escape assertions: the agent is told the truth; env / keys / home / pid 1 / net / writes-out all fail; all recorded
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -822,3 +835,14 @@ grants are absent.
   the CLI printed a traceback instead of the error line for errors raised
   in submodules (a second copy of the engine was being imported). 194
   assertions across twenty-two suites.
+- 2026-09-16 — v0.20: red team A11 + A12, and operating conditions. A11:
+  the sandboxed executor inherited the operator's environment — provider
+  keys and OVERLORD_HOME were readable with `env`, and after an in-process
+  scrub still with `cat /proc/1/environ`; the holder chain now starts with
+  an allowlisted environment, on both backends. A12: the jail bound the
+  host's /etc, /usr and /opt read-write — a sandboxed command could write
+  the machine's system tree; every host bind and its submounts is now
+  remounted read-only with its locked flags kept. The system prompt states
+  the agent's model, sandbox, network, budget and owner, and that everything
+  is recorded. `escape_test.py`: an agent that probes its situation; every
+  probe fails and is recorded. 197 assertions across twenty-three suites.

@@ -108,6 +108,21 @@ OUT=$(attack 'for f in /proc/self/fd/*; do readlink "$f"; done 2>/dev/null | gre
 if grep -q FD-LEAK <<< "$OUT"; then breach "A9 leaked file descriptor into jail"
 else hold "A9 no fd leaks"; fi
 
+# --- A11: environment inheritance — the operator's shell exports provider
+# keys and OVERLORD_HOME; a sandboxed command must see none of them
+OUT=$(ANTHROPIC_API_KEY=sk-ant-REDTEAM-MARKER OPENAI_API_KEY=sk-REDTEAM-MARKER OVERLORD_HOME="${OVERLORD_HOME:-$HOME/.overlord}" \
+      attack 'env | grep -qE "MARKER|OVERLORD_HOME" && echo LEAKED || echo CLEAN; cat /proc/1/environ 2>/dev/null | tr "\0" "\n" | grep -q MARKER && echo LEAKED1 || echo CLEAN1')
+if grep -qE 'LEAKED' <<< "$OUT"; then breach "A11 host environment (API keys) readable from jail"
+else hold "A11 environment scrubbed: no keys, no OVERLORD_HOME"; fi
+
+# --- A12: the system tree is bound from the host and must be read-only —
+# a write into /etc, /usr or /opt from the jail is a write to the machine
+OUT=$(attack 'W=0; for p in /etc/ovl-a12 /usr/ovl-a12 /opt/ovl-a12 /usr/bin/python3; do echo x >> "$p" 2>/dev/null && W=1; done; ls /etc/ovl-a12 /usr/ovl-a12 /opt/ovl-a12 2>/dev/null; [ "$W" = 1 ] && echo WROTE || echo READONLY')
+if grep -q WROTE <<< "$OUT" || [[ -e /etc/ovl-a12 || -e /usr/ovl-a12 || -e /opt/ovl-a12 ]]; then
+    rm -f /etc/ovl-a12 /usr/ovl-a12 /opt/ovl-a12 2>/dev/null
+    breach "A12 host system tree writable from jail"
+else hold "A12 /etc /usr /opt read-only in the jail"; fi
+
 # --- A10: in-jail mount games must not persist or reach out
 OUT=$(attack 'mkdir -p /mnt 2>/dev/null; mount -t tmpfs t /mnt 2>/dev/null; mount --bind / /mnt 2>/dev/null; ls /mnt/vault 2>/dev/null && echo REACHED || echo CONTAINED')
 if grep -q REACHED <<< "$OUT"; then breach "A10 mount tricks reached real fs"

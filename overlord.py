@@ -217,12 +217,31 @@ if spec.get("jail"):
     for d in ("oldroot", "proc", "tmp", "dev"):
         os.mkdir(d)
     mount(os.path.join(sdir, "tmp"), "tmp", None, MS_BIND)
-    for d in ("usr", "bin", "sbin", "lib", "lib64", "lib32", "etc", "opt"):
+    HOST_DIRS = ("usr", "bin", "sbin", "lib", "lib64", "lib32", "etc", "opt")
+    for d in HOST_DIRS:
         if os.path.islink("/" + d):
             os.symlink(os.readlink("/" + d), d)
         elif os.path.isdir("/" + d):
             os.mkdir(d)
             mount("/" + d, d, None, MS_BIND | MS_REC)
+    # red team A12: a bind mount is read-write by default, so a jailed command
+    # could write the host's /etc, /usr and /opt. Every host bind and each of
+    # its submounts is remounted read-only, keeping the flags a user namespace
+    # locks (nosuid, nodev, noexec, atime) or the kernel refuses the remount.
+    MS_REMOUNT, MS_NOEXEC = 32, 8
+    LOCKED = {"nosuid": MS_NOSUID, "nodev": MS_NODEV, "noexec": MS_NOEXEC, "noatime": 1024,
+              "nodiratime": 2048, "relatime": 1 << 21, "strictatime": 1 << 24}
+    binds = [os.path.join(J, d) for d in HOST_DIRS]
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            r = line.split()
+            mp = r[4].replace("\\040", " ")
+            if not any(mp == b or mp.startswith(b + "/") for b in binds):
+                continue
+            flags = MS_REMOUNT | MS_BIND | MS_RDONLY
+            for opt in r[5].split(","):
+                flags |= LOCKED.get(opt, 0)
+            mount("none", mp, None, flags)
     for n in ("null", "zero", "full", "random", "urandom", "tty"):
         if os.path.exists("/dev/" + n):
             open("dev/" + n, "w").close()
@@ -956,6 +975,16 @@ def load_grants(args):
 
 _EXECUTOR_SRC = r"""
 import base64, json, os, signal, socket, subprocess, sys, threading
+# red team A11: the executor inherits the holder's environment, which is the
+# operator's — provider keys, OVERLORD_HOME, whatever `overlord ui` was
+# started with. Nothing a sandboxed command runs may read those, so the
+# environment is cut to what a build needs before the first command.
+_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "TERM", "USER", "LOGNAME", "SHELL",
+         "TZ", "COLUMNS", "LINES", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")
+for _k in list(os.environ):
+    if _k not in _KEEP and not _k.startswith("LC_"):
+        del os.environ[_k]
+os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 sock = socket.socket(fileno=int(sys.argv[1]))
 rf = sock.makefile("rb")
 wl = threading.Lock()
@@ -1417,6 +1446,19 @@ def reopen_session(sid, wait=False, capture=False):
     return _launch_holder(sid, m, lock, capture, fresh=False)
 
 
+SANDBOX_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "TERM", "USER", "LOGNAME",
+                    "SHELL", "TZ", "COLUMNS", "LINES", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")
+
+
+def sandbox_env():
+    """What a sandboxed command may inherit: never the operator's keys,
+    tokens or OVERLORD_HOME (red team A11)."""
+    env = {k: v for k, v in os.environ.items()
+           if k in SANDBOX_ENV_KEEP or k.startswith("LC_")}
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    return env
+
+
 def _launch_holder(sid, meta, lock, capture, fresh):
     """Start the holder process for a session record and hand back the live
     handle. On any failure a fresh session vanishes entirely (_abort_launch);
@@ -1463,7 +1505,10 @@ def _launch_holder(sid, meta, lock, capture, fresh):
     parent_sock, child_sock = socket.socketpair()
     py = sys.executable if (sys.executable or "").startswith("/usr/") else "python3"
     argv = prefix + [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno())]
-    popen_kw = {"pass_fds": (child_sock.fileno(),)}
+    # red team A11: the environment is cut BEFORE the process exists. Unsetting
+    # variables inside it is cosmetic — /proc/<pid>/environ reads the original
+    # block, so a jailed `cat /proc/1/environ` would still show the keys.
+    popen_kw = {"pass_fds": (child_sock.fileno(),), "env": sandbox_env()}
     if capture:
         outfile = open(os.path.join(sdir, "output.log"), "ab")
         popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
@@ -2339,7 +2384,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 

@@ -135,6 +135,26 @@ try:
             fail("streamed assistant turns did not each render as a bubble")
         ok("a message runs the agent and its turns stream into the chat")
 
+        # a follow-up message renders once (the server's event is the only
+        # render), and a long conversation scrolls inside its pane: the
+        # composer never leaves the viewport
+        n_users = page.locator(".msg.user").count()
+        page.locator("#input").fill("and again")
+        page.locator("#input").press("Enter")
+        page.wait_for_selector(".stopbtn.hide", state="attached", timeout=20000)
+        page.wait_for_timeout(900)
+        if page.locator(".msg.user").count() != n_users + 1:
+            fail(f"a sent message rendered {page.locator('.msg.user').count() - n_users} times")
+        page.evaluate("""() => { const s = document.getElementById('stream');
+            for (let i = 0; i < 40; i++) { const d = document.createElement('div'); d.className = 'msg assistant';
+              d.textContent = 'filler line ' + i; s.appendChild(d); } }""")
+        geo = page.evaluate("""() => { const s = document.getElementById('stream'), c = document.getElementById('composer');
+            return {scrolls: s.scrollHeight > s.clientHeight, bottom: Math.round(c.getBoundingClientRect().bottom),
+                    inner: window.innerHeight}; }""")
+        if not geo["scrolls"] or geo["bottom"] > geo["inner"]:
+            fail(f"the stream does not scroll inside its pane: {geo}")
+        ok("a sent message renders once; a long conversation scrolls inside its pane")
+
         # the inspector shows the change and a commit control (auto-retrying
         # locators tolerate the panel re-rendering on the next poll)
         page.locator("#inspector").get_by_text("lib.py").first.wait_for(timeout=8000)

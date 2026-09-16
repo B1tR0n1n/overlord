@@ -730,6 +730,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
   font-size:13px;line-height:1.55;overflow:hidden}
 button{font-family:inherit;cursor:pointer}
 .app{display:grid;grid-template-columns:250px 1fr 320px;height:100vh}
+.app>*{min-height:0}
 @media(max-width:900px){.app{grid-template-columns:1fr}
   .rail,.inspect{display:none}.app.show-rail .rail{display:flex;position:fixed;z-index:20;
     width:250px;height:100%}.app.show-ins .inspect{display:flex;position:fixed;right:0;z-index:20;
@@ -743,7 +744,7 @@ button{font-family:inherit;cursor:pointer}
 .newbtn{margin:12px;padding:10px;background:transparent;border:1px solid var(--border-lt);
   color:var(--text);letter-spacing:2px;text-transform:uppercase;font-size:10px;transition:.2s}
 .newbtn:hover{border-color:var(--accent);color:var(--accent)}
-.convs{flex:1;overflow-y:auto;padding:4px 8px}
+.convs{flex:1;min-height:0;overflow-y:auto;padding:4px 8px}
 .conv{padding:10px 10px;border-radius:2px;cursor:pointer;border-left:2px solid transparent}
 .conv:hover{background:var(--bg3)}
 .conv.sel{background:var(--glow);border-left-color:var(--accent)}
@@ -770,7 +771,7 @@ button{font-family:inherit;cursor:pointer}
 .iconbtn{display:none;background:none;border:1px solid var(--border-lt);color:var(--dim);
   padding:5px 9px;font-size:11px}
 @media(max-width:900px){.iconbtn{display:inline-block}}
-.stream{flex:1;overflow-y:auto;padding:26px 22px 8px}
+.stream{flex:1;min-height:0;overflow-y:auto;padding:26px 22px 8px}
 .msg{max-width:760px;margin:0 auto 20px}
 .msg .who{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
 .msg.user .bub{background:var(--bg3);border:1px solid var(--border);border-left:2px solid var(--accent);
@@ -823,7 +824,7 @@ button{font-family:inherit;cursor:pointer}
 .inspect{background:var(--bg2);border-left:1px solid var(--border);display:flex;flex-direction:column}
 .ins-t{padding:14px 18px;border-bottom:1px solid var(--border);font-size:10px;letter-spacing:3px;
   text-transform:uppercase;color:var(--dim)}
-.ins-body{flex:1;overflow-y:auto;padding:16px 18px}
+.ins-body{flex:1;min-height:0;overflow-y:auto;padding:16px 18px}
 .ins-empty{color:var(--dim);font-family:var(--serif);font-style:italic;padding:20px 0}
 .ins-k{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
 .ins-v{color:var(--text);font-size:11px;margin-top:4px;word-break:break-all}
@@ -1325,12 +1326,13 @@ async function send(){
     startPoll();
   } else {
     inp.value=''; autosize();
-    const st=$('stream'); const wm=el('div','msg user');
-    wm.appendChild(el('div','who','you')); wm.appendChild(el('div','bub',text)); st.appendChild(wm); scroll();
+    setThinking(true);
     const r = await j('/api/chats/'+encodeURIComponent(SEL)+'/message',
                       {method:'POST',body:JSON.stringify({message:text})});
-    if(r.error){ flashHint(r.error,true); return; }
-    setThinking(true); startPoll();
+    if(r.error){ setThinking(false); inp.value=text; flashHint(r.error,true); return; }
+    // the server recorded the message and emits it as the next event: the
+    // poll renders it once (an optimistic bubble here showed it twice)
+    await poll(); startPoll();
   }
 }
 

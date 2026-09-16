@@ -65,6 +65,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .frame{position:relative;z-index:1;display:grid;grid-template-rows:auto 1fr;height:100vh}
 
 /* ---- masthead: a document header, not a navbar ---------------------- */
+.backlink{color:#7a7060;text-decoration:none;font-size:10px;letter-spacing:2px;text-transform:uppercase;white-space:nowrap;align-self:center}
+.backlink:hover{color:#c9a227}
 .masthead{display:flex;align-items:flex-end;gap:22px;padding:18px 26px 14px;
   border-bottom:1px solid var(--accent)}
 .mark{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:7px;
@@ -315,6 +317,7 @@ SHELL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </filter><rect width="100%" height="100%" filter="url(#fsd-noise)"/></svg>
 <div class="frame">
 <header class="masthead">
+  <a class="backlink" href="/">&larr; Workspace</a>
   <span class="mark">OVERLORD</span>
   <span class="mark-sub">agent hypervisor &mdash; <span class="mc">mission control</span></span>
   <div class="desig">

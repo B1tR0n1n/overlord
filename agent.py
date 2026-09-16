@@ -927,7 +927,8 @@ def config_from_args(args):
         "thinking": getattr(args, "thinking", None),
         "system_extra": getattr(args, "system", None),
         "stream": not getattr(args, "no_stream", False),
-        "fallbacks": not getattr(args, "no_fallbacks", False)})
+        "fallbacks": not getattr(args, "no_fallbacks", False),
+        "api": getattr(args, "api", None)})
 
 
 def add_model_flags(p):
@@ -947,6 +948,9 @@ def add_model_flags(p):
                    help="reasoning depth (anthropic output_config.effort / openai reasoning_effort)")
     p.add_argument("--thinking", choices=["summarized", "off"],
                    help="anthropic: stream a thinking summary, or disable thinking")
+    p.add_argument("--api", choices=["responses", "chat"],
+                   help="openai wire shape: /v1/responses (default for openai) or chat completions "
+                        "(default for openai-compatible; the only shape azure serves)")
     p.add_argument("--system", help="text appended to the system prompt")
     p.add_argument("--no-stream", action="store_true", help="one-shot responses instead of SSE")
     p.add_argument("--no-fallbacks", action="store_true",

@@ -231,16 +231,17 @@ try:
                                      "provider_opts": {"model": "llama3", "base_url": "http://127.0.0.1:11434/v1",
                                                        "headers": '{"X-Team": "a"}'},
                                      "gen": {"max_tokens": 2048, "effort": "high", "temperature": "0.3",
-                                             "stop": "END, STOP", "stream": False}}, "PUT")
+                                             "stop": "END, STOP", "stream": False, "api": "responses"}}, "PUT")
     if code != 200 or sp["provider_opts"]["model"] != "llama3" or sp["provider_opts"]["headers"] != {"X-Team": "a"} \
-            or sp["gen"]["max_tokens"] != 2048 or sp["gen"]["temperature"] != 0.3 or sp["gen"]["stream"] is not False:
+            or sp["gen"]["max_tokens"] != 2048 or sp["gen"]["temperature"] != 0.3 or sp["gen"]["stream"] is not False \
+            or sp["gen"]["api"] != "responses" or chatui.build_provider(chatui.load_settings()).api != "responses":
         fail(f"model settings round-trip: {code} {sp}")
     if not sp["provider_ready"]:
         fail("a keyless provider must count as ready")
     ids = [p["id"] for p in sp["providers_available"]]
     if ids != ["anthropic", "openai", "azure", "openai-compatible", "gemini"]:
         fail(f"providers listed: {ids}")
-    for bad in ({"gen": {"effort": "extreme"}}, {"gen": {"temperature": "hot"}},
+    for bad in ({"gen": {"effort": "extreme"}}, {"gen": {"temperature": "hot"}}, {"gen": {"api": "grpc"}},
                 {"provider_opts": {"headers": "not json"}}, {"provider_opts": {"base_url": "ftp://x"}}):
         code, r = req("/api/settings", bad, "PUT")
         if code != 400:

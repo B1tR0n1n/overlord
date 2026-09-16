@@ -176,10 +176,10 @@ try:
                                  "input": {"command": "pwd"}}],
                     "stop_reason": "tool_use",
                     "usage": {"input_tokens": 10, "output_tokens": 5}}
-        return {"choices": [{"finish_reason": "tool_calls", "message": {
-                    "content": None, "tool_calls": [{"id": "t1", "type": "function",
-                    "function": {"name": "shell", "arguments": "{\"command\": \"pwd\"}"}}]}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        return {"status": "completed", "output": [
+                    {"type": "function_call", "call_id": "t1", "name": "shell",
+                     "arguments": "{\"command\": \"pwd\"}"}],
+                "usage": {"input_tokens": 10, "output_tokens": 5}}
     P._post = fake_post
 
     a = agent.AnthropicProvider("m", "k", config=one_shot)
@@ -198,15 +198,18 @@ try:
     o = agent.OpenAIProvider("m", "k", config=one_shot)
     r = o.complete("sys", neutral, tools=agent.TOOLS)
     b = captured["body"]
-    if captured["headers"]["Authorization"] != "Bearer k" or b["messages"][0]["role"] != "system":
+    if captured["headers"]["Authorization"] != "Bearer k" or not captured["url"].endswith("/v1/responses") \
+            or b["instructions"] != "sys" or b["store"] is not False:
         fail("openai request")
-    if b["tools"][0]["function"]["name"] != "list_dir" or b["tools"][0]["function"]["parameters"]["type"] != "object":
+    if b["tools"][0]["name"] != "list_dir" or b["tools"][0]["parameters"]["type"] != "object":
         fail("openai tools")
-    tc = b["messages"][2]["tool_calls"][0]
-    if tc["type"] != "function" or json.loads(tc["function"]["arguments"]) != {"command": "ls"}:
-        fail("openai assistant tool_calls")
-    if b["messages"][3]["role"] != "tool" or b["messages"][4]["tool_call_id"] != "c2":
-        fail("openai tool messages")
+    items = b["input"]
+    tc = [i for i in items if i.get("type") == "function_call"][0]
+    if tc["call_id"] != "c1" or json.loads(tc["arguments"]) != {"command": "ls"}:
+        fail("openai assistant function_call items")
+    outs = [i for i in items if i.get("type") == "function_call_output"]
+    if [o["call_id"] for o in outs] != ["c1", "c2"] or items[0]["role"] != "user":
+        fail("openai function_call_output items")
     if r.tool_calls[0]["name"] != "shell" or r.tool_calls[0]["input"] != {"command": "pwd"} or r.usage["out"] != 5:
         fail("openai reply parse")
     ok("anthropic + openai adapters: wire shapes and reply parsing")

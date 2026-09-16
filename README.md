@@ -147,9 +147,9 @@ workspace, the CLI, the daemon and the SDK all share it:
 | provider | reaches | auth |
 |---|---|---|
 | `anthropic` | Claude, native Messages API: streaming, adaptive thinking, `effort`, refusal handling, opt-in server-side refusal fallbacks | `ANTHROPIC_API_KEY` or the key store |
-| `openai` | OpenAI Chat Completions: streaming, `reasoning_effort` | `OPENAI_API_KEY` |
+| `openai` | OpenAI Responses API (`/v1/responses`): streaming, `reasoning.effort`, function tools with reasoning, encrypted reasoning carried across tool turns, nothing stored server-side; `--api chat` for the old shape | `OPENAI_API_KEY` |
 | `azure` | Azure OpenAI deployments (`--base-url https://<resource>.openai.azure.com`, deployment as the model, `--azure-api-version`) | `AZURE_OPENAI_API_KEY` |
-| `openai-compatible` | anything speaking the Chat Completions shape behind a base URL: Ollama, vLLM, LiteLLM, Groq, Together, your gateway | optional |
+| `openai-compatible` | anything speaking the Chat Completions shape behind a base URL: Ollama, vLLM, LiteLLM, Groq, Together, your gateway; `--api responses` once it grows the new shape | optional |
 | `gemini` | Google Gemini REST: streaming, function calling | `GEMINI_API_KEY` |
 
 Every provider takes a **base URL** and **extra headers**, which is how a
@@ -160,7 +160,8 @@ win over the store.
 
 **Generation knobs** — `--max-tokens`, `--temperature`, `--top-p`, `--stop`,
 `--effort low|medium|high|xhigh|max`, `--thinking summarized|off`,
-`--system` (appended instructions), `--no-stream`, `--no-fallbacks` — are
+`--api responses|chat`, `--system` (appended instructions), `--no-stream`,
+`--no-fallbacks` — are
 model-aware: nothing is sent unless you set it. That matters because the
 current Claude family rejects `temperature` and `top_p` outright and takes
 its depth from `effort`; blank means the model's own default. Replies stream
@@ -934,3 +935,13 @@ grants are absent.
   connector tools withheld without the `connector_shell` grant. The
   workspace names the second model under Settings instead of guessing a
   provider. 204 assertions across twenty-four suites.
+- 2026-09-16 — v0.24: OpenAI over the Responses API. GPT-5.5 refuses function
+  tools together with a reasoning effort on `/v1/chat/completions`, which
+  broke every tool-using run and the second-model check the moment an
+  effort was set. The `openai` provider now speaks `/v1/responses`: the
+  same streaming contract, `store: false`, the model's encrypted reasoning
+  replayed ahead of the tool calls it produced so a multi-turn run keeps its
+  train of thought, `incomplete` and `refusal` mapped to the stop reasons the
+  agent already checks (chat completions' `length` and `content_filter` now
+  map too). `--api` / Settings → Generation → OpenAI API picks the shape per
+  endpoint; compatible servers and Azure keep chat completions.

@@ -175,8 +175,99 @@ if r.text != "hi":
     fail("non-streaming parse")
 ok("anthropic: gateway base URL + headers; knobs sent only when set; non-streaming path")
 
-# ------------------------------------------------------------ openai streaming
+# ------------------------------------------------------------ openai: responses
+# the default for `openai`: /v1/responses, the only place a reasoning model
+# may hold function tools and a reasoning effort at once
 P._open = fake_open
+CAPTURED.clear()
+CAPTURED["stream"] = b"""event: response.created
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC","summary":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"He"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"y"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Hey"}]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"shell","arguments":"{\\"command\\": \\"pwd\\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}
+"""
+o = P.OpenAIProvider("gpt-5.5", "k", config=P.ModelConfig(effort="xhigh", max_tokens=300))
+deltas = []
+r = o.complete("sys", NEUTRAL, tools=agent.TOOLS, on_delta=deltas.append)
+b = CAPTURED["body"]
+if CAPTURED["url"] != "https://api.openai.com/v1/responses" or \
+        CAPTURED["headers"]["Authorization"] != "Bearer k":
+    fail(f"openai responses url/auth: {CAPTURED['url']}")
+if b["instructions"] != "sys" or b["store"] is not False or "reasoning.encrypted_content" not in b["include"]:
+    fail(f"openai responses envelope: {b}")
+items = b["input"]
+if items[0] != {"role": "user", "content": NEUTRAL[0]["content"]} or \
+        items[1] != {"role": "assistant", "content": NEUTRAL[1]["content"]} or \
+        [i for i in items if i.get("type") == "function_call"][0]["call_id"] != NEUTRAL[1]["tool_calls"][0]["id"] or \
+        [i for i in items if i.get("type") == "function_call_output"][-1]["call_id"] != "c2":
+    fail(f"openai responses input translation: {items}")
+if b["tools"][0] != {"type": "function", "name": "list_dir", "description": agent.TOOLS[0]["description"],
+                     "parameters": agent.TOOLS[0]["input_schema"]}:
+    fail(f"openai responses tools: {b['tools'][0]}")
+if b["reasoning"] != {"effort": "high"} or b["max_output_tokens"] != 300 or "reasoning_effort" in b \
+        or "max_completion_tokens" in b or b.get("stream") is not True:
+    fail(f"openai responses knobs: {b}")
+if deltas != ["He", "y"] or r.text != "Hey" or r.stop != "tool_calls" or \
+        r.tool_calls[0]["input"] != {"command": "pwd"} or r.tool_calls[0]["id"] != "call_9" or \
+        r.usage != {"in": 10, "out": 5}:
+    fail(f"openai responses stream parse: {deltas} {r.text!r} {r.tool_calls} {r.usage}")
+ok("openai: /v1/responses by default — reasoning + function tools, streamed text and calls")
+
+# the next turn replays the model's encrypted reasoning ahead of the calls it
+# produced, then the tool's output; a reply cut off maps to max_tokens
+CAPTURED.clear()
+CAPTURED["stream"] = b"""event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":20,"output_tokens":300}}}
+"""
+msgs = NEUTRAL + [{"role": "assistant", "content": r.text, "tool_calls": r.tool_calls},
+                  {"role": "tool", "tool_call_id": "call_9", "content": "/work"}]
+r2 = o.complete("sys", msgs, tools=agent.TOOLS)
+items = CAPTURED["body"]["input"]
+i = [n for n, it in enumerate(items) if it.get("type") == "function_call" and it["call_id"] == "call_9"][0]
+if items[i - 1] != {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC", "summary": []} or \
+        items[i - 2] != {"role": "assistant", "content": "Hey"} or \
+        items[i + 1] != {"type": "function_call_output", "call_id": "call_9", "output": "/work"}:
+    fail(f"reasoning carry-over: {items[i-2:i+2]}")
+if r2.stop != "max_tokens" or r2.tool_calls or r2.usage != {"in": 20, "out": 300}:
+    fail(f"incomplete reply: {r2.stop} {r2.tool_calls} {r2.usage}")
+# a failed response is an error, a refusal drops the turn's calls, non-streaming parses the same
+CAPTURED["stream"] = b"""event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"message":"server melted"}}}
+"""
+try:
+    o.complete("sys", NEUTRAL, tools=agent.TOOLS)
+    fail("failed response not raised")
+except P.ProviderError as e:
+    if "server melted" not in str(e):
+        fail(f"failed response message: {e}")
+P._post = lambda url, headers, body, timeout=600: (CAPTURED.update(url=url, body=body) or {
+    "status": "completed", "output": [
+        {"type": "message", "content": [{"type": "refusal", "refusal": "no"}]},
+        {"type": "function_call", "call_id": "call_x", "name": "shell", "arguments": "{}"}],
+    "usage": {"input_tokens": 3, "output_tokens": 1}})
+ns = P.OpenAIProvider("gpt-5.5", "k", config=P.ModelConfig(stream=False))
+r3 = ns.complete("sys", NEUTRAL, tools=agent.TOOLS)
+if "stream" in CAPTURED["body"] or r3.stop != "refusal" or r3.refusal != {"category": "no"} or not r3.tool_calls:
+    fail(f"non-streaming responses / refusal: {r3.stop} {r3.refusal}")
+ok("openai: encrypted reasoning replayed before its calls; max_tokens, failure and refusal mapped")
+
+# ------------------------------------------------------------ openai: chat completions
+# `api: chat` keeps the old shape for a gateway that fronts api.openai.com
 CAPTURED.clear()
 CAPTURED["stream"] = b"""data: {"choices":[{"delta":{"content":"He"},"finish_reason":null}]}
 
@@ -190,7 +281,7 @@ data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}
 
 data: [DONE]
 """
-o = P.OpenAIProvider("gpt-5.5", "k", config=P.ModelConfig(effort="xhigh", max_tokens=300))
+o = P.OpenAIProvider("gpt-5.5", "k", config=P.ModelConfig(effort="xhigh", max_tokens=300, api="chat"))
 deltas = []
 r = o.complete("sys", NEUTRAL, tools=agent.TOOLS, on_delta=deltas.append)
 b = CAPTURED["body"]
@@ -208,7 +299,13 @@ if deltas != ["He", "y"] or r.text != "Hey" or r.stop != "tool_calls" or \
         r.tool_calls[0]["input"] != {"command": "pwd"} or r.tool_calls[0]["id"] != "call_9" or \
         r.usage != {"in": 10, "out": 5}:
     fail(f"openai stream parse: {deltas} {r.text!r} {r.tool_calls} {r.usage}")
-ok("openai: streaming text + tool-call fragments, reasoning_effort, max_completion_tokens")
+CAPTURED["stream"] = b"""data: {"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}
+
+data: [DONE]
+"""
+if o.complete("sys", NEUTRAL, tools=agent.TOOLS).stop != "max_tokens":
+    fail("chat finish_reason length not mapped to max_tokens")
+ok("openai: api=chat keeps chat completions — reasoning_effort, max_completion_tokens, length→max_tokens")
 
 # openai-compatible: no key needed, max_tokens, no reasoning_effort, custom base
 CAPTURED.clear()

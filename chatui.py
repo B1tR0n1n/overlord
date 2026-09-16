@@ -48,9 +48,9 @@ DEFAULT_SETTINGS = {"provider": "anthropic", "model": "", "jail": True,
                     # generation knobs; blank means "do not send"
                     "gen": {"max_tokens": 16000, "temperature": "", "top_p": "", "stop": "",
                             "effort": "", "thinking": "", "system_extra": "",
-                            "stream": True, "fallbacks": True, "context_limit": ""}}
+                            "stream": True, "fallbacks": True, "context_limit": "", "api": ""}}
 GEN_KEYS = ("max_tokens", "temperature", "top_p", "stop", "effort", "thinking",
-            "system_extra", "stream", "fallbacks", "context_limit")
+            "system_extra", "stream", "fallbacks", "context_limit", "api")
 PROVIDER_KEYS = ("model", "base_url", "headers", "azure_api_version")
 GLYPH = {"added": "+", "modified": "~", "deleted": "−", "replaced-dir": "±"}
 MAX_TAIL = 1200                   # chars of a tool's output shown in the stream
@@ -190,6 +190,9 @@ def save_settings(incoming):
         if g.get("thinking") not in ("", None, "summarized", "off"):
             raise core.OverlordError("error: thinking must be summarized, off or blank")
         g["thinking"] = g.get("thinking") or ""
+        if g.get("api") not in ("", None, "responses", "chat"):
+            raise core.OverlordError("error: api must be responses, chat or blank")
+        g["api"] = g.get("api") or ""
         g["stop"] = str(g.get("stop") or "")
         g["system_extra"] = str(g.get("system_extra") or "")
         g["stream"] = bool(g.get("stream", True))
@@ -1041,7 +1044,13 @@ CHAT_SHELL = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="field"><label>Effort</label>
         <select id="g-effort"><option value="">model default</option><option>low</option>
           <option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
-        <div class="desc">Reasoning depth. Claude: output_config.effort; OpenAI: reasoning_effort.</div></div>
+        <div class="desc">Reasoning depth. Claude: output_config.effort; OpenAI: reasoning.effort.</div></div>
+    </div>
+    <div class="row2">
+      <div class="field"><label>OpenAI API</label>
+        <select id="g-api"><option value="">provider default</option>
+          <option value="responses">responses</option><option value="chat">chat completions</option></select>
+        <div class="desc">Which wire shape an OpenAI-style endpoint gets. Reasoning models only take function tools with an effort on /v1/responses, so <code>openai</code> uses it; <code>openai-compatible</code> servers get chat completions. Set this for a gateway that differs.</div></div>
     </div>
     <div class="row2">
       <div class="field"><label>Thinking (Claude)</label>
@@ -1477,6 +1486,7 @@ async function openSettings(msg){
   $('g-maxtokens').value = g.max_tokens || 16000;
   $('g-effort').value = g.effort || '';
   $('g-thinking').value = g.thinking || '';
+  $('g-api').value = g.api || '';
   $('g-stop').value = g.stop || '';
   $('g-temperature').value = (g.temperature===''||g.temperature==null) ? '' : g.temperature;
   $('g-topp').value = (g.top_p===''||g.top_p==null) ? '' : g.top_p;
@@ -1528,7 +1538,8 @@ async function saveSettings(){
       thinking:$('g-thinking').value, stop:$('g-stop').value,
       temperature:$('g-temperature').value.trim(), top_p:$('g-topp').value.trim(),
       system_extra:$('g-system').value, stream:$('g-stream').checked,
-      fallbacks:$('g-fallbacks').checked, context_limit:$('g-context').value.trim()}};
+      fallbacks:$('g-fallbacks').checked, context_limit:$('g-context').value.trim(),
+      api:$('g-api').value}};
   const key = $('s-key').value.trim(); if(key) body.key=key;
   const rkey = $('r-key').value.trim(); if(rkey) body.review_key=rkey;
   const r = await j('/api/settings',{method:'PUT',body:JSON.stringify(body)});

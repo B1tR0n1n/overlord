@@ -78,12 +78,13 @@ class ModelConfig:
     """Generation knobs. None means 'do not send' — every adapter applies only
     what is set, so a knob a model rejects is never on the wire by default."""
     FIELDS = ("max_tokens", "temperature", "top_p", "stop", "effort", "thinking",
-              "system_extra", "stream", "fallbacks", "timeout", "context_limit")
+              "system_extra", "stream", "fallbacks", "timeout", "context_limit", "api")
     DEFAULT_CONTEXT = 128_000     # tokens; compaction runs at 75% of this
 
     def __init__(self, max_tokens=None, temperature=None, top_p=None, stop=None,
                  effort=None, thinking=None, system_extra=None, stream=True,
-                 fallbacks=True, timeout=600, context_limit=None):
+                 fallbacks=True, timeout=600, context_limit=None, api=None):
+        self.api = api or None                # OpenAI: None | "responses" | "chat"
         self.context_limit = int(context_limit) if context_limit else self.DEFAULT_CONTEXT
         self.max_tokens = int(max_tokens) if max_tokens else None
         self.temperature = float(temperature) if temperature not in (None, "") else None
@@ -106,7 +107,8 @@ class ModelConfig:
                    top_p=d.get("top_p"), stop=stop, effort=d.get("effort"),
                    thinking=d.get("thinking"), system_extra=d.get("system_extra"),
                    stream=d.get("stream", True), fallbacks=d.get("fallbacks", True),
-                   timeout=d.get("timeout") or 600, context_limit=d.get("context_limit"))
+                   timeout=d.get("timeout") or 600, context_limit=d.get("context_limit"),
+                   api=d.get("api"))
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.FIELDS}
@@ -336,9 +338,26 @@ def _usage(u):
 
 
 class OpenAIProvider:
-    """OpenAI Chat Completions; also the shape Ollama, vLLM, LiteLLM, Groq and
-    most gateways speak (name 'openai-compatible', any base URL)."""
+    """OpenAI. Two wire shapes behind one contract:
+
+      responses   /v1/responses — OpenAI's current API and the only one where a
+                  reasoning model may use function tools with a reasoning
+                  effort (GPT-5.5 rejects the pair on chat completions). The
+                  default for the `openai` provider. Nothing is stored server
+                  side (`store: false`); the model's encrypted reasoning is
+                  carried across the tool calls of one run so it does not have
+                  to think everything through again every turn.
+      chat        /v1/chat/completions — the shape Ollama, vLLM, LiteLLM, Groq
+                  and most gateways speak (`openai-compatible`, any base URL)
+                  and what Azure deployments serve.
+
+    `ModelConfig.api` overrides the choice: `chat` for a gateway that fronts
+    api.openai.com but only speaks the old shape, `responses` for a compatible
+    server that has grown the new one."""
     name = "openai"
+    RESPONSES, CHAT = "responses", "chat"
+    STOP = {"length": "max_tokens", "max_output_tokens": "max_tokens",
+            "content_filter": "refusal"}       # to the vocabulary agent.py checks
 
     def __init__(self, model, key, base_url=None, headers=None, config=None, name=None):
         self.model, self.key = model, key
@@ -347,6 +366,16 @@ class OpenAIProvider:
                          or DEFAULT_BASE_URLS["openai"]).rstrip("/")
         self.headers = dict(headers or {})
         self.config = config or ModelConfig()
+        self._reasoning = {}          # first tool-call id of a turn → its reasoning items
+
+    @property
+    def api(self):
+        c = getattr(self.config, "api", None)
+        if self.name == "azure":              # deployments serve chat completions
+            return self.CHAT
+        if c in (self.RESPONSES, self.CHAT):
+            return c
+        return self.RESPONSES if self.name == "openai" else self.CHAT
 
     def _headers(self):
         h = dict(self.headers)
@@ -357,10 +386,146 @@ class OpenAIProvider:
     def _url(self, path):
         return f"{self.base_url}/{path}"
 
-    def _wire(self, system, messages):
+    def _system(self, system):
         c = self.config
-        sys_text = system + (("\n\n" + c.system_extra) if c.system_extra else "")
-        out = [{"role": "system", "content": sys_text}]
+        return system + (("\n\n" + c.system_extra) if c.system_extra else "")
+
+    def _effort(self):
+        return {"xhigh": "high", "max": "high"}.get(self.config.effort, self.config.effort)
+
+    def complete(self, system, messages, tools=None, on_delta=None):
+        stream = self.config.stream
+        if self.api == self.RESPONSES:
+            body = self._body_responses(system, messages, tools, stream)
+            url = self._url("responses")
+            if not stream:
+                return self._parse_response(_post(url, self._headers(), body, self.config.timeout))
+            with _open(url, self._headers(), body, self.config.timeout) as resp:
+                return self._consume_responses(resp, on_delta)
+        body = self._body(system, messages, tools, stream)
+        url = self._url("chat/completions")
+        if not stream:
+            return self._parse(_post(url, self._headers(), body, self.config.timeout))
+        with _open(url, self._headers(), body, self.config.timeout) as resp:
+            return self._consume(resp, on_delta)
+
+    # ------------------------------------------------------------ responses
+
+    def _wire_responses(self, messages):
+        out = []
+        for m in messages:
+            if m["role"] == "user":
+                out.append({"role": "user", "content": m["content"]})
+            elif m["role"] == "assistant":
+                if m.get("content"):
+                    out.append({"role": "assistant", "content": m["content"]})
+                calls = m.get("tool_calls") or []
+                if calls:
+                    # a reasoning item must be followed by the calls it produced
+                    out.extend(self._reasoning.get(calls[0]["id"], []))
+                for tc in calls:
+                    out.append({"type": "function_call", "call_id": tc["id"], "name": tc["name"],
+                                "arguments": json.dumps(tc["input"])})
+            elif m["role"] == "tool":
+                out.append({"type": "function_call_output", "call_id": m["tool_call_id"],
+                            "output": m["content"]})
+        return out
+
+    def _body_responses(self, system, messages, tools, stream):
+        c = self.config
+        body = {"model": self.model, "instructions": self._system(system),
+                "input": self._wire_responses(messages), "store": False,
+                "include": ["reasoning.encrypted_content"]}
+        if tools:
+            body["tools"] = [{"type": "function", "name": t["name"],
+                              "description": t["description"], "parameters": t["input_schema"]}
+                             for t in tools]
+        if c.max_tokens:
+            body["max_output_tokens"] = c.max_tokens
+        if c.temperature is not None:
+            body["temperature"] = c.temperature
+        if c.top_p is not None:
+            body["top_p"] = c.top_p
+        if c.effort:
+            body["reasoning"] = {"effort": self._effort()}
+        if stream:
+            body["stream"] = True
+        return body
+
+    def _finish(self, text, calls, reasoning, status, detail, usage, refusal):
+        if calls:
+            self._reasoning[calls[0]["id"]] = reasoning
+        if status == "failed":
+            raise ProviderError(f"error: provider reply failed: {detail or 'no detail'}")
+        if refusal is not None:
+            stop = "refusal"
+        elif status == "incomplete":
+            stop = self.STOP.get(detail or "", detail or "incomplete")
+        else:
+            stop = "tool_calls" if calls else "stop"
+        return Reply(text, calls, stop,
+                     {"in": usage.get("input_tokens", 0), "out": usage.get("output_tokens", 0)},
+                     refusal={"category": refusal} if refusal is not None else None)
+
+    def _item(self, item, acc):
+        """Fold one output item into the accumulator."""
+        t = item.get("type")
+        if t == "function_call":
+            inp, bad = _strict_json(item.get("arguments") or "{}")
+            acc["calls"].append({"id": item.get("call_id") or item.get("id") or f"call_{len(acc['calls'])}",
+                                 "name": item.get("name"), "input": inp, "invalid_json": bad})
+        elif t == "reasoning":
+            keep = {k: item[k] for k in ("type", "id", "encrypted_content", "summary") if k in item}
+            if keep.get("encrypted_content"):
+                acc["reasoning"].append(keep)
+        elif t == "message":
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text":
+                    acc["item_text"] += part.get("text") or ""
+                elif part.get("type") == "refusal":
+                    acc["refusal"] = part.get("refusal") or ""
+
+    def _parse_response(self, data):
+        acc = {"calls": [], "reasoning": [], "item_text": "", "refusal": None}
+        for item in data.get("output") or []:
+            self._item(item, acc)
+        inc = data.get("incomplete_details") or {}
+        err = data.get("error") or {}
+        return self._finish(acc["item_text"], acc["calls"], acc["reasoning"], data.get("status"),
+                            inc.get("reason") or err.get("message"), data.get("usage") or {},
+                            acc["refusal"])
+
+    def _consume_responses(self, resp, on_delta):
+        acc = {"calls": [], "reasoning": [], "item_text": "", "refusal": None}
+        text, status, detail, usage = "", None, None, {}
+        for event, data in _sse(resp):
+            try:
+                ev = json.loads(data)
+            except ValueError:
+                continue
+            kind = ev.get("type") or event
+            if kind == "response.output_text.delta":
+                text += ev.get("delta") or ""
+                if on_delta and ev.get("delta"):
+                    on_delta(ev["delta"])
+            elif kind == "response.output_item.done":
+                self._item(ev.get("item") or {}, acc)
+            elif kind in ("response.completed", "response.incomplete", "response.failed"):
+                r = ev.get("response") or {}
+                usage = r.get("usage") or usage
+                status = r.get("status") or kind.rsplit(".", 1)[-1]
+                detail = (r.get("incomplete_details") or {}).get("reason") \
+                    or (r.get("error") or {}).get("message")
+            elif kind == "error":
+                e = ev.get("error") if isinstance(ev.get("error"), dict) else ev
+                raise ProviderError(f"error: provider stream error: {e.get('message') or data[:300]}")
+        return self._finish(text or acc["item_text"], acc["calls"], acc["reasoning"], status,
+                            detail, usage, acc["refusal"])
+
+    # ------------------------------------------------------------ chat completions
+
+    def _wire(self, system, messages):
+        out = [{"role": "system", "content": self._system(system)}]
         for m in messages:
             if m["role"] == "user":
                 out.append({"role": "user", "content": m["content"]})
@@ -396,20 +561,11 @@ class OpenAIProvider:
         if c.stop:
             body["stop"] = c.stop
         if c.effort and self.name in ("openai", "azure"):
-            body["reasoning_effort"] = {"xhigh": "high", "max": "high"}.get(c.effort, c.effort)
+            body["reasoning_effort"] = self._effort()
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
         return body
-
-    def complete(self, system, messages, tools=None, on_delta=None):
-        stream = self.config.stream
-        body = self._body(system, messages, tools, stream)
-        url = self._url("chat/completions")
-        if not stream:
-            return self._parse(_post(url, self._headers(), body, self.config.timeout))
-        with _open(url, self._headers(), body, self.config.timeout) as resp:
-            return self._consume(resp, on_delta)
 
     def _parse(self, data):
         choice = data["choices"][0]
@@ -420,7 +576,8 @@ class OpenAIProvider:
             calls.append({"id": tc["id"], "name": tc["function"]["name"], "input": inp,
                           "invalid_json": bad})
         u = data.get("usage") or {}
-        return Reply(msg.get("content") or "", calls, choice.get("finish_reason"),
+        stop = choice.get("finish_reason")
+        return Reply(msg.get("content") or "", calls, self.STOP.get(stop, stop),
                      {"in": u.get("prompt_tokens", 0), "out": u.get("completion_tokens", 0)})
 
     def _consume(self, resp, on_delta):
@@ -457,7 +614,7 @@ class OpenAIProvider:
             inp, bad = _strict_json(s["args"] or "{}")
             calls.append({"id": s["id"] or f"call_{i}", "name": s["name"], "input": inp,
                           "invalid_json": bad})
-        return Reply(text, calls, stop,
+        return Reply(text, calls, self.STOP.get(stop, stop),
                      {"in": usage.get("prompt_tokens", 0), "out": usage.get("completion_tokens", 0)})
 
     def models(self):

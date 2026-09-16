@@ -108,6 +108,14 @@ the next session is told about them. A note the agent proposes about the
 person arrives as a `memory_suggestion` event and is kept only when someone
 accepts it (`overlord memory accept <sid> --id <id>`).
 
+### Single sign-on
+
+Register `https://<host>/auth/callback` as the redirect URI at your
+provider, then `overlord sso set --issuer <issuer> --client-id <id>
+--client-secret-stdin --domain <your domain> --admin <you>`. Roles can
+follow a groups claim (`--role-claim groups --role-map ops=admin`). The
+provider must be https; `overlord sso test` fetches its discovery document.
+
 ### Scripts against the web API
 
 With accounts on, a script authenticates to `overlord ui` with a bearer

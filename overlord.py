@@ -2334,7 +2334,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -2778,7 +2778,9 @@ def main(argv=None):
     import audit as audit_mod
     import retention as retention_mod
     import skills as skills_mod
+    import oidc as oidc_mod
     skills_mod.add_skills_parser(sub)
+    oidc_mod.add_sso_parser(sub)
     auth_mod.add_auth_parsers(sub)
     cost_mod.add_cost_parser(sub)
     audit_mod.add_audit_parser(sub)

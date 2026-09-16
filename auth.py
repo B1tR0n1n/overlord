@@ -104,8 +104,12 @@ def _save(db):
 
 
 def enabled():
-    """Accounts exist, so the UI demands a login."""
-    return bool(_load()["users"])
+    """Accounts exist — or single sign-on is configured — so the UI demands
+    a login."""
+    if _load()["users"]:
+        return True
+    import oidc
+    return oidc.configured()
 
 
 def hash_password(password):
@@ -201,7 +205,43 @@ def remove_user(name):
 
 def public_user(name, u):
     return {"name": name, "role": u.get("role"), "created": u.get("created"),
-            "disabled": bool(u.get("disabled")), "budget": u.get("budget") or {}}
+            "disabled": bool(u.get("disabled")), "budget": u.get("budget") or {},
+            "sso": u.get("sso")}
+
+
+_EXT_RE = re.compile(r"^[a-z0-9][a-z0-9._@+-]{0,127}$")
+
+
+def external_login(ident, role, issuer):
+    """An identity the provider vouched for: provision the account on first
+    sign-in (no password — the provider is the password), keep its role in
+    step with the mapping, and open a login session. Returns the principal."""
+    ident = (ident or "").lower()
+    if not _EXT_RE.match(ident):
+        raise core.OverlordError("error: unusable identity from the provider")
+    _check_role(role)
+    with _LOCK:
+        db = _load()
+        u = db["users"].get(ident)
+        if u is None:
+            u = {"hash": None, "role": role, "sso": issuer, "disabled": False,
+                 "created": time.strftime(core.TS_FORMAT)}
+            db["users"][ident] = u
+            created = True
+        else:
+            created = False
+            if u.get("disabled"):
+                raise core.OverlordError(f"error: {ident} is disabled")
+            if u.get("sso") and u["role"] != role:
+                u["role"] = role
+        _save(db)
+    os.makedirs(os.path.join(USERS_DIR, ident), mode=0o700, exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    with _LOCK:
+        _SESSIONS[tok] = {"user": ident, "role": u["role"], "created": time.time()}
+    audit.record("auth.sso_login", actor=f"{ident}@sso", user=ident, role=u["role"],
+                 provisioned=created or None, issuer=issuer)
+    return tok, {"user": ident, "role": u["role"], "via": "sso"}
 
 
 def user_budget(name):
@@ -231,7 +271,8 @@ def list_users():
 
 
 def user_dir(name):
-    _check_name(name)
+    if not _EXT_RE.match(name or ""):
+        _check_name(name)
     path = os.path.join(USERS_DIR, name)
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path
@@ -300,6 +341,8 @@ def login(name, password, remote="?"):
             raise TooMany("error: too many attempts; try again in a minute")
     db = _load()
     u = db["users"].get(name)
+    if u and u.get("sso") and not u.get("hash"):
+        raise LoginFailed("error: this account signs in through single sign-on")
     good = bool(u) and not u.get("disabled") and verify_password(str(password or ""), u["hash"])
     if not good:
         with _LOCK:
@@ -491,8 +534,9 @@ def cmd_users(args):
             return 0
         for u in rows:
             b = ", ".join(f"{k}={v}" for k, v in (u.get("budget") or {}).items())
-            print(f"{u['name']:20} {u['role']:9} {'disabled' if u['disabled'] else ''} "
-                  f"{len(tokens_for(u['name']))} token(s)" + (f"  budget {b}" if b else ""))
+            print(f"{u['name']:28} {u['role']:9} {'disabled' if u['disabled'] else ''}"
+                  f"{'sso ' if u.get('sso') else ''}{len(tokens_for(u['name']))} token(s)"
+                  + (f"  budget {b}" if b else ""))
         return 0
     if c == "token":
         raw, tid = create_token(args.name, args.label or "")

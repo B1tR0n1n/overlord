@@ -27,6 +27,7 @@ import chatui
 import auth
 import audit
 import cost as cost_mod
+import oidc
 
 # Field Systems Division tokens. Dark ground is foundational; gold is earned.
 PALETTE = dict(
@@ -888,6 +889,8 @@ input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #2a2620
 color:#e8e2d4;font-size:15px}input:focus{outline:1px solid #c9a227}
 button{margin-top:16px;width:100%;padding:10px;background:#c9a227;color:#0a0908;border:0;
 font-weight:600;font-size:14px;cursor:pointer}.err{color:#d9534f;font-size:13px;min-height:18px;margin-top:8px}
+.sso{display:block;text-align:center;margin-top:14px;padding:10px;border:1px solid #c9a227;color:#c9a227;
+text-decoration:none;font-weight:600;font-size:14px}.sso:hover{background:#1a1814}
 </style></head><body>
 <form class="card" id="f" autocomplete="on">
   <div class="name">OVERLORD</div><div class="sub">sign in to the workspace</div>
@@ -895,6 +898,7 @@ font-weight:600;font-size:14px;cursor:pointer}.err{color:#d9534f;font-size:13px;
   <label for="p">password</label><input id="p" name="password" type="password" autocomplete="current-password">
   <button type="submit">Sign in</button>
   <div class="err" id="e"></div>
+  __SSO__
 </form>
 <script nonce="__NONCE__">
 const f=document.getElementById('f'), e=document.getElementById('e');
@@ -998,13 +1002,17 @@ class Handler(BaseHTTPRequestHandler):
         if p is not None:
             auth.set_current(p)
             return True
-        if path in ("/login", "/api/login"):
+        if path in ("/login", "/api/login", "/auth/login", "/auth/callback"):
             return True
         if path.startswith("/api/"):
             self._send({"error": "login required", "login": "/login"}, 401)
         else:
             self._redirect("/login?next=" + quote(path, safe=""))
         return False
+
+    def _callback_uri(self):
+        scheme = "https" if self._tls() else "http"
+        return f"{scheme}://{(self.headers.get('Host') or '').strip()}/auth/callback"
 
     def _redirect(self, location):
         self.send_response(302)
@@ -1097,8 +1105,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._redirect("/")
                     return
                 nonce = secrets.token_urlsafe(16)
-                self._send(None, raw=LOGIN_PAGE.replace("__NONCE__", nonce).encode(),
-                           ctype="text/html; charset=utf-8", nonce=nonce)
+                sso = oidc.public()
+                nxt = _safe_next((query.get("next") or ["/"])[0])
+                button = (f'<a class="sso" href="/auth/login?next={quote(nxt, safe="")}">'
+                          f'Sign in with {_esc(sso["name"])}</a>' if sso["configured"] else "")
+                page = LOGIN_PAGE.replace("__NONCE__", nonce).replace("__SSO__", button)
+                self._send(None, raw=page.encode(), ctype="text/html; charset=utf-8", nonce=nonce)
+                return
+            if path == "/auth/login":
+                nxt = _safe_next((query.get("next") or ["/"])[0])
+                self._redirect(oidc.begin(self._callback_uri(), nxt))
+                return
+            if path == "/auth/callback":
+                if query.get("error"):
+                    raise core.OverlordError("error: the provider refused: "
+                                             + (query.get("error_description") or query["error"])[0])
+                tok, _p, nxt = oidc.finish((query.get("code") or [""])[0],
+                                           (query.get("state") or [""])[0])
+                self.send_response(302)
+                self.send_header("Location", _safe_next(nxt))
+                self.send_header("Set-Cookie", self._cookie_header(tok))
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
                 return
             if path == "/api/me":
                 self._send(auth.me())
@@ -1341,6 +1370,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"error": str(e)}, 400)
         except Exception as e:
             self._send({"error": f"{type(e).__name__}: {e}"}, 400)
+
+
+def _safe_next(nxt):
+    nxt = nxt or "/"
+    return nxt if nxt.startswith("/") and not nxt.startswith("//") and "\\" not in nxt else "/"
 
 
 def _visible_metas():

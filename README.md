@@ -77,6 +77,8 @@ overlord memory user --add "Prefers pytest."         # a note about you, across 
 overlord memory accept <session> --all               # keep the notes an agent proposed
 overlord users add alice --role admin                # accounts: the UI now asks who you are
 overlord tls selfsign --host overlord.lan            # a certificate for --bind
+overlord sso set --issuer https://login.example.com --client-id … --client-secret-stdin \
+    --domain example.com --admin alice@example.com   # OpenID Connect; accounts provisioned on sign-in
 overlord ui --bind 0.0.0.0 --tls-cert ~/.overlord/tls/cert.pem --tls-key ~/.overlord/tls/key.pem
 overlord skills add skills/python-testing            # packaged know-how, loaded when it fits
 overlord skills new release -t /srv/app              # a project skill: part of the tree, reviewed like code
@@ -221,6 +223,18 @@ Each account has its own `~/.overlord/users/<name>/` with its `ui.json`,
 `keys.json` (a key you set is yours; the machine's shared key is the
 fallback an admin can provision) and `memory.md`. A session records its
 `owner`; sessions opened from the CLI have none and are the admin's to see.
+
+**Single sign-on** (`oidc.py`): OpenID Connect, authorization code with
+PKCE, state and nonce. `overlord sso set` names the issuer and client;
+accounts are provisioned on first sign-in when the e-mail domain is
+allowed, with the role from a listed e-mail (`--admin`, `--viewer`), a
+groups claim (`--role-claim groups --role-map auditors=viewer`) or the
+default. SSO accounts have no password and the password form refuses
+them; local accounts coexist. What the trust rests on, stated plainly:
+the TLS channel to the provider's token and userinfo endpoints plus the
+state / nonce / PKCE round-trip — the ID token's claims are checked, its
+signature is not (no RSA in the standard library), and the same identity
+is confirmed by `userinfo` directly from the provider.
 
 Beyond loopback the server refuses to start without both accounts and TLS
 (`--bind 0.0.0.0 --tls-cert … --tls-key …`; `overlord tls selfsign` makes a
@@ -527,6 +541,7 @@ python3 test/auth_test.py         # 7 auth assertions: open mode, sign-in + lock
 python3 test/cost_test.py         # 6 cost assertions: prices, ledger, policy / global / account budgets, review ledger, CLI, workspace
 python3 test/audit_test.py        # 5 audit assertions: chained acts, tamper detection, actors + healthz, gc, --log-json + doctor
 python3 test/skills_test.py       # 6 skills assertions: catalogue + shadowing, jailed / host loads, authored in-transaction, policy, CLI, workspace
+python3 test/sso_test.py          # 5 SSO assertions against a fake provider: config, PKCE round-trip, role mapping + domains, password refusal, audit
 python3 test/chat_test.py         # 12 workspace assertions: settings, model config, streaming, resume, commit
 python3 test/ui_test.py           # 12 mission-control API + origin-guard + savepoint + blame + review assertions
 python3 test/ui_browser_test.py   # 10 mission-control DOM assertions (needs playwright)
@@ -677,3 +692,9 @@ grants are absent.
   with a `skill` tool, every load on the transcript; `overlord skills
   list|show|add|new|rm`; a Skills panel; two example skills. 169 assertions
   across seventeen suites.
+- 2026-09-16 — v0.15: single sign-on. `oidc.py`: OpenID Connect
+  authorization code with PKCE / state / nonce, identity from userinfo,
+  accounts provisioned on first sign-in with roles from an e-mail list, a
+  groups claim or a default, allowed domains, SSO accounts without
+  passwords; `overlord sso set|show|test|off`; a sign-in button; every
+  sign-in, refusal and change audited. 174 assertions across eighteen suites.

@@ -1,2 +1,25 @@
+# OVERLORD state and secrets live in ~/.overlord (OVERLORD_HOME), never the repo.
+# These entries stop a stray local copy or key from being staged by accident.
+.overlord/
+*.key
+keys.json
+cost.json
+audit.jsonl
+audit.json
+ratelimit.json
+sessions/
+*.pem
+
+# Python / tooling noise
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

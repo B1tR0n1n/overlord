@@ -14,6 +14,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "== dependencies"
 if command -v apt-get > /dev/null; then
+    apt-get update
     apt-get install -y --no-install-recommends fuse-overlayfs strace gcc libc6-dev
 fi
 

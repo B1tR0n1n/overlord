@@ -1684,20 +1684,39 @@ def reopen_session(sid, wait=False, capture=False):
     return _launch_holder(sid, m, lock, capture, fresh=False)
 
 
+def _systemd_user_ok():
+    """Is `systemd-run --user` actually usable here? On WSL2 (and other setups
+    without a user D-Bus session) it fails at launch with 'Failed to connect to
+    bus: No medium found', which would otherwise stall every session. The probe
+    runs a trivial scope AND fails when it cannot reach the bus, so a stale
+    yes cannot leak through. OVERLORD_NO_SYSTEMD=1 forces it off."""
+    if os.environ.get("OVERLORD_NO_SYSTEMD"):
+        return False
+    try:
+        with open("/proc/sys/kernel/osrelease") as f:
+            if "microsoft" in f.read().lower():     # WSL: user bus is unreliable
+                return False
+    except OSError:
+        pass
+    if not shutil.which("systemd-run"):
+        return False
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--scope", "-q", "-p", "TasksMax=64", "--", "true"],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    err = (r.stderr or b"").decode(errors="replace").lower()
+    return r.returncode == 0 and "bus" not in err and "failed" not in err
+
+
 def _cgroup_prefix(limits):
     """systemd-run --user --scope with the limits, when a user manager is
-    there to delegate a cgroup (desktops, WSL2 with systemd on). Probed once."""
+    really there to delegate a cgroup (desktops). Skipped on WSL2 and wherever
+    the user bus is missing — sessions then use rlimits (and a direct cgroup if
+    delegated) instead of stalling. Probed once."""
     if _cgroup_prefix.cache is not None:
         return list(_cgroup_prefix.cache)
-    prefix = []
-    if shutil.which("systemd-run"):
-        try:
-            r = subprocess.run(["systemd-run", "--user", "--scope", "-q", "-p", "TasksMax=64", "--", "true"],
-                               capture_output=True, timeout=10)
-            if r.returncode == 0:
-                prefix = ["systemd-run", "--user", "--scope", "-q"]
-        except (OSError, subprocess.TimeoutExpired):
-            prefix = []
+    prefix = ["systemd-run", "--user", "--scope", "-q"] if _systemd_user_ok() else []
     _cgroup_prefix.cache = prefix
     return list(prefix)
 
@@ -1823,7 +1842,7 @@ def limits_backend():
             os.rmdir(probe)
             return "cgroup v2, direct (+ rlimits)"
         except OSError:
-            return "rlimits only (cgroup v2 not delegated to this user; enable systemd --user for cgroups)"
+            return "rlimits only (cgroup v2 not delegated; systemd --user unavailable — normal on WSL2)"
     if os.path.isdir("/sys/fs/cgroup/pids"):
         try:
             os.makedirs("/sys/fs/cgroup/pids/overlord-probe", exist_ok=True)

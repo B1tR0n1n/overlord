@@ -67,6 +67,10 @@ ship or host:
   the fuse backend; its header has the run line (`--device /dev/fuse
   --cap-add SYS_ADMIN`, a data volume, accounts and a certificate first).
 
+On WSL2 the per-session systemd user scope is skipped automatically (its user
+D-Bus is unreliable and would stall sessions with "Failed to connect to bus");
+limits fall back to rlimits, and `OVERLORD_NO_SYSTEMD=1` forces that anywhere.
+
 `overlord doctor` is the ground truth on any machine: it names the
 backend it found and what each grant will mean there.
 

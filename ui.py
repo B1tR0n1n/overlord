@@ -82,7 +82,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
 .desig-v{font-family:var(--mono);font-size:10px;letter-spacing:2px;
   text-transform:uppercase;color:var(--text-dim);margin-top:3px}
 
-.body{display:grid;grid-template-columns:296px 1fr;min-height:0}
+.body{display:grid;grid-template-columns:340px 1fr;min-height:0}
 
 /* ---- 00 register: an index, not a list of cards --------------------- */
 .register{border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
@@ -105,8 +105,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);
   font-style:italic;color:var(--text-dim)}
 
 /* ---- dossier: the instrument -------------------------------------- */
-.dossier{overflow-y:auto;padding:26px 34px 60px;min-height:0}
-.sheet{max-width:940px}
+.dossier{overflow-y:auto;padding:26px 44px 60px;min-height:0}
+.sheet{max-width:1280px}
 .sec{margin-bottom:38px}
 .sec-label{font-family:var(--mono);font-size:9px;letter-spacing:5px;
   text-transform:uppercase;color:var(--accent-dim)}

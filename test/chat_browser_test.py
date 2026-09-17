@@ -66,7 +66,7 @@ with open(script, "w") as f:
         {"tool_calls": [{"name": "write_file", "input": {
             "path": "lib.py",
             "content": "def a():\n    return 1\n\n\ndef greet():\n    return 'hi'\n"}}]},
-        {"text": "Added a greet() function that returns 'hi'."}], f)
+        {"text": "**Done.** Added a `greet()` function:\n\n- it returns `'hi'`\n- no other files touched"}], f)
 os.environ["OVERLORD_AGENT_SCRIPT"] = script
 
 sys.path.insert(0, HERE)
@@ -137,7 +137,20 @@ try:
             fail("a bubble is still marked live after the run stopped")
         if page.locator(".msg.assistant").count() < 2:
             fail("streamed assistant turns did not each render as a bubble")
-        ok("a message runs the agent and its turns stream into the chat")
+        # the final turn is markdown: it must render, not print raw ** and -,
+        # in the monospace CLI style
+        bub = page.locator(".msg.assistant .bub").last
+        info = bub.evaluate("""b => ({strong:b.querySelectorAll('strong').length,
+            li:b.querySelectorAll('li').length, code:b.querySelectorAll('code').length,
+            stars:(b.textContent.match(/[*]/g)||[]).length,
+            mono:/mono|consolas|sf mono/i.test(getComputedStyle(b).fontFamily)})""")
+        if info["strong"] < 1 or info["li"] < 2 or info["code"] < 1:
+            fail(f"assistant markdown did not render to DOM: {info}")
+        if info["stars"] != 0:
+            fail(f"raw markdown asterisks are still shown: {info}")
+        if not info["mono"]:
+            fail(f"the assistant transcript is not in the monospace CLI style: {info}")
+        ok("a message runs the agent; turns stream in; the final markdown renders clean in the mono CLI style")
 
         # a follow-up message renders once (the server's event is the only
         # render), and a long conversation scrolls inside its pane: the

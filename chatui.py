@@ -852,8 +852,25 @@ button{font-family:inherit;cursor:pointer}
 .msg .who{font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
 .msg.user .bub{background:var(--bg3);border:1px solid var(--border);border-left:2px solid var(--accent);
   padding:12px 16px;white-space:pre-wrap;color:var(--bright)}
-.msg.assistant .bub{font-family:var(--serif);font-size:16px;line-height:1.6;color:var(--text);
-  white-space:pre-wrap}
+.msg.assistant .bub{font-family:var(--mono);font-size:12.5px;line-height:1.55;color:var(--text);
+  background:var(--bg);border:1px solid var(--border);border-left:2px solid var(--green);
+  padding:11px 14px;overflow-x:auto}
+.msg.assistant .bub.live{white-space:pre-wrap}
+.bub>*:first-child{margin-top:0}.bub>*:last-child{margin-bottom:0}
+.bub p{margin:0 0 9px}
+.bub strong{color:var(--bright);font-weight:600}
+.bub em{color:var(--text);font-style:italic}
+.bub code{background:var(--bg3);border:1px solid var(--border);border-radius:3px;
+  padding:0 4px;font-size:11.5px;color:var(--accent)}
+.bub pre{background:var(--bg3);border:1px solid var(--border);border-radius:4px;
+  padding:9px 11px;overflow-x:auto;margin:0 0 9px;line-height:1.45}
+.bub pre code{background:none;border:0;padding:0;color:var(--text);font-size:11.5px}
+.bub ul,.bub ol{margin:0 0 9px;padding-left:20px}
+.bub li{margin:2px 0}
+.bub li::marker{color:var(--accent-dim)}
+.bub h1,.bub h2,.bub h3{font-size:11px;color:var(--bright);margin:0 0 7px;
+  letter-spacing:1.5px;text-transform:uppercase;font-weight:600}
+.bub a{color:var(--blue);text-decoration:underline}
 .tool{max-width:760px;margin:0 auto 10px;border:1px solid var(--border);background:var(--bg2)}
 .tool .th{padding:8px 14px;font-size:11px;display:flex;gap:10px;align-items:center;cursor:pointer}
 .tool .th .arrow{color:var(--accent-dim)}
@@ -1291,6 +1308,56 @@ async function loadConvs(){
 }
 
 let LIVE = null;   // the assistant bubble currently receiving streamed text
+// Render markdown into an element by BUILDING DOM NODES — never innerHTML of
+// model text, so nothing the model writes can inject markup. Handles
+// paragraphs, headings, bullet/numbered lists, fenced and inline code, bold,
+// italic and safe links. This is what turns the raw ** and - the model emits
+// into a clean, CLI-styled transcript.
+function mdSafeHref(u){ return /^(https?:|mailto:)/i.test(u) ? u : null; }
+function mdInline(container, text){
+  const re=/(\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\))/g;
+  let last=0, m;
+  while((m=re.exec(text))){
+    if(m.index>last) container.appendChild(document.createTextNode(text.slice(last,m.index)));
+    if(m[2]!=null||m[3]!=null){ const b=document.createElement('strong'); b.textContent=m[2]!=null?m[2]:m[3]; container.appendChild(b); }
+    else if(m[4]!=null){ const e=document.createElement('em'); e.textContent=m[4]; container.appendChild(e); }
+    else if(m[5]!=null){ const co=document.createElement('code'); co.textContent=m[5]; container.appendChild(co); }
+    else if(m[6]!=null){ const href=mdSafeHref(m[7]);
+      if(href){ const a=document.createElement('a'); a.textContent=m[6]; a.href=href; a.target='_blank'; a.rel='noopener noreferrer'; container.appendChild(a); }
+      else container.appendChild(document.createTextNode(m[6])); }
+    last=re.lastIndex;
+  }
+  if(last<text.length) container.appendChild(document.createTextNode(text.slice(last)));
+}
+function mdRender(el2, text){
+  el2.textContent='';
+  const lines=(text||'').replace(/\r\n?/g,'\n').split('\n');
+  let i=0, list=null, listType=null, para=[];
+  function flushList(){ if(list){ el2.appendChild(list); list=null; listType=null; } }
+  function flushPara(){ if(para.length){ const p=document.createElement('p'); mdInline(p, para.join(' ')); el2.appendChild(p); para=[]; } }
+  while(i<lines.length){
+    const line=lines[i];
+    if(/^\s*```/.test(line)){
+      flushPara(); flushList(); const buf=[]; i++;
+      while(i<lines.length && !/^\s*```/.test(lines[i])){ buf.push(lines[i]); i++; }
+      i++;
+      const pre=document.createElement('pre'), code=document.createElement('code');
+      code.textContent=buf.join('\n'); pre.appendChild(code); el2.appendChild(pre); continue;
+    }
+    const h=line.match(/^(#{1,3})\s+(.*)$/);
+    if(h){ flushPara(); flushList(); const hd=document.createElement('h3'); mdInline(hd, h[2]); el2.appendChild(hd); i++; continue; }
+    const ul=line.match(/^\s*[-*]\s+(.*)$/), ol=line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if(ul||ol){
+      flushPara(); const t=ul?'ul':'ol';
+      if(list && listType!==t) flushList();
+      if(!list){ list=document.createElement(t); listType=t; }
+      const li=document.createElement('li'); mdInline(li, ul?ul[1]:ol[1]); list.appendChild(li); i++; continue;
+    }
+    if(line.trim()===''){ flushPara(); flushList(); i++; continue; }
+    flushList(); para.push(line.trim()); i++;
+  }
+  flushPara(); flushList();
+}
 function renderMsg(m){
   const s = $('stream');
   if(m.type==='assistant_delta'){
@@ -1298,12 +1365,14 @@ function renderMsg(m){
       LIVE = el('div','bub live'); w.appendChild(LIVE); s.appendChild(w); }
     LIVE.textContent += m.text||'';
   } else if(m.type==='assistant' && LIVE){
-    LIVE.textContent = m.text||''; LIVE.classList.remove('live'); LIVE = null;
+    mdRender(LIVE, m.text||''); LIVE.classList.remove('live'); LIVE = null;
   } else if(m.type==='user'||m.type==='assistant'){
     LIVE = null;
     const w = el('div','msg '+m.type);
     w.appendChild(el('div','who', m.type==='user'?'you':'agent'));
-    w.appendChild(el('div','bub', m.text||''));
+    const bub = el('div','bub');
+    if(m.type==='assistant') mdRender(bub, m.text||''); else bub.textContent = m.text||'';
+    w.appendChild(bub);
     s.appendChild(w);
   } else if(m.type==='tool_call'){
     LIVE = null;

@@ -942,11 +942,14 @@ class _Server(ThreadingHTTPServer):
         return n > self.rate_limit
 
     def handle_error(self, request, client_address):
-        # a plain-HTTP probe at a TLS port, or a client that hung up: one
-        # quiet line, not a traceback per connection
+        # a plain-HTTP probe at a TLS port, or a client that hung up mid-reply
+        # (reload, closed tab, a reverse proxy timing out): benign, so one
+        # quiet line at most, never a traceback per connection
         import traceback
         exc = traceback.format_exc().strip().splitlines()[-1]
-        if "SSL" not in exc and "Connection reset" not in exc:
+        benign = ("SSL", "Connection reset", "Broken pipe", "BrokenPipe",
+                  "Connection aborted", "EPIPE", "ConnectionResetError")
+        if not any(b in exc for b in benign):
             print(f"ui: {client_address[0]}: {exc}", file=sys.stderr)
 
 

@@ -12,6 +12,7 @@
     overlord fork <session> [--at <savepoint>]
     overlord compare <session-a> <session-b>
     overlord review <session> [--provider ...] [--model M]
+    overlord check <session>
     overlord commit <session> [--merge] [--force] [--only SEL] [--drop SEL] [--countersigned]
     overlord rollback <session>
     overlord blame <path> [--json]
@@ -43,6 +44,11 @@ nothing is copied. That makes three things possible:
     review   a second model countersigns the diff (review.py); a fresh
              rejection blocks commit, --countersigned demands a fresh
              approval, and policy can require it per target.
+    check    dry-run the content policy gate before committing: a policy rule's
+             "checks" scan the diff for secrets, compiled binaries, dependency-
+             manifest changes and oversized diffs; each finding is block (refuse
+             like a conflict; --force overrides), countersign (demand a fresh
+             approval) or warn (record and allow). commit runs the same gate.
 
 Grants (the capability manifest, via flags or --manifest file):
     --jail          pivot_root jail: the process sees system dirs + the target
@@ -2416,6 +2422,13 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
             raise OverlordError("error: --force is refused: the diff touches protected paths: "
                                 + ", ".join(protected[:8]))
         countersigned = True
+    # content gate: findings whose action is "countersign" demand a fresh
+    # approval (handled just below); "block" findings refuse the commit like a
+    # conflict (force overrides); "warn" findings only ride the audit record.
+    policy_findings = policy_gate(m["target"], changes, origin, uppers)
+    if any(f["action"] == "countersign" for f in policy_findings):
+        countersigned = True
+    policy_block = [f for f in policy_findings if f["action"] == "block"]
     if countersigned and not (rev and fresh and rev.get("verdict") == "approve"
                               and not rev.get("truncated")):
         why = ("no review recorded" if rev is None else
@@ -2435,6 +2448,12 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
     if bad:  # would _remove_target(<tree root>); no --force for this one
         raise OverlordError("error: refusing to commit — whiteout entry names its own "
                             f"tree root: {', '.join(bad)} (roll the session back)")
+    if policy_block and not force:
+        import policycheck
+        _audit("session.commit_refused", sid=sid, owner=m.get("owner"), target=m["target"],
+               why="policy", findings=policycheck.summarize(policy_findings))
+        return {"committed": False, "conflicts": [], "merged": [],
+                "target": m["target"], "layers": selected, "policy": policy_findings}
     conflicts = list(dict.fromkeys(find_conflicts(touched, manifest, m["target"])))
     merged = []
     if conflicts and merge:
@@ -2489,12 +2508,16 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
             memory_mod.journal_record(m)
         except OSError:
             pass
+    import policycheck
     _audit("session.commit", sid=sid, owner=m.get("owner"), target=m["target"],
            files=len(changes), forced=bool(conflicts), merged=len(merged) or None,
            only=only, drop=drop, countersigned=m.get("countersigned") or None,
-           overrode_rejection=m.get("overrode_rejection") or None, usage=m.get("usage"))
+           overrode_rejection=m.get("overrode_rejection") or None,
+           policy=policycheck.summarize(policy_findings) or None,
+           policy_forced=bool(policy_block and force) or None, usage=m.get("usage"))
     return {"committed": True, "applied": len(changes), "merged": merged,
-            "target": m["target"], "layers": selected, "dropped": dropped}
+            "target": m["target"], "layers": selected, "dropped": dropped,
+            "policy": policy_findings}
 
 
 HARNESS_FILES = ("overlord.py", "agent.py", "providers.py", "review.py", "mcp.py", "memory.py",
@@ -2521,6 +2544,29 @@ def protected_hits(target, changes):
         return []
     return [rel for _k, rel in changes
             if any(fnmatch.fnmatch(rel.rstrip("/"), p) or fnmatch.fnmatch(rel, p + "/*") for p in pats)]
+
+
+def policy_gate(target, changes, origin, uppers):
+    """Content checks for the pending diff, per the target's policy rule:
+    secrets, compiled binaries, dependency-manifest changes, oversized diffs.
+    Returns a list of findings (each {check, path, detail, action}), empty when
+    the rule declares no `checks`. The findings' actions — block / countersign
+    / warn — are applied by commit_session, not here."""
+    pol = load_policy()
+    rule = _policy_rule(pol, os.path.realpath(target)) if pol else None
+    checks = rule.get("checks") if isinstance(rule, dict) else None
+    if not checks:
+        return []
+    import policycheck
+
+    def locate(rel):
+        try:
+            i = origin[rel] if rel in origin else -1
+            return _safe_join(uppers[i], rel)
+        except Exception:            # noqa: BLE001 — an unreadable path just isn't scanned
+            return None
+
+    return policycheck.evaluate(changes, locate, checks)
 
 
 def rollback_session(sid):
@@ -2552,6 +2598,14 @@ def cmd_commit(args):
               file=sys.stderr)
         print(f"override with: overlord commit --force {args.session}", file=sys.stderr)
         return 1
+    if not res["committed"] and res.get("policy") is not None and not res.get("conflicts"):
+        import policycheck
+        print("error: policy gate blocked the commit:", file=sys.stderr)
+        for line in policycheck.summarize(res["policy"]):
+            print(f"  {line}", file=sys.stderr)
+        print(f"inspect the diff, then roll back: overlord rollback {args.session}", file=sys.stderr)
+        print(f"or override (audited): overlord commit --force {args.session}", file=sys.stderr)
+        return 1
     if not res["committed"]:
         print("error: target drifted since snapshot — refusing to commit:", file=sys.stderr)
         for reason, rel in res["conflicts"]:
@@ -2559,6 +2613,12 @@ def cmd_commit(args):
         hint = "--merge (needs --merge-base session) or --force" if not args.merge else "--force"
         print(f"override with: overlord commit {hint} {args.session}", file=sys.stderr)
         return 1
+    warns = [f for f in (res.get("policy") or []) if f["action"] == "warn"]
+    if warns:
+        import policycheck
+        print("policy warnings (committed anyway):", file=sys.stderr)
+        for line in policycheck.summarize(warns):
+            print(f"  {line}", file=sys.stderr)
     msg = f"committed {res['applied']} changes to {res['target']}"
     if res["merged"]:
         msg += f" ({len(res['merged'])} three-way merged)"
@@ -2578,6 +2638,32 @@ def cmd_rollback(args):
     target = rollback_session(args.session)
     print(f"rolled back {args.session} — target untouched: {target}")
     return 0
+
+
+def cmd_check(args):
+    """Dry-run the pre-commit policy gate against a pending session: report
+    what would block, require countersignature, or warn — without committing."""
+    import policycheck
+    m = load_meta(args.session)
+    if m.get("status") != "pending":
+        print(f"error: session is {m.get('status')}, not pending", file=sys.stderr)
+        return 2
+    changes, origin, touched, uppers = session_stack(args.session, m)
+    findings = policy_gate(m["target"], changes, origin, uppers)
+    if not findings:
+        pol = load_policy()
+        rule = _policy_rule(pol, os.path.realpath(m["target"])) if pol else None
+        active = isinstance(rule, dict) and rule.get("checks")
+        print("no policy findings" + ("" if active else " (no checks configured for this target)"))
+        return 0
+    for line in policycheck.summarize(findings):
+        print(f"  {line}")
+    top = policycheck.worst(findings)
+    verdict = {"block": "commit would be BLOCKED (override: --force)",
+               "countersign": "commit would REQUIRE a fresh countersignature",
+               "warn": "commit would be allowed with warnings"}.get(top, "")
+    print(verdict)
+    return 1 if top == "block" else 0
 
 
 def _savepoint_line(sp):
@@ -2819,6 +2905,17 @@ def cmd_blame(args):
     return 0
 
 
+def _policy_gate_summary():
+    """One line for doctor: whether policy.json configures content checks."""
+    pol = load_policy()
+    if not pol:
+        return "always available; no policy file, so no checks run"
+    rules = list(pol.get("targets", {}).values()) + ([pol["default"]] if pol.get("default") else [])
+    names = sorted({k for r in rules if isinstance(r, dict) and isinstance(r.get("checks"), dict)
+                    for k, v in r["checks"].items() if not str(k).startswith("max_")})
+    return ("checks configured: " + ", ".join(names)) if names else "no checks configured"
+
+
 def cmd_doctor(args):
     if in_jail():
         print("inside an OVERLORD jail: no capabilities, no new privileges, a seccomp policy — a\n"
@@ -2847,6 +2944,8 @@ def cmd_doctor(args):
         ("savepoints (one overlay layer per writing command; rewind / commit --only)",
          "kernel: exact" if k else ("fuse: best effort (remount between commands)"
                                     if fu else "no backend"), k or fu),
+        ("commit policy gate (secrets / binaries / deps / size)",
+         _policy_gate_summary(), True),
     ]
     try:
         with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as f:
@@ -3388,6 +3487,10 @@ def main(argv=None):
                     help="refuse unless a second model's fresh approval is on record "
                          "(overlord review)")
     pc.set_defaults(fn=cmd_commit)
+
+    pch = sub.add_parser("check", help="dry-run the pre-commit policy gate on a pending session")
+    pch.add_argument("session")
+    pch.set_defaults(fn=cmd_check)
 
     pf = sub.add_parser("fork", help="copy the stack up to a savepoint into a new session")
     pf.add_argument("session")

@@ -15,6 +15,7 @@
     overlord check <session>
     overlord commit <session> [--merge] [--force] [--only SEL] [--drop SEL] [--countersigned]
     overlord rollback <session>
+    overlord revert <session> [--commit] [--force] [--stack]
     overlord blame <path> [--json]
     overlord doctor
     overlord agent -t <dir> [grants] [--provider anthropic|openai] "<task>"
@@ -44,6 +45,13 @@ nothing is copied. That makes three things possible:
     review   a second model countersigns the diff (review.py); a fresh
              rejection blocks commit, --countersigned demands a fresh
              approval, and policy can require it per target.
+    revert   undo a COMMITTED session: its inverse — added files removed,
+             modified and deleted files restored from retained before-content
+             — is staged as a NEW pending session over the same target, so it
+             is reviewed and committed like any other change. (rollback is the
+             pre-commit half: it discards a pending session; the tree was
+             never touched.) A removed directory is rebuilt from the files
+             retained beneath it at commit. File modes are not restored.
     check    dry-run the content policy gate before committing: a policy rule's
              "checks" scan the diff for secrets, compiled binaries, dependency-
              manifest changes and oversized diffs; each finding is block (refuse
@@ -767,6 +775,12 @@ def _added_conflicts(rel, manifest, target):
 def _touched_conflicts(rel, manifest, target):
     """A file the session modified or deleted must still be as snapshotted."""
     if rel not in manifest:
+        # the manifest holds files, so a deleted DIRECTORY is not in it: it is
+        # validated as a subtree, like a replaced dir — every snapshotted file
+        # beneath it intact and nothing new beneath it — since replay rmtrees it
+        tpath = _safe_join(target, rel)
+        if os.path.isdir(tpath) and not os.path.islink(tpath):
+            return _replaced_dir_conflicts(rel, manifest, target)
         return [("appeared-after-snapshot", rel)]
     tpath = _safe_join(target, rel)
     if not os.path.lexists(tpath):
@@ -2471,9 +2485,24 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
     # retain content for blame: the tree's version before replay, then the
     # session's version after it (both content-addressed, so nothing repeats)
     retained = {}
+    # a deleted DIRECTORY is one whiteout in the layer, but reversibility needs
+    # what was beneath it: retain every regular file under it and record each,
+    # so blame can answer for them and revert can rebuild the directory
+    expanded = {}
     for kind, rel in changes:
         if kind in ("modified", "deleted"):
-            if store_object(_safe_join(m["target"], rel)):
+            tpath = _safe_join(m["target"], rel)
+            if kind == "deleted" and os.path.isdir(tpath) and not os.path.islink(tpath):
+                subs = []
+                for root, _dirs, files in os.walk(tpath):
+                    for name in files:
+                        fp = os.path.join(root, name)
+                        sha = store_object(fp)
+                        if sha:
+                            subs.append((os.path.relpath(fp, m["target"]), sha))
+                expanded[rel] = subs
+                continue
+            if store_object(tpath):
                 retained.setdefault(rel, set()).add("before")
     apply_layers(uppers, m["target"], m.get("backend"))
     for kind, rel in changes:
@@ -2493,7 +2522,14 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
         for rec in records:
             for side in retained.get(rec["path"], ()):
                 rec[f"{side}_retained"] = True
+            subs = expanded.get(rec["path"]) if rec.get("kind") == "deleted" else None
+            if subs is not None:
+                rec["expanded"] = len(subs)      # the records that follow are its files
             f.write(json.dumps(rec) + "\n")
+            for sub_rel, sha in subs or ():
+                f.write(json.dumps({**{k: rec[k] for k in ("ts", "layer", "caused_by") if k in rec},
+                                    "kind": "deleted", "path": sub_rel, "under": rec["path"],
+                                    "before_sha256": sha, "before_retained": True}) + "\n")
     for sub in ("upper", "work", "merged", "base", "jail", "trace", "tmp", LAYERS_DIR,
                 MANIFEST_FILE, RAW_TRACE_FILE):
         try:
@@ -2589,6 +2625,136 @@ def rollback_session(sid):
     return m["target"]
 
 
+# ---------------------------------------------------------------- revert
+#
+# rollback discards a PENDING session: the tree was never touched. revert is
+# the other half of reversibility — undoing a COMMITTED session's file changes
+# — and it is itself a transaction: the inverse is replayed into a fresh
+# session from the provenance record and the retained before-content, so the
+# operator reviews a diff and commits it like any other. Nothing here reaches
+# the tree directly.
+
+_REVERT_SCRIPT = r'''
+import json, os, shutil, sys
+ops, objs = json.loads(sys.argv[1]), sys.argv[2]
+bad, dirs = [], []
+for op in ops:
+    kind, rel = op[0], op[1]
+    if kind == "rm":
+        try:
+            os.remove(rel)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            bad.append(rel)
+    elif kind == "rmdir":
+        dirs.append(rel)
+    elif kind == "mkdir":
+        os.makedirs(rel, exist_ok=True)
+    elif kind == "restore":
+        if os.path.islink(rel) or os.path.isdir(rel):
+            bad.append(rel)
+            continue
+        d = os.path.dirname(rel)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        try:
+            shutil.copyfile(os.path.join(objs, op[2]), rel)
+        except OSError:
+            bad.append(rel)
+for d in sorted(dirs, key=len, reverse=True):
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+print("REVERT-RESULT " + json.dumps(bad))
+'''
+
+
+def revert_plan(sid, meta=None):
+    """The inverse of a committed session, read from its provenance:
+    (ops, unrecoverable). ops are ("rm", rel) for an added file, ("rmdir", rel)
+    for an added directory, ("restore", rel, sha256) for a modified or deleted
+    file whose before-content was retained. unrecoverable lists (rel, why)."""
+    m = meta or load_meta(sid)
+    prov = session_file(sid, PROVENANCE_FILE)
+    if not os.path.isfile(prov):
+        raise OverlordError(f"error: session {sid} has no provenance record to invert")
+    with open(prov) as f:
+        records = [json.loads(line) for line in f if line.strip()]
+    ops, bad = [], []
+    for rec in records:
+        rel, kind = rec.get("path", ""), rec.get("kind")
+        clean = rel.rstrip("/")
+        if not clean or os.path.isabs(clean) or ".." in clean.split("/"):
+            bad.append((rel, "unsafe path"))
+            continue
+        if kind == "added":
+            ops.append(("rmdir", clean) if rel.endswith("/") else ("rm", clean))
+        elif kind == "deleted" and "expanded" in rec:
+            # a deleted directory: its files follow as their own records and
+            # restore it; an empty one is simply recreated
+            if rec["expanded"] == 0:
+                ops.append(("mkdir", clean))
+        elif kind in ("modified", "deleted"):
+            sha = rec.get("before_sha256")
+            if not (sha and rec.get("before_retained")
+                    and os.path.isfile(os.path.join(OBJECTS_DIR, sha))):
+                bad.append((rel, "before-content not retained"))
+                continue
+            ops.append(("restore", clean, sha))
+        else:
+            bad.append((rel, f"cannot invert {kind}"))
+    return ops, bad
+
+
+def revert_session(sid, backend=None, force=False, stack=False, commit=False, wait=False):
+    """Stage the inverse of committed session `sid` as a new pending session
+    over the same target and return {sid, reverted, changes, skipped, failed,
+    committed}. With commit=True the revert is committed at once. A path with
+    no retained before-content refuses the whole revert unless force=True,
+    which skips it (listed under `skipped`). File modes are not restored —
+    provenance records content, not metadata."""
+    m = load_meta(sid)
+    if m.get("status") != "committed":
+        raise OverlordError(f"error: session {sid} is {m.get('status')}, not committed — "
+                            "revert undoes a committed session; rollback discards a pending one")
+    ops, bad = revert_plan(sid, m)
+    if bad and not force:
+        raise OverlordError("error: revert cannot restore every path (--force skips them):\n"
+                            + "\n".join(f"  {r}: {why}" for r, why in bad[:20]))
+    if not ops:
+        raise OverlordError(f"error: nothing to revert in {sid}")
+    # no jail: the command must read the objects store; no network, ever
+    grants = {"net": "none", "jail": False, "timeout": None, "merge_base": False}
+    live = open_session(m["target"], backend or m.get("backend"), grants, wait=wait,
+                        stack=stack, capture=True, owner=m.get("owner"))
+    try:
+        rc, out = live.exec(["python3", "-c", _REVERT_SCRIPT, json.dumps(ops), OBJECTS_DIR],
+                            label=f"revert {sid}", cause={"revert_of": sid})
+    finally:
+        new_sid, changes = live.close()
+    failed = []
+    for line in out.decode(errors="replace").splitlines():
+        if line.startswith("REVERT-RESULT "):
+            failed = json.loads(line[len("REVERT-RESULT "):])
+    if rc != 0:
+        rollback_session(new_sid)
+        raise OverlordError(f"error: revert command failed (exit {rc}): {out[-300:]!r}")
+    nm = load_meta(new_sid)
+    nm["revert_of"] = sid
+    save_meta(new_sid, nm)
+    _audit("session.revert", sid=new_sid, of=sid, owner=m.get("owner"), target=m["target"],
+           files=len(changes), skipped=len(bad) or None, failed=failed or None)
+    res = {"sid": new_sid, "reverted": sid, "changes": changes, "skipped": bad,
+           "failed": failed, "committed": False}
+    if commit:
+        cres = commit_session(new_sid)
+        res["committed"] = bool(cres.get("committed"))
+        res["commit"] = cres
+    return res
+
+
 def cmd_commit(args):
     res = commit_session(args.session, merge=args.merge, force=args.force,
                          only=args.only, drop=args.drop, countersigned=args.countersigned)
@@ -2638,6 +2804,27 @@ def cmd_rollback(args):
     target = rollback_session(args.session)
     print(f"rolled back {args.session} — target untouched: {target}")
     return 0
+
+
+def cmd_revert(args):
+    res = revert_session(args.session, force=args.force, stack=args.stack, commit=args.commit)
+    print(f"revert of {args.session} staged as session {res['sid']}: "
+          f"{len(res['changes'])} change(s)")
+    for kind, rel in res["changes"][:20]:
+        print(f"  {kind:12s} {rel}")
+    if len(res["changes"]) > 20:
+        print(f"  ... {len(res['changes']) - 20} more (overlord diff {res['sid']})")
+    if res["skipped"]:
+        print(f"  skipped {len(res['skipped'])} path(s) with no retained before-content")
+    if res["failed"]:
+        print(f"  failed inside the session: {', '.join(res['failed'][:10])}", file=sys.stderr)
+    if args.commit:
+        print("committed" if res["committed"] else
+              f"NOT committed — resolve with: overlord commit {res['sid']}")
+    else:
+        print(f"\n  inspect:  overlord diff {res['sid']}\n  commit:   overlord commit {res['sid']}"
+              f"\n  discard:  overlord rollback {res['sid']}")
+    return 1 if res["failed"] else 0
 
 
 def cmd_check(args):
@@ -2991,7 +3178,7 @@ def cmd_doctor(args):
 
 # ---------------------------------------------------------------- daemon
 
-VERSION = "0.29.0"
+VERSION = "0.30.0"
 DEFAULT_SOCKET = os.path.join(OVERLORD_HOME, "overlordd.sock")
 POLICY_FILE = os.path.join(OVERLORD_HOME, "policy.json")
 
@@ -3184,7 +3371,7 @@ def _api_exec(req, emit):
     ls = _live(req["sid"])
     import base64
     rc, out = ls.exec(list(req["cmd"]), timeout=req.get("timeout"), cwd=req.get("cwd"),
-                      label=req.get("label"),
+                      label=req.get("label"), cause=req.get("cause"),
                       on_output=lambda chunk: emit(
                           {"ok": True, "event": "out",
                            "data": base64.b64encode(chunk).decode()}))
@@ -3296,8 +3483,68 @@ def _api_transcript(req):
     return {"transcript": events}
 
 
+def _api_revert(req):
+    return revert_session(req["sid"], force=bool(req.get("force")), stack=bool(req.get("stack")),
+                          commit=bool(req.get("commit")))
+
+
+# an external system (a console, an executor) may append its own events —
+# receipts, plans, findings, approvals — to the keyed audit chain through the
+# broker, so they inherit the chain's tamper evidence and off-box witness. The
+# namespace keeps them apart from the engine's own record; `via` marks them.
+_EXT_AUDIT = re.compile(r"^(ext|receipt|plan|finding|approval)\.[a-z0-9_.]{1,64}$")
+_RESERVED_AUDIT = {"ts", "action", "seq", "prev", "hash", "v", "via"}
+
+
+def _api_audit(req):
+    action = str(req.get("action") or "")
+    if not _EXT_AUDIT.match(action):
+        raise OverlordError("error: external audit actions must be namespaced "
+                            "ext.|receipt.|plan.|finding.|approval. (lowercase, dots, underscores)")
+    fields = req.get("fields") or {}
+    if not isinstance(fields, dict):
+        raise OverlordError("error: audit fields must be an object")
+    clash = _RESERVED_AUDIT & set(fields)
+    if clash:
+        raise OverlordError(f"error: reserved audit field(s): {', '.join(sorted(clash))}")
+    if len(json.dumps(fields)) > 65536:
+        raise OverlordError("error: audit fields exceed 64 KiB")
+    import audit as audit_mod
+    return {"entry": audit_mod.record(action, via="daemon", **fields)}
+
+
+def _api_complete(req):
+    """One tool-less model call through the engine's providers and key store —
+    for a planner that must only *propose*. Audited with prompt and output
+    hashes, so a plan is traceable to the exact call that produced it."""
+    import hashlib
+    import agent as agent_mod
+    prompt = req.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise OverlordError("error: complete needs a non-empty prompt")
+    system = req.get("system") or ""
+    provider = agent_mod.make_provider(req.get("provider", "anthropic"), req.get("model"),
+                                       base_url=req.get("base_url"), headers=req.get("headers"),
+                                       azure_api_version=req.get("azure_api_version"))
+    reply = provider.complete(system, [{"role": "user", "content": prompt}], tools=None)
+    text = reply.text or ""
+    sha = lambda s: hashlib.sha256(s.encode()).hexdigest()   # noqa: E731
+    model = getattr(provider, "model", None) or req.get("model")
+    res = {"text": text, "stop": reply.stop, "usage": reply.usage, "refusal": reply.refusal,
+           "provider": getattr(provider, "name", req.get("provider")), "model": model,
+           "prompt_sha256": sha(system + "\n" + prompt), "output_sha256": sha(text)}
+    _audit("model.complete", provider=res["provider"], model=model, purpose=req.get("purpose"),
+           prompt_sha256=res["prompt_sha256"], output_sha256=res["output_sha256"],
+           stop=reply.stop, usage=reply.usage)
+    return res
+
+
 DAEMON_OPS = {
     "ping": lambda req: {"version": VERSION, "pid": os.getpid()},
+    "revert": _api_revert,
+    "audit": _api_audit,
+    "audit_head": lambda req: {"head": __import__("audit").head()},
+    "complete": _api_complete,
     "run": _api_run,
     "open": _api_open,
     "close": _api_close,
@@ -3491,6 +3738,16 @@ def main(argv=None):
     pch = sub.add_parser("check", help="dry-run the pre-commit policy gate on a pending session")
     pch.add_argument("session")
     pch.set_defaults(fn=cmd_check)
+
+    prv = sub.add_parser("revert", help="undo a COMMITTED session's file changes as a new "
+                                        "reviewable session (rollback discards a pending one)")
+    prv.add_argument("session")
+    prv.add_argument("--commit", action="store_true", help="commit the revert at once")
+    prv.add_argument("--force", action="store_true",
+                     help="skip paths whose before-content was not retained instead of refusing")
+    prv.add_argument("--stack", action="store_true",
+                     help="open over existing pending sessions on the target")
+    prv.set_defaults(fn=cmd_revert)
 
     pf = sub.add_parser("fork", help="copy the stack up to a savepoint into a new session")
     pf.add_argument("session")

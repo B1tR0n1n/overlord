@@ -138,6 +138,7 @@ overlord commit --only turn:2-4 <sess>       # replay only what turns 2–4 did
 overlord commit --merge <sess>   # three-way merge non-overlapping drift (needs --merge-base)
 overlord commit --force <sess>   # commit despite drift (explicit override)
 overlord rollback <session>      # discard — target byte-identical
+overlord revert <session>        # undo a COMMITTED session as a new reviewable session
 overlord blame <path>            # which session, turn, tool call, instruction put each line here
 overlord doctor                  # backend / dependency diagnostics
 ```

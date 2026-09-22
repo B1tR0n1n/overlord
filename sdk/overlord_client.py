@@ -53,18 +53,8 @@ class Session:
         "tool:NAME", "call:ID", comma-separated — undo a decision, keep the
         rest. countersigned=True (or policy "require_review") demands a fresh
         approval from review(); a fresh rejection refuses unless force."""
-        res = self._client._call("commit", sid=self.sid, merge=merge, force=force,
-                                 only=only, drop=drop, countersigned=countersigned)
-        if not res.get("committed"):
-            if res.get("rejected"):
-                r = res["rejected"]
-                raise OverlordError(f"commit refused — rejected by {r.get('reviewer')}: "
-                                    f"{r.get('reason')}")
-            raise OverlordError(
-                "commit refused — target drifted: "
-                + ", ".join(f"{r}:{p}" for r, p in res.get("conflicts", []))
-            )
-        return res
+        return self._client.commit(self.sid, merge=merge, force=force, only=only,
+                                   drop=drop, countersigned=countersigned)
 
     def review(self, provider="anthropic", model=None, max_turns=None, same_model=False,
                on_event=None):
@@ -82,6 +72,11 @@ class Session:
 
     def rollback(self):
         return self._client._call("rollback", sid=self.sid)["target"]
+
+    def revert(self, commit=False, force=False, stack=False):
+        """Once committed: stage this session's inverse as a new pending
+        session (see OverlordClient.revert)."""
+        return self._client.revert(self.sid, commit=commit, force=force, stack=stack)
 
     def savepoints(self):
         """One entry per layer: n, cause (tool call) or cmd, and its paths."""
@@ -134,25 +129,35 @@ class OverlordClient:
     def ping(self):
         return self._call("ping")
 
+    @staticmethod
+    def _grants(jail, net, timeout, merge_base, net_allow=None, limits=None):
+        g = {"jail": jail, "net": net, "timeout": timeout, "merge_base": merge_base}
+        if net_allow:
+            g["net_allow"] = list(net_allow)      # with net="proxy": hosts / *.suffix
+        if limits:
+            g["limits"] = dict(limits)            # cpu / mem / pids / disk ceilings
+        return g
+
     def run(self, target, cmd, jail=False, net="host", timeout=None,
-            merge_base=False, trace=None, wait=False, stack=False):
+            merge_base=False, trace=None, wait=False, stack=False,
+            net_allow=None, limits=None):
         """Execute cmd transactionally against target. Returns a Session."""
         res = self._call(
             "run", target=str(target), cmd=list(cmd),
-            grants={"jail": jail, "net": net, "timeout": timeout,
-                    "merge_base": merge_base},
+            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits),
             trace=trace, wait=wait, stack=stack,
         )
         return Session(self, res["sid"], res["exit_code"], res["changes"],
                        res["grants"], res.get("output_tail", ""))
 
     def open(self, target, jail=False, net="host", timeout=None, merge_base=False,
-             trace=None, wait=False, stack=False, agent=None):
-        """Open a live transaction: many commands, one commit. Returns LiveSession."""
+             trace=None, wait=False, stack=False, agent=None, net_allow=None, limits=None):
+        """Open a live transaction: many commands, one commit. Returns LiveSession.
+        The daemon applies policy: the effective grants are never looser than
+        the target's rule, and are returned on the LiveSession."""
         res = self._call(
             "open", target=str(target),
-            grants={"jail": jail, "net": net, "timeout": timeout,
-                    "merge_base": merge_base},
+            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits),
             trace=trace, wait=wait, stack=stack, agent=agent,
         )
         return LiveSession(self, res["sid"], res["grants"], res["backend"])
@@ -258,6 +263,55 @@ class OverlordClient:
     def transcript(self, sid):
         return self._call("transcript", sid=sid)["transcript"]
 
+    def commit(self, sid, merge=False, force=False, only=None, drop=None, countersigned=False):
+        """Commit a pending session by id (see Session.commit). Raises on
+        refusal, naming why: a reviewer's rejection, the policy gate's
+        findings, or external drift."""
+        res = self._call("commit", sid=sid, merge=merge, force=force,
+                         only=only, drop=drop, countersigned=countersigned)
+        if not res.get("committed"):
+            if res.get("rejected"):
+                r = res["rejected"]
+                raise OverlordError(f"commit refused — rejected by {r.get('reviewer')}: "
+                                    f"{r.get('reason')}")
+            if res.get("policy") and not res.get("conflicts"):
+                raise OverlordError(
+                    "commit refused — policy gate: "
+                    + "; ".join(f"[{f.get('action')}] {f.get('check')} {f.get('path') or '(diff)'}"
+                                f" — {f.get('detail')}" for f in res["policy"]))
+            raise OverlordError(
+                "commit refused — target drifted: "
+                + ", ".join(f"{r}:{p}" for r, p in res.get("conflicts", []))
+            )
+        return res
+
+    def revert(self, sid, commit=False, force=False, stack=False):
+        """Undo a COMMITTED session's file changes as a NEW reviewable session
+        over the same target. Returns {sid, reverted, changes, skipped, failed,
+        committed}. A path with no retained before-content refuses the revert
+        unless force=True, which skips it. rollback() is the pre-commit half."""
+        return self._call("revert", sid=sid, commit=commit, force=force, stack=stack)
+
+    def audit(self, action, **fields):
+        """Append one event to the engine's keyed, witnessed audit chain.
+        `action` must be namespaced ext.|receipt.|plan.|finding.|approval.;
+        the entry is marked via="daemon". Returns the entry ({seq, hash, ...})
+        — a receipt can cite its `hash` as its chain reference."""
+        return self._call("audit", action=action, fields=fields)["entry"]
+
+    def audit_head(self):
+        """{seq, hash, keyed}: the chain head right now."""
+        return self._call("audit_head")["head"]
+
+    def complete(self, prompt, system="", provider="anthropic", model=None, purpose=None,
+                 base_url=None, headers=None):
+        """One tool-less model call through the engine's providers and key
+        store — for a planner that only proposes. Returns {text, stop, usage,
+        provider, model, prompt_sha256, output_sha256, refusal}; the call is
+        audited as model.complete with those hashes."""
+        return self._call("complete", prompt=prompt, system=system, provider=provider,
+                          model=model, purpose=purpose, base_url=base_url, headers=headers)
+
     def sessions(self):
         return self._call("sessions")["sessions"]
 
@@ -269,8 +323,11 @@ class LiveSession:
     def __init__(self, client, sid, grants, backend):
         self._c, self.sid, self.grants, self.backend = client, sid, grants, backend
 
-    def exec(self, cmd, timeout=None, cwd=None, label=None, on_output=None):
+    def exec(self, cmd, timeout=None, cwd=None, label=None, on_output=None, cause=None):
         """Run cmd inside the transaction. Streams output chunks to on_output.
+        `cause` (any JSON object — e.g. {"plan_id", "step_id", "action_id"}) is
+        stamped on the layer this command writes into and surfaces as
+        `caused_by` on every affected path's provenance record.
         Returns (exit_code, output, changes_so_far)."""
         import base64
 
@@ -278,7 +335,7 @@ class LiveSession:
             if on_output and ev.get("event") == "out":
                 on_output(base64.b64decode(ev["data"]))
         res = self._c._call("exec", on_event=_ev, sid=self.sid, cmd=list(cmd),
-                            timeout=timeout, cwd=cwd, label=label)
+                            timeout=timeout, cwd=cwd, label=label, cause=cause)
         return res["exit_code"], res["output"], [tuple(c) for c in res["changes"]]
 
     def shell(self, script, **kw):

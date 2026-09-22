@@ -246,6 +246,9 @@ try:
         page.locator("#whoami").get_by_text("alice").wait_for(timeout=5000)
         if page.locator("#logout").evaluate("e => e.classList.contains('hide')"):
             fail("sign-out button hidden while signed in")
+        # the meter renders from an async fetch after sign-in: wait for it,
+        # rather than racing it under a loaded machine
+        page.locator("#meters .meter").nth(1).wait_for(timeout=15000)
         rows = page.locator("#meters .meter")
         if rows.count() < 2 or "today" not in page.locator("#meters").inner_text().lower() \
                 or "this month" not in page.locator("#meters").inner_text().lower():

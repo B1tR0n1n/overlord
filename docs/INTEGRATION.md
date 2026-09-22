@@ -190,6 +190,43 @@ for row in ov.compare(s.sid, b.sid):         # path, state (same/differ/only-a/o
     print(row)
 ```
 
+### Driving OVERLORD as an executor (a remediation loop, a console)
+
+An external orchestrator that plans elsewhere and only *executes* through
+OVERLORD gets four things: a step that names itself on provenance, a real
+undo for a committed change, a place to put its own receipts on the
+tamper-evident chain, and a model call that can only propose.
+
+```python
+ls = ov.open("/srv/app", jail=True, net="proxy",
+             net_allow=["registry.example.com"], limits={"pids": 64})
+rc, out, _ = ls.exec(["systemctl", "restart", "app"], timeout=30,
+                     cause={"plan_id": "plan-7", "step_id": "s1", "action_id": "restart_service"})
+s = ls.close()
+s.commit()                                   # every path's provenance is caused_by that step
+
+ov.audit("receipt.step", plan_id="plan-7", step_id="s1", status="ok", sid=s.sid)
+head = ov.audit_head()                       # {seq, hash, keyed}: cite hash as the receipt's chain ref
+
+r = ov.revert(s.sid)                         # verification failed: stage the inverse
+ov.commit(r["sid"])                         # ...review it like any change, then commit
+#   ov.revert(s.sid, commit=True)            # or land it at once; force=True skips unretained paths
+
+plan = ov.complete("Propose steps for finding F-12 from the catalog: ...",
+                   system="You only propose; output JSON.", purpose="planner")
+# plan["text"], plan["prompt_sha256"], plan["output_sha256"] — audited as model.complete
+```
+
+`revert` undoes a **committed** session (added files removed, modified and
+deleted files restored from retained before-content) as a **new pending
+session**, so it is reviewed and committed like anything else; `rollback`
+remains the pre-commit half. It restores content, not file modes, and refuses
+a path whose before-content was not retained unless `force=True`. `audit`
+accepts only namespaced actions (`ext.` `receipt.` `plan.` `finding.`
+`approval.`) and marks them `via: daemon`; the engine's own names are
+refused. `complete` runs one tool-less call through the engine's providers
+and key store — a planner that cannot touch the tree by construction.
+
 ## 3. Policy-brokered fleets (the operator holds the keys)
 
 `~/.overlord/policy.json` binds every session brokered by the daemon.

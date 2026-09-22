@@ -49,8 +49,13 @@ chmod 0755 /usr/local/bin/overlord
 echo "== apparmor profile (kernel backend enablement)"
 if [[ -d /etc/apparmor.d ]] && command -v apparmor_parser > /dev/null; then
     install -m 0644 "$HERE/packaging/apparmor/overlord" /etc/apparmor.d/overlord
-    apparmor_parser -r /etc/apparmor.d/overlord
-    echo "   profile loaded"
+    if apparmor_parser -r /etc/apparmor.d/overlord 2>/dev/null; then
+        echo "   profile loaded"
+    else
+        # WSL2 and other kernels without AppArmor: the parser fails, the file is
+        # in place for a kernel that has it, and `doctor` decides the backend
+        echo "   profile not loaded (this kernel has no AppArmor — normal on WSL2; overlord doctor decides the backend)"
+    fi
 else
     echo "   apparmor not present — skipping (fuse backend will be used)"
 fi

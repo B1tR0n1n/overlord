@@ -209,6 +209,14 @@ def in_jail():
     return bool(os.environ.get("OVERLORD_JAIL"))
 
 
+def internal_net(backend):
+    """The net grant for a session overlord drives itself (revert, bundle
+    replay). The kernel backend cuts the network; fuse cannot, and refuses
+    --net none — and what runs there is overlord's own copy step, not agent
+    code, so it runs with host networking rather than not at all."""
+    return "none" if backend == "kernel" else "host"
+
+
 def detect_backend():
     if _kernel_backend_available():
         return "kernel"
@@ -901,7 +909,15 @@ def _replaced_dir_conflicts(rel, manifest, target):
         if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
             found.append(("modified-externally", mrel))
     tdir = _safe_join(target, rel)
-    if os.path.isdir(tdir) and not os.path.islink(tdir):
+    if os.path.lexists(tdir) and (os.path.islink(tdir) or not os.path.isdir(tdir)):
+        # a file or symlink where the session put a directory. fuse-overlayfs
+        # marks every new dir opaque, so an ADDED dir whose path an external
+        # file took after the snapshot lands here too — replay would delete it
+        if rel not in manifest:
+            found.append(("created-externally", rel))
+        elif _fingerprint(tdir) != manifest[rel]:
+            found.append(("modified-externally", rel))
+    elif os.path.isdir(tdir):
         for root, _dirs, files in os.walk(tdir):
             for name in files:
                 drel = os.path.relpath(os.path.join(root, name), target)
@@ -2905,6 +2921,11 @@ def rollback_session(sid):
             if not _pid_alive(m["holder_pid"]):
                 break
             time.sleep(0.1)
+    # a holder that died hard (orphaned session) never ran its teardown: on
+    # fuse its overlay is still mounted at merged/ and rmtree hits EBUSY
+    merged = os.path.join(session_path(sid), "merged")
+    if os.path.ismount(merged) and not _fuse_unmount(merged):
+        subprocess.run(["fusermount3", "-uz", merged], capture_output=True)
     _force_rmtree(session_path(sid))
     _audit("session.rollback", sid=sid, owner=m.get("owner"), target=m["target"],
            was=m.get("status"), usage=m.get("usage"))
@@ -3011,9 +3032,11 @@ def revert_session(sid, backend=None, force=False, stack=False, commit=False, wa
                             + "\n".join(f"  {r}: {why}" for r, why in bad[:20]))
     if not ops:
         raise OverlordError(f"error: nothing to revert in {sid}")
-    # no jail: the command must read the objects store; no network, ever
-    grants = {"net": "none", "jail": False, "timeout": None, "merge_base": False}
-    live = open_session(m["target"], backend or m.get("backend"), grants, wait=wait,
+    # no jail: the command must read the objects store; no network where the
+    # backend can cut it
+    backend = backend or m.get("backend") or detect_backend()
+    grants = {"net": internal_net(backend), "jail": False, "timeout": None, "merge_base": False}
+    live = open_session(m["target"], backend, grants, wait=wait,
                         stack=stack, capture=True, owner=m.get("owner"))
     try:
         rc, out = live.exec(["python3", "-c", _REVERT_SCRIPT, json.dumps(ops), OBJECTS_DIR],

@@ -447,11 +447,16 @@ def _fuse_mount(target, sdir, n_layers):
 
 
 def _fuse_unmount(merged):
-    """True when merged is no longer mounted."""
-    if not os.path.ismount(merged):
-        return True
-    r = subprocess.run(["fusermount3", "-u", merged], capture_output=True)
-    return r.returncode == 0 and not os.path.ismount(merged)
+    """True when merged is no longer mounted. A session's processes may still
+    be exiting (a cgroup kill is not instantaneous): EBUSY is retried briefly."""
+    for _ in range(20):
+        if not os.path.ismount(merged):
+            return True
+        r = subprocess.run(["fusermount3", "-u", merged], capture_output=True)
+        if r.returncode == 0 and not os.path.ismount(merged):
+            return True
+        time.sleep(0.05)
+    return not os.path.ismount(merged)
 
 
 PREPARE = {"kernel": prepare_kernel, "fuse": prepare_fuse}
@@ -1196,11 +1201,32 @@ def _limits_hook(lim):
     # rlimits in the child, before exec: the process count, the size of any
     # one file, open files, and — when no cgroup surrounds the session — the
     # data segment as a coarse memory line. Inherited by everything below.
+    # RLIMIT_NPROC counts EVERY process of the real uid, not the session's:
+    # capped at the grant it made every fork fail on a desktop already running
+    # more than that (found at 1938 threads against 512). With a cgroup the
+    # cgroup's pids limit is the session bound; without one, allow the grant
+    # on top of what the user already runs.
     import resource
+    def _user_procs():
+        # threads count against RLIMIT_NPROC too
+        n, uid = 0, str(os.getuid())
+        for d in os.listdir("/proc"):
+            if not d.isdigit(): continue
+            try:
+                with open("/proc/" + d + "/status") as f:
+                    st = dict(l.split(":", 1) for l in f if ":" in l)
+                if st.get("Uid", "").split()[:1] == [uid]:
+                    n += int(st.get("Threads", "1").strip() or 1)
+            except (OSError, ValueError): pass
+        return n
     def hook():
         MB = 1 << 20
         for key, res in (("pids", resource.RLIMIT_NPROC), ("nofile", resource.RLIMIT_NOFILE)):
             v = int(lim.get(key) or 0)
+            if v > 0 and key == "pids":
+                if not lim.get("rlimit_memory"):
+                    continue                     # a cgroup holds the session's pids line
+                v += _user_procs()
             if v > 0:
                 try: resource.setrlimit(res, (v, v))
                 except (ValueError, OSError): pass
@@ -1403,6 +1429,7 @@ class LiveSession:
             os.killpg(self.proc.pid, 9)
         except OSError:
             pass
+        _cgroup_kill(self.meta.get("cgroup"))
 
     def _expire(self):
         self.expired = True
@@ -1841,6 +1868,45 @@ def _own_cgroup_dir():
     return None
 
 
+def _scope_of(pid):
+    """The cgroup v2 directory systemd-run --scope put pid in, or None. The
+    move happens right after launch, so it is polled for a moment."""
+    for _ in range(40):
+        try:
+            with open(f"/proc/{pid}/cgroup") as f:
+                path = next((l.split("::", 1)[1].strip() for l in f if l.startswith("0::")), "")
+        except OSError:
+            return None
+        if path.endswith(".scope"):
+            return "/sys/fs/cgroup" + path
+        time.sleep(0.025)
+    return None
+
+
+def _cgroup_kill(info):
+    """SIGKILL everything still in a session's cgroup. Killing the holder's
+    process group is not enough: a command runs in its own session, and on the
+    fuse backend there is no PID namespace to take it down with the holder, so
+    a timed-out `sleep 30` outlived its session and pinned the mount."""
+    info = info or {}
+    for d in list(info.get("paths") or []) + ([info["scope"]] if info.get("scope") else []):
+        try:
+            kill = os.path.join(d, "cgroup.kill")                # v2
+            if os.path.exists(kill):
+                with open(kill, "w") as f:
+                    f.write("1")
+                continue
+            with open(os.path.join(d, "cgroup.procs")) as f:     # v1
+                pids = [int(x) for x in f.read().split()]
+            for pid in pids:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            pass
+
+
 def _cgroup_release(info):
     for d in reversed((info or {}).get("paths") or []):
         for _ in range(20):
@@ -1875,6 +1941,10 @@ def limits_backend():
 
 SANDBOX_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "TERM", "USER", "LOGNAME",
                     "SHELL", "TZ", "COLUMNS", "LINES", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")
+
+
+# what `systemd-run --user` needs to find the user bus; never reaches a sandbox
+SYSTEMD_BUS_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
 def sandbox_env():
@@ -1957,13 +2027,21 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         import netproxy as _np
         proxy_parent, proxy_child = socket.socketpair()
         proxy_fd, proxy_port = proxy_child.fileno(), _np.PROXY_PORT
-    argv = (sd + _systemd_props(limits) + ["--"] if sd else []) + prefix + \
+    # systemd-run --user must reach the user bus, which it finds through
+    # XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS — both of which sandbox_env()
+    # drops. The probe (_systemd_user_ok) ran with the full environment and
+    # said yes, so on every desktop with a user manager each holder died at
+    # launch ("session holder did not start"). systemd-run gets the two bus
+    # variables; `env -u` takes them away again before the holder exists.
+    bus_env = {k: os.environ[k] for k in SYSTEMD_BUS_KEYS if os.environ.get(k)} if sd else {}
+    unset = [shutil.which("env") or "/usr/bin/env"] + [a for k in bus_env for a in ("-u", k)] if bus_env else []
+    argv = (sd + _systemd_props(limits) + ["--"] + unset if sd else []) + prefix + \
         [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno()), str(proxy_fd), str(proxy_port)]
     # red team A11: the environment is cut BEFORE the process exists. Unsetting
     # variables inside it is cosmetic — /proc/<pid>/environ reads the original
     # block, so a jailed `cat /proc/1/environ` would still show the keys.
     pass_fds = (child_sock.fileno(),) + ((proxy_child.fileno(),) if proxy_child else ())
-    popen_kw = {"pass_fds": pass_fds, "env": sandbox_env()}
+    popen_kw = {"pass_fds": pass_fds, "env": {**sandbox_env(), **bus_env}}
     if cg.get("paths"):
         popen_kw["preexec_fn"] = _cgroup_joiner(cg)
     if capture:
@@ -1982,6 +2060,8 @@ def _launch_holder(sid, meta, lock, capture, fresh):
             outfile.close()
     meta["holder_pid"] = proc.pid
     meta["limits"] = limits
+    if sd:
+        cg["scope"] = _scope_of(proc.pid)          # what _cgroup_kill empties on expiry
     meta["cgroup"] = cg
     save_meta(sid, meta)
     proxy = None

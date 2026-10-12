@@ -273,7 +273,8 @@ def import_bundle(path, target=None, key_file=None, require_signature=False):
     backend = core.detect_backend()
     if backend is None:
         raise BundleError("error: no sandbox backend available")
-    grants = {"net": "none", "jail": backend == "kernel", "timeout": None, "merge_base": False}
+    grants = {"net": core.internal_net(backend), "jail": backend == "kernel", "timeout": None,
+              "merge_base": False}
     live = core.open_session(target, backend, grants, capture=True,
                              agent=manifest.get("agent") or "import", owner=core_owner())
     new = live.sid

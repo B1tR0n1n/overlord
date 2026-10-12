@@ -265,9 +265,13 @@ pass "sid_of refuses a missing id"
 # --- 21. a whiteout that names its own tree root can never reach apply_upper
 # (kernel overlayfs never names whiteouts .wh.*, so there `.wh.` is a plain file)
 reset_target
-OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'touch .wh.')
+# fuse-overlayfs refuses to let a process create `.wh.` (EINVAL), so there the
+# whiteout is planted in the session's upper layer directly — the shape a
+# tampered or foreign upper would have, which is what apply_upper must survive
+OUT=$($OVERLORD run -t "$TARGET" -- bash -c 'touch .wh. 2>/dev/null || touch probe')
 SID=$(sid_of "$OUT")
 BACKEND=$(grep -o '"backend": "[a-z]*"' "$OVERLORD_HOME/sessions/$SID/meta.json" | cut -d'"' -f4)
+[[ "$BACKEND" == "kernel" ]] || : > "$OVERLORD_HOME/sessions/$SID/upper/.wh."
 if [[ "$BACKEND" == "kernel" ]]; then
     $OVERLORD diff "$SID" | grep -q 'added *\.wh\.$' || fail "kernel: .wh. not treated as a plain file"
     $OVERLORD diff "$SID" | grep -q 'invalid-whiteout' && fail "kernel: plain file misread as whiteout" || true

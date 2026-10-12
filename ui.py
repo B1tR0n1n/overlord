@@ -1134,7 +1134,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n) or b"{}")
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            # a malformed body is the client's error: 400, not a 500
+            raise core.OverlordError("error: request body is not valid JSON")
 
     def _views(self, sel):
         """Server-rendered fragments: register + status line."""

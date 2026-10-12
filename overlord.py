@@ -140,6 +140,23 @@ class OverlordError(Exception):
 def _now():
     return time.strftime(TS_FORMAT)
 
+
+def private_dir(path):
+    """Create path (and parents) owner-only. Session records — the syscall
+    trace, provenance, and meta.json with every command line — live under
+    these dirs, so on a shared host they must not be world-readable. chmod is
+    idempotent, so this also retrofits a dir an older version made 0755."""
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def ensure_private_dirs():
+    for d in (OVERLORD_HOME, SESSIONS_DIR):
+        private_dir(d)
+
 # ---------------------------------------------------------------- backends
 
 
@@ -151,6 +168,19 @@ def _kernel_backend_available():
     except OSError:                       # no unshare(1) on this host at all
         return False
     return probe.returncode == 0
+
+
+def _unroot_available():
+    """True when a nested user namespace can be made inside the session's own
+    (the un-root step in _ENTER_SRC). Only meaningful with the kernel backend."""
+    probe = ("import ctypes, sys; l = ctypes.CDLL(None, use_errno=True); "
+             "sys.exit(0 if l.unshare(0x10000000) == 0 else 1)")
+    try:
+        r = subprocess.run(["unshare", "--map-root-user", "--mount",
+                            sys.executable or "python3", "-c", probe], capture_output=True)
+    except OSError:
+        return False
+    return r.returncode == 0
 
 
 def _fuse_backend_reason():
@@ -177,6 +207,14 @@ def _fuse_backend_available():
 def in_jail():
     """True when this process runs inside an OVERLORD jail."""
     return bool(os.environ.get("OVERLORD_JAIL"))
+
+
+def internal_net(backend):
+    """The net grant for a session overlord drives itself (revert, bundle
+    replay). The kernel backend cuts the network; fuse cannot, and refuses
+    --net none — and what runs there is overlord's own copy step, not agent
+    code, so it runs with host networking rather than not at all."""
+    return "none" if backend == "kernel" else "host"
 
 
 def detect_backend():
@@ -249,6 +287,23 @@ def mount(src, tgt, fstype, flags, data=None):
     if libc.mount(src.encode(), tgt.encode(), fstype.encode() if fstype else None,
                   ctypes.c_ulong(flags), data.encode() if data else None) != 0:
         die("mount " + tgt)
+def unroot():
+    # The mounts are done as the namespace's mapped root; the command itself
+    # never needs uid 0, and agent CLIs refuse to run as root. A nested user
+    # namespace maps the invoking user's uid onto that mapped root, so the
+    # command runs as you. Called before the jail's capability drop and
+    # seccomp filter (which denies unshare). A kernel that refuses the nested
+    # namespace leaves the command as mapped root, as before; doctor says so.
+    uid, gid = spec.get("run_uid"), spec.get("run_gid")
+    if not uid or libc.unshare(0x10000000) != 0:          # CLONE_NEWUSER
+        return
+    try:
+        for name, body in (("setgroups", "deny"), ("uid_map", "%d 0 1" % uid),
+                           ("gid_map", "%d 0 1" % gid)):
+            with open("/proc/self/" + name, "w") as f:
+                f.write(body)
+    except OSError:
+        die("un-root: write id map")
 if libc.unshare(CLONE_NEWNS) != 0:
     die("unshare mount namespace")
 mount("none", "/", None, MS_REC | MS_PRIVATE)
@@ -316,6 +371,46 @@ if spec.get("jail"):
                 g.write(f.read())
     except OSError:
         pass
+    # --expose / --expose-rw: host paths an agent needs that the jail would
+    # otherwise erase (its runtime and credentials live in $HOME), bound at
+    # their real path. The mountpoint matches the source: a dir for a dir, an
+    # empty file for a file (an agent's config is often a single dotfile).
+    # Paths were validated at open: absolute, existing, and never overlapping
+    # the target or OVERLORD_HOME (session records and provider keys).
+    for src, ro in spec.get("expose") or ():
+        rel = src.lstrip("/")
+        if not os.path.lexists(rel):
+            if os.path.isdir(src):
+                os.makedirs(rel)
+            else:
+                os.makedirs(os.path.dirname(rel) or ".", exist_ok=True)
+                open(rel, "w").close()
+        mount(src, rel, None, MS_BIND | MS_REC)
+        if ro:
+            remount_ro([os.path.join(J, rel)])
+    # Recon hardening: /etc must stay bound (ld.so.cache, certs, nsswitch, the
+    # alternatives symlinks tools resolve through), but the host's identity in
+    # it need not leak. The UTS name and synthetic hostname, machine-id and a
+    # passwd/group naming only root and the run user are overmounted, so a
+    # jailed command cannot read the host name or enumerate host accounts. The
+    # source files are unlinked once bound; the mounts keep them alive.
+    run_uid, run_gid = spec.get("run_uid", 0), spec.get("run_gid", 0)
+    home = os.environ.get("HOME", "/") if spec.get("expose") else "/" + tgt_rel
+    libc.sethostname(b"sandbox", 7)
+    ident = {"hostname": "sandbox\n", "machine-id": "",
+             "passwd": "root:x:0:0:root:/root:/usr/sbin/nologin\n" + (
+                 "agent:x:%d:%d:agent:%s:/bin/sh\n" % (run_uid, run_gid, home) if run_uid else ""),
+             "group": "root:x:0:\n" + ("agent:x:%d:\n" % run_gid if run_gid else "")}
+    os.mkdir(".ovl-ident")
+    for name, body in ident.items():
+        if os.path.isfile("etc/" + name):
+            with open(".ovl-ident/" + name, "w") as f:
+                f.write(body)
+            if libc.mount((".ovl-ident/" + name).encode(), ("etc/" + name).encode(), None,
+                          ctypes.c_ulong(MS_BIND), None) == 0:
+                remount_ro([os.path.join(J, "etc", name)])
+            os.unlink(".ovl-ident/" + name)
+    os.rmdir(".ovl-ident")
     if spec.get("trace_bind"):
         os.mkdir(".overlord")
         mount(os.path.join(sdir, "trace"), ".overlord", None, MS_BIND)
@@ -330,10 +425,13 @@ if spec.get("jail"):
         subprocess.run(["pivot_root", ".", "oldroot"], check=True)
     os.chdir("/")
     libc.umount2(b"/oldroot", MNT_DETACH)
-    os.environ["HOME"] = "/" + tgt_rel
+    # with nothing exposed $HOME is the workspace; once host paths are exposed
+    # (an agent's ~/.config, say) the real $HOME is kept so the agent finds them
+    os.environ["HOME"] = home
     os.environ["TMPDIR"] = "/tmp"
     os.environ["OVERLORD_JAIL"] = "1"       # so a command can tell where it is
     os.chdir(os.path.join("/", tgt_rel, cwd))
+    unroot()
     # red team A14: inside the user namespace the command held every
     # capability (over the namespace's own resources) with no seccomp policy
     # and NoNewPrivs off — far more surface than a build needs. Mounts are
@@ -387,6 +485,7 @@ else:
     os.chdir(sdir)
     mount("overlay", target, "overlay", 0, spec["opts"])
     os.chdir(os.path.join(target, cwd))
+    unroot()
 try:
     os.execvp(cmd[0], cmd)
 except OSError as e:
@@ -447,11 +546,16 @@ def _fuse_mount(target, sdir, n_layers):
 
 
 def _fuse_unmount(merged):
-    """True when merged is no longer mounted."""
-    if not os.path.ismount(merged):
-        return True
-    r = subprocess.run(["fusermount3", "-u", merged], capture_output=True)
-    return r.returncode == 0 and not os.path.ismount(merged)
+    """True when merged is no longer mounted. A session's processes may still
+    be exiting (a cgroup kill is not instantaneous): EBUSY is retried briefly."""
+    for _ in range(20):
+        if not os.path.ismount(merged):
+            return True
+        r = subprocess.run(["fusermount3", "-u", merged], capture_output=True)
+        if r.returncode == 0 and not os.path.ismount(merged):
+            return True
+        time.sleep(0.05)
+    return not os.path.ismount(merged)
 
 
 PREPARE = {"kernel": prepare_kernel, "fuse": prepare_fuse}
@@ -467,7 +571,8 @@ def validate_session_id(sid):
     """Return sid if it has the minted shape; otherwise refuse. This is the one
     gate between externally supplied ids and the filesystem, so the message
     deliberately does not echo the rejected value."""
-    if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+    # fullmatch, not match: `$` also matches before a trailing newline
+    if not isinstance(sid, str) or not _SESSION_ID_RE.fullmatch(sid):
         raise OverlordError("error: invalid session id")
     return sid
 
@@ -518,10 +623,11 @@ def load_meta(sid):
 
 def save_meta(sid, meta):
     # atomic: a reader (the UI polling during a live run, a second session,
-    # the daemon) must never see a truncated meta.json mid-write
+    # the daemon) must never see a truncated meta.json mid-write. Owner-only:
+    # meta holds every command line the session ran, argv and all.
     path = session_file(sid, META_FILE)
     tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
-    with open(tmp, "w") as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         json.dump(meta, f, indent=2)
     os.replace(tmp, path)
 
@@ -531,7 +637,7 @@ def list_sessions():
         return []
     return sorted(
         d for d in os.listdir(SESSIONS_DIR)
-        if _SESSION_ID_RE.match(d)
+        if _SESSION_ID_RE.fullmatch(d)
         and os.path.isfile(os.path.join(SESSIONS_DIR, d, META_FILE))
     )
 
@@ -547,7 +653,7 @@ def pending_sessions_for(target):
 
 def acquire_target_lock(target, wait):
     """Arbitration: one executing session per target. Returns held lock fd."""
-    os.makedirs(LOCKS_DIR, exist_ok=True)
+    private_dir(LOCKS_DIR)
     name = hashlib.sha256(target.encode()).hexdigest()[:24] + ".lock"
     fd = open(os.path.join(LOCKS_DIR, name), "w")
     try:
@@ -803,7 +909,15 @@ def _replaced_dir_conflicts(rel, manifest, target):
         if not os.path.lexists(mpath) or _fingerprint(mpath) != fp:
             found.append(("modified-externally", mrel))
     tdir = _safe_join(target, rel)
-    if os.path.isdir(tdir) and not os.path.islink(tdir):
+    if os.path.lexists(tdir) and (os.path.islink(tdir) or not os.path.isdir(tdir)):
+        # a file or symlink where the session put a directory. fuse-overlayfs
+        # marks every new dir opaque, so an ADDED dir whose path an external
+        # file took after the snapshot lands here too — replay would delete it
+        if rel not in manifest:
+            found.append(("created-externally", rel))
+        elif _fingerprint(tdir) != manifest[rel]:
+            found.append(("modified-externally", rel))
+    elif os.path.isdir(tdir):
         for root, _dirs, files in os.walk(tdir):
             for name in files:
                 drel = os.path.relpath(os.path.join(root, name), target)
@@ -1076,7 +1190,7 @@ def apply_layers(uppers, target, backend=None):
 # rlimits in every command (both backends) and, where the host allows, a
 # cgroup around the whole session; the disk figure is measured per layer.
 DEFAULT_LIMITS = {"memory_mb": 4096, "pids": 512, "cpu_pct": 200, "disk_mb": 8192,
-                  "fsize_mb": 4096, "nofile": 4096}
+                  "fsize_mb": 4096, "nofile": 4096, "trace_mb": 2048}
 LIMIT_KEYS = tuple(DEFAULT_LIMITS)
 DISK_RC = 122            # a command's exit code when the session crossed its disk grant
 
@@ -1099,11 +1213,83 @@ def effective_limits(grants):
     return {k: int(v) for k, v in (grants.get("limits") or DEFAULT_LIMITS).items() if k in LIMIT_KEYS}
 
 
+def _overlaps(a, b):
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
+
+
+def resolve_expose(grants, backend, target):
+    """Validate the expose / expose_rw grants and return grants with each path
+    resolved. An exposed path must be absolute and exist, needs the kernel
+    backend and the jail (without a jail the whole filesystem is visible
+    already), and may not overlap the target (the overlay is mounted there) or
+    OVERLORD_HOME — exposing ~ would hand the jail every session record and the
+    provider key store (red team A3, A11)."""
+    if not (grants.get("expose") or grants.get("expose_rw")):
+        return grants
+    if backend != "kernel":
+        raise OverlordError("error: --expose requires the kernel backend "
+                            "(install packaging/apparmor profile)")
+    if not grants.get("jail"):
+        raise OverlordError("error: --expose requires --jail (without a jail the path is already visible)")
+    home = os.path.realpath(OVERLORD_HOME)
+    out = dict(grants)
+    for key in ("expose", "expose_rw"):
+        paths = []
+        for p in grants.get(key) or ():
+            if not isinstance(p, str) or not os.path.isabs(p):
+                raise OverlordError(f"error: --expose path must be absolute: {p}")
+            rp = os.path.realpath(p)
+            if not os.path.exists(rp):
+                raise OverlordError(f"error: --expose path does not exist: {p}")
+            if rp == "/" or _overlaps(rp, home) or _overlaps(rp, target):
+                raise OverlordError(f"error: --expose path overlaps the target or OVERLORD_HOME: {p}")
+            paths.append(rp)
+        out[key] = paths
+    return out
+
+
+def load_profile(name):
+    """A named preset from $OVERLORD_HOME/profiles.json: the host paths an
+    agent CLI needs exposed and the environment it runs with, e.g.
+    {"mycli": {"expose": ["~/.mycli"], "expose_rw": [], "env": {"K": "V"}}}.
+    Paths may start with ~; ones missing on this host are skipped, so one
+    profile serves hosts that lack an optional dir."""
+    path = os.path.join(OVERLORD_HOME, "profiles.json")
+    try:
+        with open(path) as f:
+            profiles = json.load(f)
+    except FileNotFoundError:
+        raise OverlordError(f"error: no profiles defined ({path})")
+    except ValueError as e:
+        raise OverlordError(f"error: {path} is not valid JSON: {e}")
+    prof = profiles.get(name) if isinstance(profiles, dict) else None
+    if not isinstance(prof, dict):
+        raise OverlordError(f"error: no such profile: {name}")
+    out = {"env": {str(k): str(v) for k, v in (prof.get("env") or {}).items()}}
+    for key in ("expose", "expose_rw"):
+        out[key] = [rp for rp in (os.path.expanduser(p) for p in prof.get(key) or ())
+                    if os.path.exists(rp)]
+    return out
+
+
+def apply_profile(name, grants, cmd):
+    """Fold a profile into grants (it implies --jail) and wrap cmd with its env.
+    Returns (grants, cmd)."""
+    prof = load_profile(name)
+    grants = dict(grants, jail=True)
+    for key in ("expose", "expose_rw"):
+        grants[key] = list(grants.get(key) or ()) + prof[key]
+    if prof["env"]:
+        cmd = ["env"] + [f"{k}={v}" for k, v in prof["env"].items()] + list(cmd)
+    return grants, list(cmd)
+
+
 def load_grants(args):
     """Capability manifest: --manifest file defaults, CLI flags override."""
     grants = {"net": "host", "jail": False, "timeout": None, "merge_base": False}
     optional = {"connectors": list, "connector_approval": str, "limits": dict,
-                "connector_shell": bool, "net_allow": list}
+                "connector_shell": bool, "net_allow": list,
+                "expose": list, "expose_rw": list}
     manifest_file = getattr(args, "manifest", None)
     if manifest_file:
         with open(manifest_file) as f:
@@ -1129,6 +1315,9 @@ def load_grants(args):
         grants["limits"] = parse_limits(args.limit, grants.get("limits"))
     if getattr(args, "connector_shell", False):
         grants["connector_shell"] = True
+    for key in ("expose", "expose_rw"):
+        if getattr(args, key, None):
+            grants[key] = list(grants.get(key) or ()) + list(getattr(args, key))
     return grants
 
 
@@ -1196,11 +1385,32 @@ def _limits_hook(lim):
     # rlimits in the child, before exec: the process count, the size of any
     # one file, open files, and — when no cgroup surrounds the session — the
     # data segment as a coarse memory line. Inherited by everything below.
+    # RLIMIT_NPROC counts EVERY process of the real uid, not the session's:
+    # capped at the grant it made every fork fail on a desktop already running
+    # more than that (found at 1938 threads against 512). With a cgroup the
+    # cgroup's pids limit is the session bound; without one, allow the grant
+    # on top of what the user already runs.
     import resource
+    def _user_procs():
+        # threads count against RLIMIT_NPROC too
+        n, uid = 0, str(os.getuid())
+        for d in os.listdir("/proc"):
+            if not d.isdigit(): continue
+            try:
+                with open("/proc/" + d + "/status") as f:
+                    st = dict(l.split(":", 1) for l in f if ":" in l)
+                if st.get("Uid", "").split()[:1] == [uid]:
+                    n += int(st.get("Threads", "1").strip() or 1)
+            except (OSError, ValueError): pass
+        return n
     def hook():
         MB = 1 << 20
         for key, res in (("pids", resource.RLIMIT_NPROC), ("nofile", resource.RLIMIT_NOFILE)):
             v = int(lim.get(key) or 0)
+            if v > 0 and key == "pids":
+                if not lim.get("rlimit_memory"):
+                    continue                     # a cgroup holds the session's pids line
+                v += _user_procs()
             if v > 0:
                 try: resource.setrlimit(res, (v, v))
                 except (ValueError, OSError): pass
@@ -1350,8 +1560,14 @@ class LiveSession:
                 self._fuse_layers = n
             return list(cmd), os.path.join(merged, cwd) if cwd else merged
         jail = bool(self.meta["grants"].get("jail"))
+        g = self.meta["grants"]
+        expose = [[p, True] for p in g.get("expose") or ()] + \
+                 [[p, False] for p in g.get("expose_rw") or ()]
         spec = {"sdir": self.sdir, "target": target, "cmd": list(cmd), "cwd": cwd,
                 "jail": jail, "opts": overlay_opts(target, n, kernel=True),
+                # the identity the command drops to (nested userns, see unroot)
+                "run_uid": os.getuid(), "run_gid": os.getgid(),
+                "expose": expose if jail else [],
                 "net": self.meta["grants"].get("net", "none"),
                 # the resolver file the jail is given names from; a test points
                 # it at a symlink chain of its own to prove the dangling case
@@ -1403,6 +1619,7 @@ class LiveSession:
             os.killpg(self.proc.pid, 9)
         except OSError:
             pass
+        _cgroup_kill(self.meta.get("cgroup"))
 
     def _expire(self):
         self.expired = True
@@ -1459,6 +1676,25 @@ class LiveSession:
             timer = threading.Timer(timeout, _kill_exec)
             timer.daemon = True
             timer.start()
+        # The syscall trace is overlord's own output, outside the layer the
+        # disk grant measures and outside anything the jail bounds: a runaway
+        # command must not fill the disk through it. Past trace_mb the command
+        # is killed and the record marked truncated.
+        trace_cap = (int(lim.get("trace_mb") or 0) << 20) if self._trace_inside else 0
+        trace_stop, trace_capped = threading.Event(), [False]
+        if trace_cap:
+            tpath = os.path.join(self.sdir, "trace", f"raw.{rid}.strace")
+
+            def _watch_trace():
+                while not trace_stop.wait(2):
+                    try:
+                        if os.path.getsize(tpath) > trace_cap:
+                            trace_capped[0] = True
+                            self._send({"op": "kill", "id": rid})
+                            return
+                    except OSError:
+                        pass
+            threading.Thread(target=_watch_trace, daemon=True).start()
         out = bytearray()
         outlog = open(os.path.join(self.sdir, "output.log"), "ab") if capture else None
         try:
@@ -1481,6 +1717,7 @@ class LiveSession:
         finally:
             if timer:
                 timer.cancel()
+            trace_stop.set()
             if outlog:
                 outlog.close()
             with self._qlock:
@@ -1490,6 +1727,9 @@ class LiveSession:
         if timed_out[0] or (self.expired and rc in (137, TIMEOUT_RC)):
             rc = TIMEOUT_RC
             rec["timed_out"] = True
+        if trace_capped[0]:
+            rec["trace_truncated"] = True
+            self.meta["trace_truncated"] = True
         # the disk grant: this layer's upper is measured after the command; the
         # session's total is the sum over layers, and a crossing ends the session's
         # ability to run anything else — what was written stays for review
@@ -1639,6 +1879,7 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
             "  kernel: userns capability grants restricted (install packaging/)\n"
             "  fuse:   install fuse-overlayfs (sudo apt install fuse-overlayfs)"
         )
+    grants = resolve_expose(grants, backend, target)
     pending = pending_sessions_for(target)
     if pending and not stack:
         raise OverlordError(
@@ -1649,6 +1890,7 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
 
     sid = new_session_id()
     sdir = session_path(sid)
+    private_dir(sdir)  # owner-only; trace, provenance and layers inherit the barrier
     for d in ("upper", "work", "merged", "tmp"):
         os.makedirs(os.path.join(sdir, d))
     os.chmod(os.path.join(sdir, "tmp"), 0o1777)
@@ -1841,6 +2083,49 @@ def _own_cgroup_dir():
     return None
 
 
+def _scope_of(pid):
+    """The cgroup v2 directory systemd-run --scope put pid in, or None. The
+    move happens right after launch, so it is polled for a moment. Until then
+    the child still sits in OUR cgroup — under a desktop terminal that is the
+    tab's own .scope, and handing that to _cgroup_kill takes down the terminal
+    and everything in it. Only a scope other than ours counts."""
+    own = _own_cgroup_dir()
+    for _ in range(40):
+        try:
+            with open(f"/proc/{pid}/cgroup") as f:
+                path = next((l.split("::", 1)[1].strip() for l in f if l.startswith("0::")), "")
+        except OSError:
+            return None
+        if path.endswith(".scope") and "/sys/fs/cgroup" + path != own:
+            return "/sys/fs/cgroup" + path
+        time.sleep(0.025)
+    return None
+
+
+def _cgroup_kill(info):
+    """SIGKILL everything still in a session's cgroup. Killing the holder's
+    process group is not enough: a command runs in its own session, and on the
+    fuse backend there is no PID namespace to take it down with the holder, so
+    a timed-out `sleep 30` outlived its session and pinned the mount."""
+    info = info or {}
+    for d in list(info.get("paths") or []) + ([info["scope"]] if info.get("scope") else []):
+        try:
+            kill = os.path.join(d, "cgroup.kill")                # v2
+            if os.path.exists(kill):
+                with open(kill, "w") as f:
+                    f.write("1")
+                continue
+            with open(os.path.join(d, "cgroup.procs")) as f:     # v1
+                pids = [int(x) for x in f.read().split()]
+            for pid in pids:
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            pass
+
+
 def _cgroup_release(info):
     for d in reversed((info or {}).get("paths") or []):
         for _ in range(20):
@@ -1875,6 +2160,10 @@ def limits_backend():
 
 SANDBOX_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "TERM", "USER", "LOGNAME",
                     "SHELL", "TZ", "COLUMNS", "LINES", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")
+
+
+# what `systemd-run --user` needs to find the user bus; never reaches a sandbox
+SYSTEMD_BUS_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
 def sandbox_env():
@@ -1957,13 +2246,21 @@ def _launch_holder(sid, meta, lock, capture, fresh):
         import netproxy as _np
         proxy_parent, proxy_child = socket.socketpair()
         proxy_fd, proxy_port = proxy_child.fileno(), _np.PROXY_PORT
-    argv = (sd + _systemd_props(limits) + ["--"] if sd else []) + prefix + \
+    # systemd-run --user must reach the user bus, which it finds through
+    # XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS — both of which sandbox_env()
+    # drops. The probe (_systemd_user_ok) ran with the full environment and
+    # said yes, so on every desktop with a user manager each holder died at
+    # launch ("session holder did not start"). systemd-run gets the two bus
+    # variables; `env -u` takes them away again before the holder exists.
+    bus_env = {k: os.environ[k] for k in SYSTEMD_BUS_KEYS if os.environ.get(k)} if sd else {}
+    unset = [shutil.which("env") or "/usr/bin/env"] + [a for k in bus_env for a in ("-u", k)] if bus_env else []
+    argv = (sd + _systemd_props(limits) + ["--"] + unset if sd else []) + prefix + \
         [py, "-c", _EXECUTOR_SRC, str(child_sock.fileno()), str(proxy_fd), str(proxy_port)]
     # red team A11: the environment is cut BEFORE the process exists. Unsetting
     # variables inside it is cosmetic — /proc/<pid>/environ reads the original
     # block, so a jailed `cat /proc/1/environ` would still show the keys.
     pass_fds = (child_sock.fileno(),) + ((proxy_child.fileno(),) if proxy_child else ())
-    popen_kw = {"pass_fds": pass_fds, "env": sandbox_env()}
+    popen_kw = {"pass_fds": pass_fds, "env": {**sandbox_env(), **bus_env}}
     if cg.get("paths"):
         popen_kw["preexec_fn"] = _cgroup_joiner(cg)
     if capture:
@@ -1982,6 +2279,8 @@ def _launch_holder(sid, meta, lock, capture, fresh):
             outfile.close()
     meta["holder_pid"] = proc.pid
     meta["limits"] = limits
+    if sd:
+        cg["scope"] = _scope_of(proc.pid)          # what _cgroup_kill empties on expiry
     meta["cgroup"] = cg
     save_meta(sid, meta)
     proxy = None
@@ -2305,9 +2604,11 @@ def _print_session_footer(sid, rc, backend, changes):
 
 
 def cmd_run(args):
-    grants = load_grants(args)
+    grants, cmd = load_grants(args), args.cmd
+    if getattr(args, "profile", None):
+        grants, cmd = apply_profile(args.profile, grants, cmd)
     sid, rc, changes = execute_session(
-        args.target, args.cmd, args.backend, grants,
+        args.target, cmd, args.backend, grants,
         trace=args.trace, wait=args.wait, stack=args.stack,
     )
     _print_session_footer(sid, rc, load_meta(sid)["backend"], changes)
@@ -2315,12 +2616,13 @@ def cmd_run(args):
 
 
 def cmd_shell(args):
-    grants = load_grants(args)
-    shell = os.environ.get("SHELL", "/bin/bash")
+    grants, cmd = load_grants(args), [os.environ.get("SHELL", "/bin/bash")]
+    if getattr(args, "profile", None):
+        grants, cmd = apply_profile(args.profile, grants, cmd)
     print(f"overlord: transactional shell over {args.target} — exit to close",
           file=sys.stderr)
     sid, rc, changes = execute_session(
-        args.target, [shell], args.backend, grants,
+        args.target, cmd, args.backend, grants,
         wait=args.wait, stack=args.stack,
     )
     _print_session_footer(sid, rc, load_meta(sid)["backend"], changes)
@@ -2619,6 +2921,11 @@ def rollback_session(sid):
             if not _pid_alive(m["holder_pid"]):
                 break
             time.sleep(0.1)
+    # a holder that died hard (orphaned session) never ran its teardown: on
+    # fuse its overlay is still mounted at merged/ and rmtree hits EBUSY
+    merged = os.path.join(session_path(sid), "merged")
+    if os.path.ismount(merged) and not _fuse_unmount(merged):
+        subprocess.run(["fusermount3", "-uz", merged], capture_output=True)
     _force_rmtree(session_path(sid))
     _audit("session.rollback", sid=sid, owner=m.get("owner"), target=m["target"],
            was=m.get("status"), usage=m.get("usage"))
@@ -2725,9 +3032,11 @@ def revert_session(sid, backend=None, force=False, stack=False, commit=False, wa
                             + "\n".join(f"  {r}: {why}" for r, why in bad[:20]))
     if not ops:
         raise OverlordError(f"error: nothing to revert in {sid}")
-    # no jail: the command must read the objects store; no network, ever
-    grants = {"net": "none", "jail": False, "timeout": None, "merge_base": False}
-    live = open_session(m["target"], backend or m.get("backend"), grants, wait=wait,
+    # no jail: the command must read the objects store; no network where the
+    # backend can cut it
+    backend = backend or m.get("backend") or detect_backend()
+    grants = {"net": internal_net(backend), "jail": False, "timeout": None, "merge_base": False}
+    live = open_session(m["target"], backend, grants, wait=wait,
                         stack=stack, capture=True, owner=m.get("owner"))
     try:
         rc, out = live.exec(["python3", "-c", _REVERT_SCRIPT, json.dumps(ops), OBJECTS_DIR],
@@ -3111,6 +3420,7 @@ def cmd_doctor(args):
               "`overlord doctor` and red-team suite are the view that counts.\n")
     k = _kernel_backend_available()
     fu = _fuse_backend_available()
+    ur = _unroot_available() if k else False
     checks = [
         ("python", sys.version.split()[0], True),
         ("kernel backend (userns overlay; jail + net grants)",
@@ -3119,6 +3429,9 @@ def cmd_doctor(args):
          "available" if fu else _fuse_backend_reason(), fu),
         ("recorded egress (--net proxy: empty netns + in-process proxy)",
          "available" if k else "needs the kernel backend", k),
+        ("un-root (kernel: commands run as you via a nested userns, not mapped root)",
+         "available" if ur else ("refused by this kernel: commands run as mapped root"
+                                 if k else "needs the kernel backend"), ur or not k),
         ("syscall trace (--trace, strace)",
          "available" if shutil.which("strace") else "missing",
          bool(shutil.which("strace"))),
@@ -3231,6 +3544,18 @@ def resolve_policy(target, requested):
         eff["limits"] = lim
     if not rule.get("connector_shell", False):
         eff.pop("connector_shell", None)
+    # host paths into a jail are a policy decision: a requester keeps only the
+    # exposes under a path the rule lists in "expose" (read-write ones under
+    # "expose_rw"); with no list, none. Otherwise --expose would be a way out
+    # of a jail the policy forces on.
+    for key in ("expose", "expose_rw"):
+        allowed = [os.path.realpath(os.path.expanduser(a)) for a in rule.get(key) or ()]
+        eff[key] = [p for p in eff.get(key) or ()
+                    if isinstance(p, str) and any(
+                        os.path.realpath(p) == a or os.path.realpath(p).startswith(a.rstrip(os.sep) + os.sep)
+                        for a in allowed)]
+        if not eff[key]:
+            eff.pop(key)
     return eff, rule
 
 
@@ -3647,6 +3972,12 @@ def _add_exec_flags(parser):
                         help=f"a resource grant: {', '.join(LIMIT_KEYS)} (0 = unlimited)")
     parser.add_argument("--connector-shell", action="store_true",
                         help="offer connector tools that look like a shell (withheld by default)")
+    parser.add_argument("--expose", action="append", metavar="PATH",
+                        help="bind a host path into the jail read-only (repeatable; "
+                             "needs --jail; e.g. an agent's runtime or credentials)")
+    parser.add_argument("--expose-rw", action="append", metavar="PATH",
+                        help="like --expose, read-write: the jailed command can change "
+                             "it on the real filesystem")
     parser.add_argument("--timeout", type=float, metavar="SECS",
                         help="hard wall-clock limit; kills the process group")
     parser.add_argument("--merge-base", action="store_true",
@@ -3661,8 +3992,11 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="overlord", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
 
+    profile_help = ("a preset from $OVERLORD_HOME/profiles.json: the paths an agent "
+                    "CLI needs exposed and its env (implies --jail)")
     pr = sub.add_parser("run", help="run a command transactionally against a target dir")
     _add_exec_flags(pr)
+    pr.add_argument("--profile", metavar="NAME", help=profile_help)
     pr.add_argument("--trace", nargs="?", const="strace", choices=["strace", "ebpf"],
                     help="record syscall provenance")
     pr.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- CMD")
@@ -3670,6 +4004,7 @@ def main(argv=None):
 
     ps = sub.add_parser("shell", help="interactive transactional shell over a target dir")
     _add_exec_flags(ps)
+    ps.add_argument("--profile", metavar="NAME", help=profile_help)
     ps.set_defaults(fn=cmd_shell)
 
     sub.add_parser("sessions", help="list sessions").set_defaults(fn=cmd_sessions)
@@ -3804,7 +4139,7 @@ def main(argv=None):
             args.cmd = args.cmd[1:]
         if not args.cmd:
             p.error("run requires a command after --")
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    ensure_private_dirs()
     try:
         return args.fn(args)
     except OverlordError as e:

@@ -130,34 +130,42 @@ class OverlordClient:
         return self._call("ping")
 
     @staticmethod
-    def _grants(jail, net, timeout, merge_base, net_allow=None, limits=None):
+    def _grants(jail, net, timeout, merge_base, net_allow=None, limits=None,
+                expose=None, expose_rw=None):
         g = {"jail": jail, "net": net, "timeout": timeout, "merge_base": merge_base}
         if net_allow:
             g["net_allow"] = list(net_allow)      # with net="proxy": hosts / *.suffix
         if limits:
             g["limits"] = dict(limits)            # cpu / mem / pids / disk ceilings
+        if expose:
+            g["expose"] = list(expose)            # host paths, read-only, into the jail
+        if expose_rw:
+            g["expose_rw"] = list(expose_rw)      # under a policy, only what the rule lists
         return g
 
     def run(self, target, cmd, jail=False, net="host", timeout=None,
             merge_base=False, trace=None, wait=False, stack=False,
-            net_allow=None, limits=None):
+            net_allow=None, limits=None, expose=None, expose_rw=None):
         """Execute cmd transactionally against target. Returns a Session."""
         res = self._call(
             "run", target=str(target), cmd=list(cmd),
-            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits),
+            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits,
+                                expose, expose_rw),
             trace=trace, wait=wait, stack=stack,
         )
         return Session(self, res["sid"], res["exit_code"], res["changes"],
                        res["grants"], res.get("output_tail", ""))
 
     def open(self, target, jail=False, net="host", timeout=None, merge_base=False,
-             trace=None, wait=False, stack=False, agent=None, net_allow=None, limits=None):
+             trace=None, wait=False, stack=False, agent=None, net_allow=None, limits=None,
+             expose=None, expose_rw=None):
         """Open a live transaction: many commands, one commit. Returns LiveSession.
         The daemon applies policy: the effective grants are never looser than
         the target's rule, and are returned on the LiveSession."""
         res = self._call(
             "open", target=str(target),
-            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits),
+            grants=self._grants(jail, net, timeout, merge_base, net_allow, limits,
+                                expose, expose_rw),
             trace=trace, wait=wait, stack=stack, agent=agent,
         )
         return LiveSession(self, res["sid"], res["grants"], res["backend"])

@@ -140,6 +140,23 @@ class OverlordError(Exception):
 def _now():
     return time.strftime(TS_FORMAT)
 
+
+def private_dir(path):
+    """Create path (and parents) owner-only. Session records — the syscall
+    trace, provenance, and meta.json with every command line — live under
+    these dirs, so on a shared host they must not be world-readable. chmod is
+    idempotent, so this also retrofits a dir an older version made 0755."""
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def ensure_private_dirs():
+    for d in (OVERLORD_HOME, SESSIONS_DIR):
+        private_dir(d)
+
 # ---------------------------------------------------------------- backends
 
 
@@ -472,7 +489,8 @@ def validate_session_id(sid):
     """Return sid if it has the minted shape; otherwise refuse. This is the one
     gate between externally supplied ids and the filesystem, so the message
     deliberately does not echo the rejected value."""
-    if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+    # fullmatch, not match: `$` also matches before a trailing newline
+    if not isinstance(sid, str) or not _SESSION_ID_RE.fullmatch(sid):
         raise OverlordError("error: invalid session id")
     return sid
 
@@ -523,10 +541,11 @@ def load_meta(sid):
 
 def save_meta(sid, meta):
     # atomic: a reader (the UI polling during a live run, a second session,
-    # the daemon) must never see a truncated meta.json mid-write
+    # the daemon) must never see a truncated meta.json mid-write. Owner-only:
+    # meta holds every command line the session ran, argv and all.
     path = session_file(sid, META_FILE)
     tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
-    with open(tmp, "w") as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         json.dump(meta, f, indent=2)
     os.replace(tmp, path)
 
@@ -536,7 +555,7 @@ def list_sessions():
         return []
     return sorted(
         d for d in os.listdir(SESSIONS_DIR)
-        if _SESSION_ID_RE.match(d)
+        if _SESSION_ID_RE.fullmatch(d)
         and os.path.isfile(os.path.join(SESSIONS_DIR, d, META_FILE))
     )
 
@@ -552,7 +571,7 @@ def pending_sessions_for(target):
 
 def acquire_target_lock(target, wait):
     """Arbitration: one executing session per target. Returns held lock fd."""
-    os.makedirs(LOCKS_DIR, exist_ok=True)
+    private_dir(LOCKS_DIR)
     name = hashlib.sha256(target.encode()).hexdigest()[:24] + ".lock"
     fd = open(os.path.join(LOCKS_DIR, name), "w")
     try:
@@ -1676,6 +1695,7 @@ def open_session(target, backend, grants, trace=None, wait=False, stack=False,
 
     sid = new_session_id()
     sdir = session_path(sid)
+    private_dir(sdir)  # owner-only; trace, provenance and layers inherit the barrier
     for d in ("upper", "work", "merged", "tmp"):
         os.makedirs(os.path.join(sdir, d))
     os.chmod(os.path.join(sdir, "tmp"), 0o1777)
@@ -3884,7 +3904,7 @@ def main(argv=None):
             args.cmd = args.cmd[1:]
         if not args.cmd:
             p.error("run requires a command after --")
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    ensure_private_dirs()
     try:
         return args.fn(args)
     except OverlordError as e:

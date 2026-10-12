@@ -13,6 +13,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
+# a private home, set before import: the profile check writes profiles.json
+# there and must never touch the operator's ~/.overlord
+os.environ["OVERLORD_HOME"] = tempfile.mkdtemp()
 
 import overlord as core  # noqa: E402
 

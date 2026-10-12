@@ -77,5 +77,43 @@ if verdict != "FG":
          f"— job control handoff did not happen")
 print("  ok: interactive run hands terminal foreground to the wrapped command")
 
+# Ctrl-C on the terminal must interrupt the command, not overlord: overlord
+# survives to close the session and print its footer
+import select
+import time
+cmd = [sys.executable, os.path.join(HERE, "overlord.py"), "run", "-t", TARGET,
+       "--", sys.executable, "-c",
+       "import sys,time; print('READY', flush=True); time.sleep(30)"]
+pid, mfd = os.forkpty()
+if pid == 0:
+    os.execvpe(cmd[0], cmd, os.environ)
+out, sent, deadline = b"", False, time.time() + 25
+while time.time() < deadline:
+    if select.select([mfd], [], [], 0.2)[0]:
+        try:
+            chunk = os.read(mfd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    if not sent and b"READY" in out:
+        os.write(mfd, b"\x03")              # what the terminal sends for Ctrl-C
+        sent = True
+    if os.waitpid(pid, os.WNOHANG)[0]:
+        break
+else:
+    os.kill(pid, 9)
+    fail(f"Ctrl-C did not end the command within 25s:\n{out.decode(errors='replace')}")
+text = out.decode(errors="replace")
+if not sent:
+    fail(f"command never started:\n{text}")
+m = re.search(r"session (\S+)\s+exit=(-?\d+)", text)
+if not m:
+    fail(f"overlord died on Ctrl-C instead of the command (no session footer):\n{text}")
+subprocess.run([sys.executable, os.path.join(HERE, "overlord.py"), "rollback", m.group(1)],
+               capture_output=True)
+print(f"  ok: Ctrl-C interrupts the command (exit={m.group(2)}); overlord closes the session")
+
 print("PASS: job control")
 subprocess.run(["rm", "-rf", OVERLORD_HOME, TARGET])

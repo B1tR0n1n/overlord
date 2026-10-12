@@ -2329,7 +2329,15 @@ def _launch_holder(sid, meta, lock, capture, fresh):
     # group, so killpg still takes it whole): a terminal can only hand its
     # foreground to a group in its own session. Anything else detaches.
     tty = _interactive_tty(capture)
-    popen_kw.update({"process_group": 0} if tty else {"start_new_session": True})
+    if tty:
+        joiner = popen_kw.get("preexec_fn")
+        def _own_group():                  # Popen(process_group=) is 3.11+
+            os.setpgid(0, 0)
+            if joiner:
+                joiner()
+        popen_kw["preexec_fn"] = _own_group
+    else:
+        popen_kw["start_new_session"] = True
     try:
         proc = subprocess.Popen(argv, **popen_kw)
     except OSError:

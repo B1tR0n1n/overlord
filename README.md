@@ -83,7 +83,7 @@ overlord run --manifest cap.json -t /srv/app -- <cmd>               # grants fro
 overlord run --trace -t /srv/app -- <cmd>            # + syscall flight recorder (strace)
 overlord run --trace ebpf -t /srv/app -- <cmd>       # kernel-side recorder (root-only)
 overlord run --merge-base -t /srv/app -- <cmd>       # keep base copy for commit --merge
-overlord shell -t /srv/app                           # interactive transactional shell
+overlord shell -t /srv/app                           # interactive transactional shell (full job control)
 
 overlord agent -t /srv/app "add a Makefile with a test target"   # jailed by default
 overlord agent --net none -t /srv/app "<task>"       # ...and offline too
@@ -722,6 +722,10 @@ Finding A3 (session records reachable via the strace bind) was found by this
 suite and fixed — records are never exposed; strace gets an isolated trace/
 bind only when in use. Every future breach becomes a fix + regression test.
 
+A live-agent breakout test — an LLM agent turned loose in the jail with orders
+to escape, free to improvise beyond the scripted battery — is written up in
+[docs/breakout-red-team.md](docs/breakout-red-team.md).
+
 The agent can run the audit itself: `overlord agent --audit` (or `/audit` in
 the workspace chat) presets an *authorized containment audit* as the task.
 A well-aligned model rightly declines "break out of your sandbox"; the same
@@ -815,6 +819,8 @@ bash test/all.sh                  # every suite, one line each; logs kept; exit 
 ```bash
 bash test/smoke.sh                # 26 core transactional + replay-safety assertions
 bash test/redteam.sh              # 10 jail escape attempts (kernel backend)
+python3 test/unit_test.py         # 9 engine unit checks: session ids, containment, per-backend whiteouts, malformed markers, profiles, --expose (no backend)
+python3 test/jobcontrol_test.py   # interactive terminal handoff: the wrapped command owns the foreground (pty, no backend)
 python3 test/daemon_sdk_test.py   # 17 daemon + SDK + policy + live-session assertions
 python3 test/agent_test.py        # 10 agent loop, tool, provenance, and jail-default assertions
 python3 test/savepoint_test.py    # 10 savepoint / rewind / resume / commit-by-cause / blame assertions

@@ -2069,14 +2069,18 @@ def _own_cgroup_dir():
 
 def _scope_of(pid):
     """The cgroup v2 directory systemd-run --scope put pid in, or None. The
-    move happens right after launch, so it is polled for a moment."""
+    move happens right after launch, so it is polled for a moment. Until then
+    the child still sits in OUR cgroup — under a desktop terminal that is the
+    tab's own .scope, and handing that to _cgroup_kill takes down the terminal
+    and everything in it. Only a scope other than ours counts."""
+    own = _own_cgroup_dir()
     for _ in range(40):
         try:
             with open(f"/proc/{pid}/cgroup") as f:
                 path = next((l.split("::", 1)[1].strip() for l in f if l.startswith("0::")), "")
         except OSError:
             return None
-        if path.endswith(".scope"):
+        if path.endswith(".scope") and "/sys/fs/cgroup" + path != own:
             return "/sys/fs/cgroup" + path
         time.sleep(0.025)
     return None

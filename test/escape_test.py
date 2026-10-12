@@ -173,8 +173,9 @@ try:
     import threading
     import ui
     from http.server import ThreadingHTTPServer
-    PORT = 7780
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), ui.Handler)
+    # an OS-assigned port: a fixed one collides with whatever else the host runs
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ui.Handler)
+    PORT = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         probe = ("import urllib.request\n"

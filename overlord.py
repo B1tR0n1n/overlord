@@ -88,6 +88,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -763,7 +764,8 @@ def _layer_entries(upper, target, backend=None):
                 try:
                     yield ("deleted", _victim_rel(fpath, upper), False)
                 except OverlordError:
-                    # names its own tree root; recorded so diff/log show it,
+                    # names a directory (at the top, the tree root), not an
+                    # entry; recorded so diff/log show it,
                     # refused by commit_session before anything is replayed
                     yield ("invalid-whiteout", rel, False)
             elif os.path.lexists(_safe_join(target, rel)):
@@ -779,8 +781,14 @@ def compute_diff(upper, target, backend=None):
 
 
 def _victim_rel(whiteout_path, upper):
-    """Relative path a whiteout entry deletes, proven to stay inside the tree
-    (a file literally named '.wh...' would otherwise name the parent dir)."""
+    """Relative path a whiteout entry deletes, proven to name one entry inside
+    the tree. A marker whose victim name is empty or a dot ('.wh.', '.wh..',
+    '.wh...') names its own directory or that directory's parent, not an
+    entry: at the top that is the tree root, and one level down `sub/.wh.`
+    would replay as deleting all of sub/. Refused wherever it sits."""
+    name = os.path.basename(whiteout_path)
+    if name.startswith(WHITEOUT_PREFIX) and name[len(WHITEOUT_PREFIX):] in ("", os.curdir, os.pardir):
+        raise OverlordError(f"error: whiteout names a directory, not an entry: {whiteout_path}")
     victim = os.path.relpath(whiteout_victim(whiteout_path), upper)
     if victim in ("", os.curdir) or victim.startswith(os.pardir + os.sep):
         # a file literally named '.wh.' / '.wh..' resolves to the parent dir;
@@ -1424,17 +1432,40 @@ def _limits_hook(lim):
             except (ValueError, OSError): pass
     return hook
 def run(req):
+    # a run that dies unreported leaves its caller waiting on "exit" forever
+    try:
+        _run(req)
+    except Exception as e:
+        try: send({"id": req.get("id"), "exit": 127, "error": "executor: %r" % (e,)})
+        except OSError: pass
+def _run(req):
     rid, cmd = req["id"], req["cmd"]
     cwd = req.get("cwd") or None
     kw = {}
     if req.get("capture", True):
         kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if req.get("limits"):
-        kw["preexec_fn"] = _limits_hook(req["limits"])
+    hook = _limits_hook(req["limits"]) if req.get("limits") else None
+    tty = bool(req.get("tty"))
+    if tty:
+        # job control: its own process group (killpg still takes the tree)
+        # in the terminal's session, so it can be handed the foreground
+        def pre():
+            os.setpgid(0, 0)
+            if hook: hook()
+        kw["preexec_fn"] = pre
+    elif hook:
+        kw["preexec_fn"] = hook
     try:
-        p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True, **kw)
+        p = subprocess.Popen(cmd, cwd=cwd, start_new_session=not tty, **kw)
     except OSError as e:
         send({"id": rid, "exit": 127, "error": str(e)}); return
+    if tty:
+        # SIGTTOU blocked (per thread; signal.signal is main-thread only) so a
+        # background group may set the foreground
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+        try: os.tcsetpgrp(0, p.pid)
+        except OSError: pass
+        finally: signal.pthread_sigmask(signal.SIG_SETMASK, old)
     procs[rid] = p
     if p.stdout is not None:
         while True:
@@ -1484,6 +1515,30 @@ def _check_rel_cwd(cwd):
     return "" if p == os.curdir else p
 
 
+def _interactive_tty(capture):
+    """An uncaptured run from the foreground of a real terminal: its commands
+    get job control (Ctrl-C / Ctrl-Z reach them, not overlord). Never when
+    overlord itself was backgrounded — it must not steal the terminal."""
+    if capture:
+        return False
+    try:
+        return os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp()
+    except OSError:
+        return False
+
+
+def _reclaim_terminal():
+    """Take the terminal foreground back after an interactive command.
+    SIGTTOU is blocked for this thread only: exec() may run off the main one."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+    try:
+        os.tcsetpgrp(0, os.getpgrp())
+    except OSError:
+        pass
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
 class LiveSession:
     """An open transaction: holder alive, commands accepted, each one run over
     the current layer stack. A command that wrote something seals its layer:
@@ -1496,6 +1551,7 @@ class LiveSession:
         self.sdir = session_path(sid)
         self._sock, self._lock, self._cleanup, self._ebpf = sock, lock, cleanup, ebpf
         self._trace_inside = trace_inside
+        self._tty = False                    # set by _launch_holder: job control on
         self._q = {}
         self._qlock = threading.Lock()
         self._wlock = threading.Lock()
@@ -1665,8 +1721,9 @@ class LiveSession:
         lim = dict(effective_limits(self.meta.get("grants") or {}))
         if (self.meta.get("cgroup") or {}).get("kind") in (None, "none"):
             lim["rlimit_memory"] = True          # no cgroup: the data segment is the memory line
+        tty = not capture and self._tty
         self._send({"op": "run", "id": rid, "cmd": wrapped, "capture": capture,
-                    "cwd": run_cwd, "limits": lim})
+                    "cwd": run_cwd, "limits": lim, "tty": tty})
         timer = None
         timed_out = [False]
         if timeout:
@@ -1715,6 +1772,8 @@ class LiveSession:
                         outlog.write((msg["error"] + "\n").encode())
                     break
         finally:
+            if tty:
+                _reclaim_terminal()
             if timer:
                 timer.cancel()
             trace_stop.set()
@@ -2266,8 +2325,21 @@ def _launch_holder(sid, meta, lock, capture, fresh):
     if capture:
         outfile = open(os.path.join(sdir, "output.log"), "ab")
         popen_kw.update(stdout=outfile, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    # an interactive run keeps the holder in our session (its own process
+    # group, so killpg still takes it whole): a terminal can only hand its
+    # foreground to a group in its own session. Anything else detaches.
+    tty = _interactive_tty(capture)
+    if tty:
+        joiner = popen_kw.get("preexec_fn")
+        def _own_group():                  # Popen(process_group=) is 3.11+
+            os.setpgid(0, 0)
+            if joiner:
+                joiner()
+        popen_kw["preexec_fn"] = _own_group
+    else:
+        popen_kw["start_new_session"] = True
     try:
-        proc = subprocess.Popen(argv, start_new_session=True, **popen_kw)
+        proc = subprocess.Popen(argv, **popen_kw)
     except OSError:
         abort(parent_sock, cleanup)
         raise
@@ -2304,6 +2376,7 @@ def _launch_holder(sid, meta, lock, capture, fresh):
     try:
         live = LiveSession(sid, meta, proc, parent_sock, lock, cleanup, ebpf, trace_inside)
         live._proxy = proxy
+        live._tty = tty
     except OverlordError:
         if proxy:
             proxy["stop"].set()
@@ -2761,9 +2834,10 @@ def commit_session(sid, merge=False, force=False, only=None, drop=None,
         return {"committed": False, "conflicts": [], "merged": [], "target": m["target"],
                 "layers": selected, "rejected": rev}
     bad = [rel for kind, rel in changes if kind == "invalid-whiteout"]
-    if bad:  # would _remove_target(<tree root>); no --force for this one
-        raise OverlordError("error: refusing to commit — whiteout entry names its own "
-                            f"tree root: {', '.join(bad)} (roll the session back)")
+    if bad:  # would _remove_target(<a whole dir, or the tree root>); no --force
+        raise OverlordError("error: refusing to commit — malformed whiteout entry names its own "
+                            f"tree root or a directory, not an entry: {', '.join(bad)} "
+                            "(roll the session back)")
     if policy_block and not force:
         import policycheck
         _audit("session.commit_refused", sid=sid, owner=m.get("owner"), target=m["target"],

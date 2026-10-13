@@ -103,8 +103,19 @@ try:
         fail(f"session A: {changes_a}")
 
     # ------------------------------------------------------------ forks first (A must stay pending)
+    # kernel overlayfs leaves each layer's work/work at mode 000; plant it on
+    # any backend, since a fork that copies work/ cannot read it
+    for i in range(len(ov.load_meta(A)["layers"])):
+        ww = os.path.join(ov.session_path(A), ov.layer_work_rel(i), "work")
+        os.makedirs(ww, exist_ok=True)
+        os.chmod(ww, 0)
     B = ov.fork_session(A, 0)
     C = ov.fork_session(A)
+    for f in (B, C):
+        for i in range(len(ov.load_meta(f)["layers"])):
+            wd = os.path.join(ov.session_path(f), ov.layer_work_rel(i))
+            if not os.path.isdir(wd) or os.listdir(wd):
+                fail(f"fork {f} layer {i}: work dir missing or not fresh")
     mb, mc, ma = ov.load_meta(B), ov.load_meta(C), ov.load_meta(A)
     if mb["forked_from"] != {"session": A, "at": 0, "ts": mb["forked_from"]["ts"]} or \
             len(mb["layers"]) != 1 or [e["layer"] for e in mb["execs"]] != [0]:

@@ -23,7 +23,7 @@ no daemon, no build.
 Any agent binary, any vendor, unmodified:
 
 ```bash
-overlord run --jail --net none --timeout 600 -t ~/projects/app -- \
+overlord run --profile claude --timeout 600 -t ~/projects/app -- \
     claude -p "refactor the auth module"
 
 overlord diff <session>      # what it did
@@ -33,6 +33,23 @@ overlord commit <session>    # or rollback; --drop / --only select savepoints
 ```
 
 The agent believes it edited the project. Nothing is real until you commit.
+
+`--jail` erases `$HOME`, and an agent whose runtime or credentials live there
+can't start without them. A profile in `~/.overlord/profiles.json` names those
+paths once; `--profile` exposes them **read-only** (missing paths are skipped),
+adds the profile's environment, and implies `--jail`. Everything else under
+`$HOME` stays invisible:
+
+```json
+{"claude": {"expose": ["~/.local/share/claude", "~/.local/bin", "~/.claude"],
+            "env": {"IS_SANDBOX": "1"}}}
+```
+
+The wrapped command runs unprivileged, not as root (on the kernel backend a
+nested user namespace un-maps the mount-time root), so agents that refuse to
+run as root still launch. Don't use `--net none` for an agent that needs its model API; to
+record or restrict its egress, use `--net proxy` with `--net-allow HOST`.
+`overlord doctor` shows whether un-root is available.
 
 ## 1b. Watch it happen (web UI)
 

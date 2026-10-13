@@ -2491,15 +2491,17 @@ def fork_session(sid, at=None):
     dst = session_path(new)
     os.makedirs(dst)
     try:
-        for name in ("upper", "work", "base", "tmp", MANIFEST_FILE, "transcript.jsonl"):
+        for name in ("base", "tmp", MANIFEST_FILE, "transcript.jsonl"):
             p = os.path.join(src, name)
             if os.path.lexists(p):
                 _copy_tree(p, os.path.join(dst, name))
-        if at > 0:
-            os.makedirs(os.path.join(dst, LAYERS_DIR))
-            for i in range(1, at + 1):
-                _copy_tree(os.path.join(src, LAYERS_DIR, str(i)),
-                           os.path.join(dst, LAYERS_DIR, str(i)))
+        for i in range(at + 1):
+            # an upper is the layer; its work dir is overlay scratch, made fresh
+            # (kernel overlayfs leaves work/work mode 000, which cp -a can't read)
+            up = os.path.join(dst, layer_upper_rel(i))
+            os.makedirs(os.path.dirname(up), exist_ok=True)
+            _copy_tree(os.path.join(src, layer_upper_rel(i)), up)
+            os.makedirs(os.path.join(dst, layer_work_rel(i)))
         os.makedirs(os.path.join(dst, "merged"), exist_ok=True)
         fm = json.loads(json.dumps(m))
         fm.update(id=new, status="pending", started=_now(), trace=None,
